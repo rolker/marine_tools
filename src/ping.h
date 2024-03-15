@@ -1,7 +1,8 @@
 #ifndef MARINE_TOOLS_PING_H
 #define MARINE_TOOLS_PING_H
 
-#include "marine_acoustic_msgs/RawSonarImage.h"
+#include "rclcpp/rclcpp.hpp"
+#include "marine_acoustic_msgs/msg/raw_sonar_image.hpp"
 
 namespace marine_tools
 {
@@ -9,9 +10,9 @@ namespace marine_tools
 class Ping
 {
 public:
-  Ping(const marine_acoustic_msgs::RawSonarImage& message, float bin_size = 0.0);
+  Ping(const marine_acoustic_msgs::msg::RawSonarImage& message, float bin_size = 0.0);
 
-  ros::Time timestamp() const;
+  rclcpp::Time timestamp() const;
   
   /// Returns the binned samples
   const std::vector<float>& values() const;
@@ -23,7 +24,7 @@ public:
   float binSize() const;
 
 private:
-  ros::Time timestamp_;
+  rclcpp::Time timestamp_;
 
   /// size in meters of sample bins
   float bin_size_;

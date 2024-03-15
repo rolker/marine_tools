@@ -1,44 +1,36 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.5.1)
+
 project(marine_tools)
 
-find_package(catkin REQUIRED COMPONENTS
-    geometry_msgs
-    marine_acoustic_msgs
-    pcl_ros
-    project11_msgs
-    rosbag
-    roscpp
-    tf2
-    tf2_ros
-    visualization_msgs
-)
+set(CMAKE_CXX_STANDARD 17)
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
 
-catkin_package(
-    CATKIN_DEPENDS
-        geometry_msgs
-        marine_acoustic_msgs
-        pcl_ros
-        project11_msgs
-        roscpp
-        tf2
-        tf2_ros
-        visualization_msgs
-    INCLUDE_DIRS 
-    #include
-)
 
-include_directories(
-    #include
-    ${catkin_INCLUDE_DIRS}
-)
-
+find_package(ament_cmake REQUIRED)
+find_package(marine_acoustic_msgs REQUIRED)
+find_package(pcl_ros REQUIRED)
+find_package(rclcpp REQUIRED)
 
 add_executable(marine_sonar_to_pointcloud src/marine_sonar_to_pointcloud.cpp src/ping.cpp)
-add_dependencies(marine_sonar_to_pointcloud ${marine_tools_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
-target_link_libraries(marine_sonar_to_pointcloud ${catkin_LIBRARIES})
+
+
+
+ament_target_dependencies(marine_sonar_to_pointcloud
+    marine_acoustic_msgs
+    pcl_ros
+    rclcpp
+)
+
 
 install(TARGETS  marine_sonar_to_pointcloud
-        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-        RUNTIME DESTINATION ${CATKIN_GLOBAL_BIN_DESTINATION}
+    DESTINATION lib/${PROJECT_NAME}
 )
+
+ament_export_dependencies(
+    marine_acoustic_msgs
+    pcl_ros
+)
+
+ament_package()

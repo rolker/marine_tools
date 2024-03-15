@@ -5,7 +5,7 @@
 namespace marine_tools
 {
 
-Ping::Ping(const marine_acoustic_msgs::RawSonarImage& message, float bin_size)
+Ping::Ping(const marine_acoustic_msgs::msg::RawSonarImage& message, float bin_size)
   :bin_size_(bin_size)
 {
   if (bin_size == 0.0)
@@ -16,7 +16,7 @@ Ping::Ping(const marine_acoustic_msgs::RawSonarImage& message, float bin_size)
   uint32_t bin_count = ceil(max_range/bin_size_);
   values_.resize(bin_count);
   std::vector<int> counts(bin_count, 0);
-  if(message.image.dtype == marine_acoustic_msgs::SonarImageData::DTYPE_FLOAT32)
+  if(message.image.dtype == marine_acoustic_msgs::msg::SonarImageData::DTYPE_FLOAT32)
   {
     for(uint32_t i = 0; i < message.samples_per_beam; i++)
     {
@@ -49,7 +49,7 @@ Ping::Ping(const marine_acoustic_msgs::RawSonarImage& message, float bin_size)
   }
 }
 
-ros::Time Ping::timestamp() const
+rclcpp::Time Ping::timestamp() const
 {
   return timestamp_;
 }

@@ -1,25 +1,26 @@
-#include <ros/ros.h>
-#include <marine_acoustic_msgs/RawSonarImage.h>
+#include <rclcpp/rclcpp.hpp>
+#include <marine_acoustic_msgs/msg/raw_sonar_image.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include "pcl_ros/point_cloud.h"
+#include "pcl_conversions/pcl_conversions.h"
+#include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include "ping.h"
 
-ros::Publisher pointcloud_publisher;
+rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_publisher;
 float detection_threshold = 0.0;
 
 float last_increment = 0.0;
 
-void sonarPingCallback(const marine_acoustic_msgs::RawSonarImage::ConstPtr &msg)
+void sonarPingCallback(const marine_acoustic_msgs::msg::RawSonarImage &msg)
 {
-  if(!msg->image.data.empty() && msg->image.dtype == marine_acoustic_msgs::SonarImageData::DTYPE_FLOAT32)
+  if(!msg.image.data.empty() && msg.image.dtype == marine_acoustic_msgs::msg::SonarImageData::DTYPE_FLOAT32)
   {
-    marine_tools::Ping ping(*msg);
+    marine_tools::Ping ping(msg);
 
     pcl::PointCloud<pcl::PointXYZI> pc;
-    pc.header.frame_id = msg->header.frame_id;
-    pc.header.stamp = msg->header.stamp.toNSec()/1000;
+    pc.header.frame_id = msg.header.frame_id;
+    pc.header.stamp = rclcpp::Time(msg.header.stamp).nanoseconds()/1000;
 
     // float start_range = 0.5*msg->ping_info.sound_speed*msg->sample0/msg->sample_rate;
     // float range_increment = 0.5*msg->ping_info.sound_speed/msg->sample_rate;
@@ -43,22 +44,27 @@ void sonarPingCallback(const marine_acoustic_msgs::RawSonarImage::ConstPtr &msg)
         }
       }
     }
-    pointcloud_publisher.publish(pc);
+
+    sensor_msgs::msg::PointCloud2 pc2;
+    pcl::toROSMsg(pc, pc2);
+    pointcloud_publisher->publish(pc2);
   }
 }
 
 int main(int argc, char* argv[])
 {
-  ros::init(argc, argv, "marine_sonar_to_pointcloud");
+  rclcpp::init(argc, argv);
+  
+  auto node = rclcpp::Node::make_shared("marine_sonar_to_pointcloud");
 
-  ros::NodeHandle nh, pnh("~");
+  node->declare_parameter("detection_threshold", 0.0);
 
-  detection_threshold = pnh.param("detection_threshold", 0.0);
+  detection_threshold = node->get_parameter("detection_threshold").as_double();
 
-  ros::Subscriber radar_subscriber = nh.subscribe("sonar", 10, &sonarPingCallback);
+  auto sonar_subsciber = node->create_subscription<marine_acoustic_msgs::msg::RawSonarImage>("sonar", 10, &sonarPingCallback);
 
-  pointcloud_publisher = pnh.advertise<pcl::PointCloud<pcl::PointXYZI> >("pointcloud", 10);
-    
-  ros::spin();
+  pointcloud_publisher = node->create_publisher<sensor_msgs::msg::PointCloud2>("pointcloud", 10);
+
+  rclcpp::spin(node);
   return 0;
 }    
