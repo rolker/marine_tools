@@ -17,7 +17,7 @@ def nmeaCallback(msg: Sentence):
 
 rospy.init_node("nmea_to_udp", sys.argv)
 
-imu_sub = rospy.Subscriber('nmea', Sentence, nmeaCallback)
+nmea_sub = rospy.Subscriber('nmea', Sentence, nmeaCallback)
 
 address = rospy.get_param('~address', '127.0.0.1')
 port = rospy.get_param('~port', 4322)
