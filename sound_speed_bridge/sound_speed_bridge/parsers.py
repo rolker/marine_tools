@@ -11,6 +11,7 @@ parser implementations, not in the node.
 
 from abc import ABC, abstractmethod
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Iterable, NamedTuple, Optional
 
 
@@ -36,6 +37,12 @@ class SoundSpeedReading(NamedTuple):
 
     receive_time_ns: int
     """ROS time at which the framing terminator was observed (ns since epoch)."""
+
+    temperature_c: Optional[float] = None
+    """Optional water temperature in degrees Celsius, when reported by the sensor."""
+
+    pressure_pa: Optional[float] = None
+    """Optional pressure in pascals, when reported by the sensor."""
 
 
 class SoundSpeedParser(ABC):
@@ -105,6 +112,119 @@ class AMLParser(SoundSpeedParser):
         )
 
 
+class RegexParser(SoundSpeedParser):
+    r"""
+    Generic regex-based parser for sensors without a first-class implementation.
+
+    Configured by:
+
+    - pattern: a Python regex with a required named group ``sound_speed`` and
+      optional named groups ``temperature`` (degrees Celsius) and
+      ``pressure`` (pascals).
+    - sound_speed_scale: multiply the captured sound_speed value by this to
+      produce m/s. For sensors that emit raw mm/s, set this to 0.001.
+    - line_terminator: ``cr`` | ``lf`` | ``crlf`` -- how sentences are framed.
+
+    raw_mm_s is always None for this parser (no contract with the sensor about
+    integer representation), so downstream Valeport UDP fan-out rounds from
+    the float. Use a first-class parser when bit-exactness matters.
+    """
+
+    _TERMINATORS = {'cr': b'\r', 'lf': b'\n', 'crlf': b'\r\n'}
+
+    def __init__(
+        self,
+        pattern: str,
+        sound_speed_scale: float = 1.0,
+        line_terminator: str = 'cr',
+    ) -> None:
+        if line_terminator not in self._TERMINATORS:
+            raise ValueError(
+                f'Unknown line_terminator {line_terminator!r}; '
+                f'expected one of {list(self._TERMINATORS)}')
+        if not pattern:
+            raise ValueError('regex_pattern must be non-empty')
+        self._regex = re.compile(pattern)
+        if 'sound_speed' not in self._regex.groupindex:
+            raise ValueError(
+                "regex_pattern must contain a named group 'sound_speed'")
+        self._terminator = self._TERMINATORS[line_terminator]
+        self._scale = float(sound_speed_scale)
+        self._buffer = b''
+
+    def feed(self, data: bytes, receive_time_ns: int) -> Iterable[SoundSpeedReading]:
+        """Frame on the configured terminator and yield one reading per non-empty line."""
+        self._buffer += data
+        sep = self._terminator
+        sep_len = len(sep)
+        while True:
+            idx = self._buffer.find(sep)
+            if idx < 0:
+                break
+            line = self._buffer[:idx]
+            raw = bytes(line) + sep
+            self._buffer = self._buffer[idx + sep_len:]
+            stripped = line.strip()
+            if not stripped:
+                continue
+            yield self._parse(stripped, raw, receive_time_ns)
+
+    def _parse(
+        self, stripped: bytes, raw: bytes, receive_time_ns: int,
+    ) -> SoundSpeedReading:
+        try:
+            text = stripped.decode('ascii')
+        except UnicodeDecodeError:
+            return SoundSpeedReading(
+                sound_speed_m_s=float('nan'),
+                raw_mm_s=None,
+                raw_bytes=raw,
+                receive_time_ns=receive_time_ns,
+            )
+        match = self._regex.search(text)
+        if match is None:
+            return SoundSpeedReading(
+                sound_speed_m_s=float('nan'),
+                raw_mm_s=None,
+                raw_bytes=raw,
+                receive_time_ns=receive_time_ns,
+            )
+        try:
+            value = float(match.group('sound_speed')) * self._scale
+        except (TypeError, ValueError):
+            value = float('nan')
+        temperature = self._optional_float(match, 'temperature')
+        pressure = self._optional_float(match, 'pressure')
+        return SoundSpeedReading(
+            sound_speed_m_s=value,
+            raw_mm_s=None,
+            raw_bytes=raw,
+            receive_time_ns=receive_time_ns,
+            temperature_c=temperature,
+            pressure_pa=pressure,
+        )
+
+    @staticmethod
+    def _optional_float(match: 're.Match[str]', name: str) -> Optional[float]:
+        if name not in match.re.groupindex:
+            return None
+        captured = match.group(name)
+        if captured is None:
+            return None
+        try:
+            return float(captured)
+        except (TypeError, ValueError):
+            return None
+
+
+# Mapping of parser name -> factory(node) -> SoundSpeedParser. Factories take
+# the node so they can read parser-specific parameters; AMLParser has no
+# tunables and ignores the argument.
 PARSERS = {
-    'aml': AMLParser,
+    'aml': lambda _node: AMLParser(),
+    'regex': lambda node: RegexParser(
+        pattern=node.get_parameter('regex_pattern').value,
+        sound_speed_scale=node.get_parameter('regex_sound_speed_scale').value,
+        line_terminator=node.get_parameter('regex_line_terminator').value,
+    ),
 }

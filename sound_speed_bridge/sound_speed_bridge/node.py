@@ -17,6 +17,7 @@ from marine_interfaces.msg import SoundSpeed
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import FluidPressure, Temperature
 import serial
 
 from .parsers import PARSERS, SoundSpeedReading
@@ -59,6 +60,9 @@ class SoundSpeedBridgeNode(Node):
         self.declare_parameter('valid_sound_speed_max', 1600.0)
         self.declare_parameter('stale_age_warn_sec', 5.0)
         self.declare_parameter('stale_age_error_sec', 30.0)
+        self.declare_parameter('regex_pattern', '')
+        self.declare_parameter('regex_sound_speed_scale', 1.0)
+        self.declare_parameter('regex_line_terminator', 'cr')
 
         self._device = self.get_parameter('device').value
         self._baud = self.get_parameter('baud').value
@@ -74,7 +78,7 @@ class SoundSpeedBridgeNode(Node):
         if self._parser_name not in PARSERS:
             raise ValueError(
                 f'Unknown parser {self._parser_name!r}. Known: {list(PARSERS)}')
-        self._parser = PARSERS[self._parser_name]()
+        self._parser = PARSERS[self._parser_name](self)
 
         self._udp_targets = self._build_udp_targets()
         self._udp_socket: Optional[socket.socket] = None
@@ -83,6 +87,9 @@ class SoundSpeedBridgeNode(Node):
 
         topic_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self._pub = self.create_publisher(SoundSpeed, 'sound_speed', topic_qos)
+        self._temp_pub = self.create_publisher(Temperature, 'temperature', topic_qos)
+        self._pressure_pub = self.create_publisher(
+            FluidPressure, 'fluid_pressure', topic_qos)
         self._diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         self._lock = threading.Lock()
@@ -171,16 +178,38 @@ class SoundSpeedBridgeNode(Node):
         if math.isnan(reading.sound_speed_m_s):
             self._parse_error_count += 1
 
+        stamp_sec = reading.receive_time_ns // 1_000_000_000
+        stamp_nanosec = reading.receive_time_ns % 1_000_000_000
+
         msg = SoundSpeed()
-        msg.header.stamp.sec = reading.receive_time_ns // 1_000_000_000
-        msg.header.stamp.nanosec = reading.receive_time_ns % 1_000_000_000
+        msg.header.stamp.sec = stamp_sec
+        msg.header.stamp.nanosec = stamp_nanosec
         msg.header.frame_id = self._frame_id
         msg.sound_speed = float(reading.sound_speed_m_s)
         msg.variance = float(self._variance)
         self._pub.publish(msg)
 
+        if reading.temperature_c is not None:
+            tmsg = Temperature()
+            tmsg.header.stamp.sec = stamp_sec
+            tmsg.header.stamp.nanosec = stamp_nanosec
+            tmsg.header.frame_id = self._frame_id
+            tmsg.temperature = float(reading.temperature_c)
+            tmsg.variance = 0.0
+            self._temp_pub.publish(tmsg)
+
+        if reading.pressure_pa is not None:
+            pmsg = FluidPressure()
+            pmsg.header.stamp.sec = stamp_sec
+            pmsg.header.stamp.nanosec = stamp_nanosec
+            pmsg.header.frame_id = self._frame_id
+            pmsg.fluid_pressure = float(reading.pressure_pa)
+            pmsg.variance = 0.0
+            self._pressure_pub.publish(pmsg)
+
+        ctx = {'frame_id': self._frame_id}
         for target in self._udp_targets:
-            payload = target.formatter(reading)
+            payload = target.formatter(reading, target.template, ctx)
             if payload is None:
                 continue
             try:
