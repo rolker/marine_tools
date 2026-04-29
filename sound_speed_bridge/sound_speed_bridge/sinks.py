@@ -5,9 +5,10 @@ Each formatter takes (reading, template, ctx) and returns Optional[bytes]:
 None means "skip emitting anything" (e.g. a NaN reading on a Valeport sink
 that would emit garbage downstream).
 
-- ``template`` is a per-target string used by the ``template`` formatter
-  (Python str.format with backslash escapes processed). Other formatters
-  ignore it.
+- ``template`` is a per-target string used by the ``template`` formatter.
+  Backslash escapes (\\r, \\n, \\t) are pre-decoded by the node at startup
+  before being handed in here, so the formatter only does str.format
+  substitution. Other formatters ignore the argument.
 - ``ctx`` is a small dict of node-level context (currently just
   ``frame_id``). Other formatters ignore it.
 
@@ -80,8 +81,10 @@ def format_template(
     - ``{stamp}`` (Unix epoch seconds, float)
     - ``{frame_id}`` (str, from the node's frame_id parameter)
 
-    Backslash escapes (\\r, \\n, \\t) in the template are processed before
-    formatting since YAML and CLI args do not naturally embed control chars.
+    Backslash escapes (\\r, \\n, \\t) in the template are processed by the
+    node at startup (see ``_decode_template``) since YAML and CLI args do
+    not naturally embed control chars; this formatter receives the already-
+    decoded form and only does ``str.format`` substitution.
 
     Skips NaN readings.
     """
@@ -89,14 +92,13 @@ def format_template(
         return None
     if math.isnan(reading.sound_speed_m_s):
         return None
-    fmt = template.encode('ascii').decode('unicode_escape')
     int_mm_s = (reading.raw_mm_s if reading.raw_mm_s is not None
                 else round(reading.sound_speed_m_s * 1000))
     frame_id = ''
     if isinstance(ctx, dict):
         frame_id = str(ctx.get('frame_id', ''))
     try:
-        rendered = fmt.format(
+        rendered = template.format(
             value=reading.sound_speed_m_s,
             value_mm_s=reading.sound_speed_m_s * 1000.0,
             value_int_mm_s=int_mm_s,
@@ -106,6 +108,24 @@ def format_template(
     except (KeyError, IndexError, ValueError):
         return None
     return rendered.encode('ascii', errors='replace')
+
+
+def decode_template(format_name: str, template: str) -> str:
+    """Decode backslash escapes in a user-supplied template string at startup.
+
+    Validated once at config time so a malformed escape (e.g. ``\\xZZ``) or
+    a non-ASCII character raises a clear configuration error instead of
+    crashing the serial thread mid-stream. Non-template formats and empty
+    templates pass through unchanged.
+    """
+    if format_name != 'template' or not template:
+        return template
+    try:
+        return template.encode('ascii').decode('unicode_escape')
+    except (UnicodeEncodeError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f'udp_templates entry {template!r} is not a valid '
+            f'ASCII string with backslash escapes: {exc}') from exc
 
 
 FORMATTERS: Dict[str, Formatter] = {

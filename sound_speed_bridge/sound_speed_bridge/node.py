@@ -21,19 +21,25 @@ from sensor_msgs.msg import FluidPressure, Temperature
 import serial
 
 from .parsers import PARSERS, SoundSpeedReading
-from .sinks import FORMATTERS
+from .sinks import FORMATTERS, decode_template
 
 
 class _UdpTarget:
     """Internal record describing one configured UDP fan-out destination."""
 
-    __slots__ = ('host', 'port', 'format_name', 'template', 'formatter', 'address')
+    __slots__ = (
+        'host', 'port', 'format_name',
+        'template', 'decoded_template', 'formatter', 'address',
+    )
 
-    def __init__(self, host, port, format_name, template, formatter):
+    def __init__(
+        self, host, port, format_name, template, decoded_template, formatter,
+    ):
         self.host = host
         self.port = port
         self.format_name = format_name
         self.template = template
+        self.decoded_template = decoded_template
         self.formatter = formatter
         self.address = (host, port)
 
@@ -121,29 +127,32 @@ class SoundSpeedBridgeNode(Node):
         formats_raw = list(self.get_parameter('udp_formats').value or [])
         templates_raw = list(self.get_parameter('udp_templates').value or [])
 
-        hosts = [h for h in hosts_raw if h]
-        if not hosts:
+        if not any(hosts_raw):
             return []
 
-        if len(ports_raw) < len(hosts) or len(formats_raw) < len(hosts):
+        if len(ports_raw) < len(hosts_raw) or len(formats_raw) < len(hosts_raw):
             raise ValueError(
                 f'udp_hosts={hosts_raw} udp_ports={ports_raw} '
                 f'udp_formats={formats_raw} '
                 'must be parallel arrays of equal length')
-        ports = [int(p) for p in ports_raw[:len(hosts)]]
-        formats = list(formats_raw[:len(hosts)])
-        templates = list(templates_raw[:len(hosts)])
-        while len(templates) < len(hosts):
+        ports = [int(p) for p in ports_raw[:len(hosts_raw)]]
+        formats = list(formats_raw[:len(hosts_raw)])
+        templates = list(templates_raw[:len(hosts_raw)])
+        while len(templates) < len(hosts_raw):
             templates.append('')
 
         targets: List[_UdpTarget] = []
-        for host, port, fmt, template in zip(hosts, ports, formats, templates):
+        for host, port, fmt, template in zip(hosts_raw, ports, formats, templates):
+            if not host:
+                continue
             if fmt not in FORMATTERS:
                 raise ValueError(
                     f'Unknown UDP format {fmt!r} for {host}:{port}. '
                     f'Known: {list(FORMATTERS)}')
             formatter = FORMATTERS[fmt]
-            targets.append(_UdpTarget(host, port, fmt, template, formatter))
+            decoded_template = decode_template(fmt, template)
+            targets.append(_UdpTarget(
+                host, port, fmt, template, decoded_template, formatter))
         return targets
 
     def _serial_loop(self) -> None:
@@ -209,7 +218,7 @@ class SoundSpeedBridgeNode(Node):
 
         ctx = {'frame_id': self._frame_id}
         for target in self._udp_targets:
-            payload = target.formatter(reading, target.template, ctx)
+            payload = target.formatter(reading, target.decoded_template, ctx)
             if payload is None:
                 continue
             try:

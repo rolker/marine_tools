@@ -89,17 +89,20 @@ def test_passthrough_skips_when_raw_bytes_empty():
 
 
 def test_template_basic_format_with_int_mm_s():
-    r"""Bit-exact int mm/s flows through {value_int_mm_s} unchanged."""
+    r"""Bit-exact int mm/s flows through {value_int_mm_s} unchanged.
+
+    Templates arrive at the formatter already decoded by the node.
+    """
     out = format_template(
         _reading(value=1500.123, raw_mm_s=1500123),
-        template=' {value_int_mm_s:7d}\\r\\n',
+        template=' {value_int_mm_s:7d}\r\n',
     )
     assert out == b' 1500123\r\n'
 
 
-def test_template_processes_backslash_escapes():
-    r"""\r and \n in the template parameter are converted to control chars."""
-    out = format_template(_reading(value=1500.0), template='{value:.1f}\\n')
+def test_template_passes_through_control_chars():
+    r"""Control chars in the (already-decoded) template flow through to bytes."""
+    out = format_template(_reading(value=1500.0), template='{value:.1f}\n')
     assert out == b'1500.0\n'
 
 

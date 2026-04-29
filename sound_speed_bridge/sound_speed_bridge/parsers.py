@@ -81,6 +81,11 @@ class AMLParser(SoundSpeedParser):
         """Frame on CR and yield one reading per non-empty sentence."""
         self._buffer += data
         while True:
+            # Drop inter-sentence padding (the trailing '\n' of CRCRLF)
+            # before framing so raw_bytes for the next sentence does not
+            # leak the prior terminator's '\n'. Passthrough sinks rely on
+            # raw_bytes being exactly the framed sentence.
+            self._buffer = self._buffer.lstrip(b'\n')
             idx = self._buffer.find(self._TERMINATOR)
             if idx < 0:
                 break
@@ -88,7 +93,7 @@ class AMLParser(SoundSpeedParser):
             terminator = self._buffer[idx:idx + 1]
             self._buffer = self._buffer[idx + 1:]
             raw = bytes(line) + terminator
-            stripped = line.lstrip(b' \t\n').rstrip(b' \t')
+            stripped = line.lstrip(b' \t').rstrip(b' \t')
             if not stripped:
                 continue
             yield self._parse(stripped, raw, receive_time_ns)

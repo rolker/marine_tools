@@ -40,7 +40,10 @@ def test_aml_handles_crcrlf_padding_between_sentences():
     Stray newline bytes between sentences should not produce extra readings.
 
     Each AML sentence ends with CRCRLF; framing on the first CR leaves a
-    trailing \n that the parser must silently skip.
+    trailing \n that the parser must silently skip. raw_bytes for the
+    second sentence must not leak the prior terminator's \n -- the
+    passthrough sink contract is that raw_bytes is exactly the framed
+    sentence.
     """
     p = AMLParser()
     readings = _readings(p, b'1500.000\r\r\n1500.500\r\r\n')
@@ -48,6 +51,8 @@ def test_aml_handles_crcrlf_padding_between_sentences():
     raw_mm_s = [r.raw_mm_s for r in readings]
     assert values == [1500.0, 1500.5]
     assert raw_mm_s == [1500000, 1500500]
+    raw = [r.raw_bytes for r in readings]
+    assert raw == [b'1500.000\r', b'1500.500\r']
 
 
 def test_aml_partial_buffering():
