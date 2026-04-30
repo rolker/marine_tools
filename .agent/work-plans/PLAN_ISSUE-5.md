@@ -19,7 +19,9 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 
 1. **Scaffold ament_python package** — `package.xml`, `setup.py`,
    `setup.cfg`, `resource/bag_analysis`, `README.md`, mirroring
-   `sound_speed_bridge` conventions (ADR-0008).
+   `sound_speed_bridge` conventions (ADR-0008). Every Python source
+   file gets the BSD-3-Clause copyright header used elsewhere in
+   the repo.
 2. **Reader layer** (`bag_analysis/reader.py`) — `rosbag2_py` sequential
    reader, deserialize via `rclpy.serialization`. Iterate (topic, msg,
    t_ns) tuples.
@@ -28,10 +30,10 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
    flat columns; dispatch by `msg_type` string. Tier 1 needs extractors
    for: `mavros_msgs/State`, `sensor_msgs/BatteryState`,
    `mavros_msgs/RCOut`, `sensor_msgs/NavSatFix`, `sbg_driver/SbgGpsPos`,
-   `sbg_driver/SbgEkfNav`, `sbg_driver/SbgGpsHdt`,
+   `sbg_driver/SbgGpsVel`, `sbg_driver/SbgEkfNav`, `sbg_driver/SbgGpsHdt`,
    `sbg_driver/SbgStatus`, `nav_msgs/Odometry`,
    `geometry_msgs/TwistStamped`, `marine_interfaces/Heartbeat`,
-   `diagnostic_msgs/DiagnosticArray`,
+   `nav2_msgs/BehaviorTreeLog`, `diagnostic_msgs/DiagnosticArray`,
    `udp_bridge_interfaces/BridgeInfo`,
    `udp_bridge_interfaces/TopicStatisticsArray`. Unknown types fall
    through to `{json: <repr>}` (skip rather than crash).
@@ -54,12 +56,21 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 8. **Two CLI entry points** (`bag_analysis/cli/`) — `bag_to_parquet`
    and `parquet_to_report`, both registered as console_scripts. Argparse
    with `--bag`, `--parquet-dir`, `--output`, `--topics` (whitelist),
-   `--tier` (default 1), `--robot-namespace` (default `bizzy`). Topic
-   prefix in plot modules is parameterized off `--robot-namespace`.
-9. **Tests** (`test/`) — unit tests for one extractor (battery) and one
-   plot generator (mode timeline) using a small synthetic bag fixture
-   in `test/fixtures/`. Per "Test what breaks" — focus on the
-   deserialize → flatten → DataFrame contract, not framework glue.
+   `--tier` (default 1), `--robot-namespace` (default `bizzy`). Plot
+   modules use a small helper `topic(name)` that prefixes
+   robot-scoped names with `/<namespace>/` and passes through
+   system topics (`/diagnostics`, `/tf`, `/tf_static`, `/rosout`,
+   `/marine/platforms`) unchanged. The system-topic allowlist lives
+   in one place (`bag_analysis/topics.py`) — plot modules don't
+   make per-topic decisions.
+9. **Tests** (`test/`) — unit tests using boundary-mocked inputs:
+   construct ROS message instances directly in-process and call the
+   extractor; build synthetic DataFrames and call the plot generator.
+   No real bag fixture — the contracts under test are extractor
+   flatten and plot consumption, both reachable without a writer +
+   schema-registration round trip. Per "Test what breaks": cover at
+   least one extractor (battery — typed numerics) and one plot
+   (mode timeline — string-step rendering).
 10. **README** — purpose, install, two CLI usage examples, how to add
     a new extractor, how to add a new plot, parquet schema description.
 
@@ -79,7 +90,8 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 
 | File | Change |
 |------|--------|
-| `bag_analysis/package.xml` | New — depends on rclpy, rosbag2_py, rosidl_runtime_py, message pkgs (mavros_msgs, sbg_driver, marine_interfaces, sensor_msgs, nav_msgs, geometry_msgs, diagnostic_msgs, tf2_msgs, udp_bridge_interfaces, std_msgs, visualization_msgs, nav2_msgs), python3-pandas, python3-pyarrow, python3-matplotlib |
+| `bag_analysis/package.xml` | New — `<depend>` on rclpy, rosbag2_py, rosidl_runtime_py, and message pkgs (mavros_msgs, sbg_driver, marine_interfaces, sensor_msgs, nav_msgs, geometry_msgs, diagnostic_msgs, tf2_msgs, udp_bridge_interfaces, std_msgs, visualization_msgs, nav2_msgs); `<exec_depend>` on the pure-Python runtime libraries (python3-pandas, python3-pyarrow, python3-matplotlib) |
+| `bag_analysis/bag_analysis/topics.py` | New — system-topic allowlist + `topic(name, namespace)` helper used by all plot modules |
 | `bag_analysis/setup.py` | New — entry_points for `bag_to_parquet` and `parquet_to_report` |
 | `bag_analysis/setup.cfg` | New — flake8/pep257 config matching `sound_speed_bridge` |
 | `bag_analysis/resource/bag_analysis` | New — empty marker |
@@ -98,14 +110,14 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 | Test what breaks | Tests target extractor flattening + plot generation contract, not rosbag2 internals |
 | A change includes its consequences | README + tests in same PR; usage examples invoke the CLIs directly (`ros2 run bag_analysis ...`) — no workspace coupling |
 | Improve incrementally | Single PR; first iteration validated against one real bag; extensibility designed in but not all extractors landed |
-| Workspace vs. project separation | Package lives in `marine_tools` (cross-boat); workspace gets only the make target wrapper, no domain code |
+| Workspace vs. project separation | Package lives entirely in `marine_tools` (cross-boat); zero workspace involvement — CLIs invoked via `ros2 run` directly |
 
 ## ADR Compliance
 
 | ADR | Triggered | How addressed |
 |---|---|---|
 | 0008 — ROS 2 conventions | Yes (new package) | Mirror `sound_speed_bridge` layout: ament_python build_type, BSD-3-Clause, format-3 package.xml, conventional setup.py with console_scripts |
-| 0009 — Python package management | Yes (Python deps) | All deps via `<depend>` in `package.xml` resolved by rosdep (python3-pandas, python3-pyarrow, python3-matplotlib all have rosdep keys); no pip, no .venv |
+| 0009 — Python package management | Yes (Python deps) | All deps declared in `package.xml` (`<depend>` for build+runtime, `<exec_depend>` for pure-Python runtime libs) and resolved by rosdep — pandas/pyarrow/matplotlib all have rosdep keys; no pip, no .venv |
 | 0002 — Worktree isolation | Yes | Worktree created at `layers/worktrees/issue-marine_tools-5/` before any edits |
 
 ## Consequences
