@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bag_analysis</name>
+  <version>0.0.1</version>
+  <description>Two-stage post-deployment bag analysis: extract a rosbag2 to columnar parquet sidecars, then render a Tier-1 report (mode timeline, track, speed/heading, power, comms, sensor health, altitude) as PNGs + summary.md.</description>
+  <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <depend>rclpy</depend>
+  <depend>rosbag2_py</depend>
+  <depend>rosidl_runtime_py</depend>
+
+  <depend>diagnostic_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>marine_interfaces</depend>
+  <depend>mavros_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sbg_driver</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_msgs</depend>
+  <depend>udp_bridge_interfaces</depend>
+  <depend>visualization_msgs</depend>
+
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pandas</exec_depend>
+  <exec_depend>python3-pyarrow</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

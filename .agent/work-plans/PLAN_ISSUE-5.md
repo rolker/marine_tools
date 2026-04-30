@@ -19,9 +19,11 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 
 1. **Scaffold ament_python package** — `package.xml`, `setup.py`,
    `setup.cfg`, `resource/bag_analysis`, `README.md`, mirroring
-   `sound_speed_bridge` conventions (ADR-0008). Every Python source
-   file gets the BSD-3-Clause copyright header used elsewhere in
-   the repo.
+   `sound_speed_bridge` conventions (ADR-0008). Match the in-repo
+   convention for source-file headers: module docstring at the top
+   of each file; license declared once in `package.xml` (BSD-3-Clause)
+   — no per-file copyright comment block, since the existing
+   `marine_tools` and `sound_speed_bridge` packages don't use them.
 2. **Reader layer** (`bag_analysis/reader.py`) — `rosbag2_py` sequential
    reader, deserialize via `rclpy.serialization`. Iterate (topic, msg,
    t_ns) tuples.
