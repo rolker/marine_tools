@@ -54,15 +54,13 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 8. **Two CLI entry points** (`bag_analysis/cli/`) — `bag_to_parquet`
    and `parquet_to_report`, both registered as console_scripts. Argparse
    with `--bag`, `--parquet-dir`, `--output`, `--topics` (whitelist),
-   `--tier` (default 1).
-9. **Workspace `make analyze-bag`** — added to workspace `Makefile`,
-   sources sensors layer install + runs the two CLIs in sequence. Per
-   ADR-0007 stamp-file pattern not needed; this is on-demand.
-10. **Tests** (`test/`) — unit tests for one extractor (battery) and one
-    plot generator (mode timeline) using a small synthetic bag fixture
-    in `test/fixtures/`. Per "Test what breaks" — focus on the
-    deserialize → flatten → DataFrame contract, not framework glue.
-11. **README** — purpose, install, two CLI usage examples, how to add
+   `--tier` (default 1), `--robot-namespace` (default `bizzy`). Topic
+   prefix in plot modules is parameterized off `--robot-namespace`.
+9. **Tests** (`test/`) — unit tests for one extractor (battery) and one
+   plot generator (mode timeline) using a small synthetic bag fixture
+   in `test/fixtures/`. Per "Test what breaks" — focus on the
+   deserialize → flatten → DataFrame contract, not framework glue.
+10. **README** — purpose, install, two CLI usage examples, how to add
     a new extractor, how to add a new plot, parquet schema description.
 
 ## Tier 1 plot inventory → topic mapping
@@ -91,7 +89,6 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 | `bag_analysis/bag_analysis/cli/{bag_to_parquet,parquet_to_report}.py` | New — CLI entry points |
 | `bag_analysis/test/test_*.py` + fixtures | New — unit tests |
 | `bag_analysis/README.md` | New — usage + extension docs |
-| `(workspace) Makefile` | Add `analyze-bag` target — separate workspace PR after this lands |
 
 ## Principles Self-Check
 
@@ -99,7 +96,7 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 |---|---|
 | Only what's needed | Tier 1 only; explicit "out of scope" for Tier 2/3, IzzyBoat adapters, field-host automation, GitHub Actions |
 | Test what breaks | Tests target extractor flattening + plot generation contract, not rosbag2 internals |
-| A change includes its consequences | README + tests in same PR; workspace `make analyze-bag` target follow-up PR (cross-repo) |
+| A change includes its consequences | README + tests in same PR; usage examples invoke the CLIs directly (`ros2 run bag_analysis ...`) — no workspace coupling |
 | Improve incrementally | Single PR; first iteration validated against one real bag; extensibility designed in but not all extractors landed |
 | Workspace vs. project separation | Package lives in `marine_tools` (cross-boat); workspace gets only the make target wrapper, no domain code |
 
@@ -117,29 +114,19 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 |---|---|---|
 | `extractors/` API | All plot modules importing extractor outputs | Yes — kept internal; not a public ROS API |
 | Parquet schema (`_topic_index.json`) | Any external readers of the parquet sidecars | First iteration: docs only. Schema versioning deferred until there is a non-`bag_analysis` reader |
-| `make analyze-bag` target | `AGENTS.md` Build & Test section, workspace dashboard | Follow-up workspace PR |
 | New extractor | `bag_analysis/README.md` "how to add" section | Yes — README is part of this PR |
 
 ## Open Questions
 
-- **Q1: Parquet output location for the cod rock validation run.** Per
-  the agreed architecture, parquet sidecars are not committed. For the
-  validation step, where should they live on dev? Proposal: `~/data/bag_reports/<bag-name>/parquet/`,
-  with the committed `report/` ending up under
-  `unh_echoboats_project11/docs/logs/2026/2026-04-29/<bag-name>/`.
-- **Q2: Cross-boat parameterization.** First iteration hardcodes
-  `/bizzy/...` topic prefix in the plot modules. IzzyBoat adapter is
-  out of scope, but should the topic prefix be a CLI flag now (cheap)
-  or deferred? Proposal: CLI flag now (`--robot-namespace bizzy`),
-  default `bizzy`.
-- **Q3: Workspace `make analyze-bag` target.** Same PR (cross-repo) or
-  follow-up workspace-issue PR? Proposal: follow-up — workspace and
-  project repos belong on separate PRs per ADR-0003 separation.
+(none — the three planning questions resolved before implementation:
+parquet sidecars go to `~/data/bag_reports/<bag-name>/parquet/`,
+committed `report/` lands under `unh_echoboats_project11/docs/logs/<year>/<deployment>/<bag-name>/`;
+`--robot-namespace` CLI flag with default `bizzy`; no workspace
+coupling — CLIs are invoked directly via `ros2 run`.)
 
 ## Estimated Scope
 
 Single PR in `rolker/marine_tools` for the package itself (~1500–2500
-LOC including tests + README). Follow-up workspace PR (~10 LOC) for
-the `make analyze-bag` target. First-validation deliverable: a
+LOC including tests + README). First-validation deliverable: a
 generated `report/` for the cod rock bag, posted as a comment on this
 issue or on the deployment issue.
