@@ -6,7 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_meta, load_topic
+from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
 from ._common import PlotResult, save_figure, to_elapsed_s
 
@@ -16,13 +16,13 @@ TITLE = 'Altitude / heave (launch + recovery, tide proxy)'
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Plot SBG-fused altitude over time."""
-    meta = load_meta(parquet_dir)
+    meta = load_meta(db_path)
     t0 = meta['start_ns']
 
-    ekf = load_topic(parquet_dir, topic('sensors/sbg/ekf_nav', namespace))
+    ekf = load_topic(db_path, topic('sensors/sbg/ekf_nav', namespace))
     if ekf is None or 'altitude' not in ekf.columns:
         return PlotResult(
             plot_name=PLOT_NAME, title=TITLE,

@@ -8,12 +8,18 @@ https://github.com/rolker/marine_tools/issues/5
 
 Post-deployment bag analysis has been ad-hoc; each new question needs a
 fresh re-read of the bag. Architecture agreed in design discussion:
-two-stage CLI pipeline (`bag_to_parquet`, `parquet_to_report`),
+two-stage CLI pipeline (`bag_to_sqlite`, `sqlite_to_report`),
 ament_python package inside this repo alongside `sound_speed_bridge`,
 PNGs+`summary.md` committed under
 `unh_echoboats_project11/docs/logs/<year>/<deployment>/<bag-name>/`,
-parquet sidecars stay local. Validated against the 2026-04-29 cod rock
-survey bag (251 MB, 42 topics, ~2.18 hr).
+the SQLite extract stays local. Validated against the 2026-04-29 cod
+rock survey bag (251 MB, 42 topics, ~2.18 hr).
+
+Storage backend started as parquet but switched to SQLite during
+implementation: pyarrow isn't packaged for Ubuntu 24.04 and venv-based
+Python deps mix poorly with `ros2 run` (PYTHONPATH and shebang
+ordering). SQLite uses only stdlib + `python3-pandas` (apt) and gives
+free `sqlite3` CLI ad-hoc queries.
 
 ## Approach
 
@@ -39,15 +45,15 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
    `udp_bridge_interfaces/BridgeInfo`,
    `udp_bridge_interfaces/TopicStatisticsArray`. Unknown types fall
    through to `{json: <repr>}` (skip rather than crash).
-4. **Parquet writer** (`bag_analysis/parquet_writer.py`) — one parquet
-   file per topic via `pyarrow.parquet`, schema inferred per-topic from
-   first N messages. Sanitize topic name → filename
-   (`_bizzy_mavros_battery.parquet`). Write `_topic_index.json` (topic
-   → file, msg type, count) and `_bag_meta.json` (start_ns, duration_ns,
-   source_path).
-5. **Parquet reader helpers** (`bag_analysis/parquet_reader.py`) —
-   `load_topic(parquet_dir, topic) -> pd.DataFrame` keyed off the
-   index. Used by all plot generators.
+4. **SQLite writer** (`bag_analysis/sqlite_writer.py`) — one table per
+   topic via `pandas.to_sql`, schema inferred per-topic. Sanitize topic
+   → table name (`/bizzy/mavros/battery` → `t_bizzy_mavros_battery`).
+   Index `t_ns` for time-range queries. Write `_topic_index` (topic,
+   table_name, msg_type, count) and `_bag_meta` (key/value: start_ns,
+   duration_ns, source_path) tables in the same DB file.
+5. **SQLite reader helpers** (`bag_analysis/sqlite_reader.py`) —
+   `load_topic(db_path, topic) -> pd.DataFrame` keyed off the index
+   table. Used by all plot generators.
 6. **Plot generators** (`bag_analysis/plots/`) — one module per Tier 1
    plot. Each exposes `generate(parquet_dir, output_dir) -> PlotResult`
    returning PNG path + summary stats.
@@ -55,9 +61,9 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
    plot, writes `summary.md` with the bag header (start time, duration,
    topic count, message count) followed by per-plot sections (PNG
    embed + the summary stats from `PlotResult`).
-8. **Two CLI entry points** (`bag_analysis/cli/`) — `bag_to_parquet`
-   and `parquet_to_report`, both registered as console_scripts. Argparse
-   with `--bag`, `--parquet-dir`, `--output`, `--topics` (whitelist),
+8. **Two CLI entry points** (`bag_analysis/cli/`) — `bag_to_sqlite`
+   and `sqlite_to_report`, both registered as console_scripts. Argparse
+   with `--bag`, `--db`, `--output`, `--topics` (whitelist),
    `--tier` (default 1), `--robot-namespace` (default `bizzy`). Plot
    modules use a small helper `topic(name)` that prefixes
    robot-scoped names with `/<namespace>/` and passes through
@@ -92,7 +98,7 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 
 | File | Change |
 |------|--------|
-| `bag_analysis/package.xml` | New — `<depend>` on rclpy, rosbag2_py, rosidl_runtime_py, and message pkgs (mavros_msgs, sbg_driver, marine_interfaces, sensor_msgs, nav_msgs, geometry_msgs, diagnostic_msgs, tf2_msgs, udp_bridge_interfaces, std_msgs, visualization_msgs, nav2_msgs); `<exec_depend>` on the pure-Python runtime libraries (python3-pandas, python3-pyarrow, python3-matplotlib) |
+| `bag_analysis/package.xml` | New — `<depend>` on rclpy, rosbag2_py, rosidl_runtime_py, and message pkgs we extract (mavros_msgs, sbg_driver, marine_interfaces, sensor_msgs, nav_msgs, geometry_msgs, diagnostic_msgs, udp_bridge_interfaces, nav2_msgs); `<exec_depend>` on the pure-Python runtime libraries (python3-pandas, python3-numpy, python3-matplotlib). Reader skips topics whose message type isn't installed, so message packages we don't extract aren't declared. |
 | `bag_analysis/bag_analysis/topics.py` | New — system-topic allowlist + `topic(name, namespace)` helper used by all plot modules |
 | `bag_analysis/setup.py` | New — entry_points for `bag_to_parquet` and `parquet_to_report` |
 | `bag_analysis/setup.cfg` | New — flake8/pep257 config matching `sound_speed_bridge` |
@@ -119,7 +125,7 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 | ADR | Triggered | How addressed |
 |---|---|---|
 | 0008 — ROS 2 conventions | Yes (new package) | Mirror `sound_speed_bridge` layout: ament_python build_type, BSD-3-Clause, format-3 package.xml, conventional setup.py with console_scripts |
-| 0009 — Python package management | Yes (Python deps) | All deps declared in `package.xml` (`<depend>` for build+runtime, `<exec_depend>` for pure-Python runtime libs) and resolved by rosdep — pandas/pyarrow/matplotlib all have rosdep keys; no pip, no .venv |
+| 0009 — Python package management | Yes (Python deps) | All deps declared in `package.xml` (`<depend>` for build+runtime, `<exec_depend>` for pure-Python runtime libs) and resolved by rosdep — pandas/numpy/matplotlib all have rosdep keys; no pip, no .venv. (Originally specced parquet/pyarrow but pyarrow isn't apt-packaged on Ubuntu 24.04, so storage swung to SQLite — stdlib only.) |
 | 0002 — Worktree isolation | Yes | Worktree created at `layers/worktrees/issue-marine_tools-5/` before any edits |
 
 ## Consequences
@@ -127,16 +133,26 @@ survey bag (251 MB, 42 topics, ~2.18 hr).
 | If we change... | Also update... | Included in plan? |
 |---|---|---|
 | `extractors/` API | All plot modules importing extractor outputs | Yes — kept internal; not a public ROS API |
-| Parquet schema (`_topic_index.json`) | Any external readers of the parquet sidecars | First iteration: docs only. Schema versioning deferred until there is a non-`bag_analysis` reader |
+| SQLite schema (`_topic_index`, `_bag_meta`, `t_<topic>` tables) | Any external readers of the DB | First iteration: docs only. Schema versioning deferred until there is a non-`bag_analysis` reader. The DB is also queryable from the `sqlite3` CLI for ad-hoc questions. |
 | New extractor | `bag_analysis/README.md` "how to add" section | Yes — README is part of this PR |
 
 ## Open Questions
 
 (none — the three planning questions resolved before implementation:
-parquet sidecars go to `~/data/bag_reports/<bag-name>/parquet/`,
+SQLite extract goes to `~/data/bag_reports/<bag-name>/data.db`,
 committed `report/` lands under `unh_echoboats_project11/docs/logs/<year>/<deployment>/<bag-name>/`;
 `--robot-namespace` CLI flag with default `bizzy`; no workspace
 coupling — CLIs are invoked directly via `ros2 run`.)
+
+## Implementation Notes
+
+- **Storage backend swung from parquet to SQLite mid-implementation.**
+  pyarrow has no apt package on Ubuntu 24.04 (and PEP 668 + the
+  PYTHONPATH-vs-`ros2 run` interaction makes a venv-based runtime dep
+  load-bearing for ROS messy). SQLite uses only stdlib + already-apt
+  pandas. The columnar speed advantage of parquet was not material at
+  our scale; the ad-hoc-query advantage of SQLite (`sqlite3` CLI on
+  the extract file) is a real ergonomic win.
 
 ## Estimated Scope
 

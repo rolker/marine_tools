@@ -1,6 +1,6 @@
-"""CLI: extract a rosbag2 to parquet sidecars.
+"""CLI: extract a rosbag2 to a SQLite database.
 
-    ros2 run bag_analysis bag_to_parquet --bag <bag-dir> --output <out-dir>
+    ros2 run bag_analysis bag_to_sqlite --bag <bag-dir> --output <db-path>
 """
 
 from __future__ import annotations
@@ -10,14 +10,14 @@ import sys
 from pathlib import Path
 
 from ..extractors import extract
-from ..parquet_writer import ParquetBagWriter
 from ..reader import iter_messages, open_reader
+from ..sqlite_writer import SqliteBagWriter
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog='bag_to_parquet',
-        description='Extract a rosbag2 directory to per-topic parquet files.',
+        prog='bag_to_sqlite',
+        description='Extract a rosbag2 directory to a SQLite database.',
     )
     p.add_argument(
         '--bag', required=True, type=Path,
@@ -25,7 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         '--output', required=True, type=Path,
-        help='Output directory for parquet files + index/meta JSONs',
+        help='Output SQLite database file path (e.g. .../data.db)',
     )
     p.add_argument(
         '--topics', nargs='+', default=None,
@@ -35,28 +35,23 @@ def _build_parser() -> argparse.ArgumentParser:
         '--robot-namespace', default='bizzy',
         help=('Robot namespace (default: bizzy). Currently informational '
               '— extraction is namespace-agnostic; the value is recorded '
-              'in the meta JSON for downstream report generation.'),
+              'in the meta table for downstream report generation.'),
     )
     return p
 
 
 def _bag_time_bounds(bag_path: Path) -> tuple[int, int]:
-    """Return (start_ns, duration_ns) from the bag's rosbag2 metadata.
-
-    Uses a one-shot reader probe to avoid parsing metadata.yaml directly.
-    """
+    """Return (start_ns, duration_ns) from the bag's rosbag2 metadata."""
     reader, _ = open_reader(bag_path)
     meta = reader.get_metadata()
-    start_ns = int(meta.starting_time.nanoseconds)
-    duration_ns = int(meta.duration.nanoseconds)
-    return start_ns, duration_ns
+    return int(meta.starting_time.nanoseconds), int(meta.duration.nanoseconds)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point."""
     args = _build_parser().parse_args(argv)
     bag_path: Path = args.bag.resolve()
-    output_dir: Path = args.output.resolve()
+    db_path: Path = args.output.resolve()
 
     if not bag_path.exists():
         print(f'error: bag path not found: {bag_path}', file=sys.stderr)
@@ -64,16 +59,16 @@ def main(argv: list[str] | None = None) -> int:
 
     start_ns, duration_ns = _bag_time_bounds(bag_path)
 
-    # Re-open via the probe to enumerate types; iter_messages opens its own
-    # reader, so we don't keep this one alive past the type lookup.
+    # Re-open via a probe to enumerate types; iter_messages opens its
+    # own reader, so we drop this one after the type lookup.
     probe_reader, topic_types = open_reader(bag_path)
     del probe_reader
 
     print(f'extracting {bag_path}', flush=True)
-    print(f'  -> {output_dir}', flush=True)
+    print(f'  -> {db_path}', flush=True)
     print(f'  topics in bag: {len(topic_types)}', flush=True)
 
-    writer = ParquetBagWriter(output_dir)
+    writer = SqliteBagWriter(db_path)
     n = 0
     for topic, msg, t_ns in iter_messages(bag_path, topics=args.topics):
         msg_type = topic_types[topic]
@@ -89,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f'done: {meta["total_messages"]} messages written, '
-        f'output at {output_dir}',
+        f'output at {db_path}',
         flush=True,
     )
     return 0

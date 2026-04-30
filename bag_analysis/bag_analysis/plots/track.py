@@ -6,7 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_topic
+from ..sqlite_reader import load_topic
 from ..topics import topic
 from ._common import PlotResult, save_figure
 
@@ -38,10 +38,10 @@ FIX_COLORS = {
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Render the lat/lon track with fix-grade coloring."""
-    df = load_topic(parquet_dir, topic('sensors/sbg/gps_pos', namespace))
+    df = load_topic(db_path, topic('sensors/sbg/gps_pos', namespace))
     if df is None or df.empty:
         return PlotResult(
             plot_name=PLOT_NAME, title=TITLE,

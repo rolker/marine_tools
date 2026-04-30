@@ -1,64 +1,88 @@
 """Tests for the mode_timeline plot.
 
-These tests build a tiny parquet directory by hand (no rosbag2 round
-trip) and exercise the plot's load → DataFrame → matplotlib path
-end-to-end. A real bag fixture would dwarf the test by orders of
-magnitude for the same assertion power.
+Build a tiny SQLite extract by hand (no rosbag2 round trip) and exercise
+the plot's load → DataFrame → matplotlib path end-to-end. A real bag
+fixture would dwarf this by orders of magnitude for the same assertions.
 """
 
 import json
+import sqlite3
 from pathlib import Path
-
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 from bag_analysis.plots.mode_timeline import generate
 
 
 _START_NS = 1_700_000_000_000_000_000
-_DURATION_NS = 60_000_000_000  # 60s
+_DURATION_NS = 60_000_000_000  # 60 s
 
 
-def _write_meta(parquet_dir: Path, *, total_messages: int) -> None:
-    (parquet_dir / '_bag_meta.json').write_text(json.dumps({
-        'source_bag_path': '/dev/null',
-        'start_ns': _START_NS,
-        'duration_ns': _DURATION_NS,
-        'total_messages': total_messages,
-    }))
+def _open_extract_db(db_path: Path) -> sqlite3.Connection:
+    """Create the empty bag_to_sqlite skeleton (meta + index tables)."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        'CREATE TABLE _bag_meta (key TEXT PRIMARY KEY, value TEXT)',
+    )
+    conn.execute(
+        'CREATE TABLE _topic_index ('
+        '  topic TEXT PRIMARY KEY, '
+        '  table_name TEXT, '
+        '  msg_type TEXT, '
+        '  count INTEGER'
+        ')',
+    )
+    conn.executemany(
+        'INSERT INTO _bag_meta(key, value) VALUES (?, ?)',
+        [
+            ('source_bag_path', json.dumps('/dev/null')),
+            ('start_ns', json.dumps(_START_NS)),
+            ('duration_ns', json.dumps(_DURATION_NS)),
+            ('total_messages', json.dumps(0)),
+        ],
+    )
+    return conn
 
 
-def _write_state_parquet(parquet_dir: Path) -> None:
-    """Write a synthetic /bizzy/mavros/state parquet + index entry."""
-    table = pa.table({
-        't_ns': [_START_NS + i * 1_000_000_000 for i in range(5)],
-        'frame_id': [''] * 5,
-        'header_t_ns': [_START_NS + i * 1_000_000_000 for i in range(5)],
-        'connected': [True] * 5,
-        'armed': [False, False, True, True, False],
-        'guided': [False, False, True, True, False],
-        'manual_input': [True, True, False, False, True],
-        'mode': ['MANUAL', 'MANUAL', 'AUTO', 'AUTO', 'MANUAL'],
-        'system_status': [3] * 5,
-    })
-    pq.write_table(table, parquet_dir / '_bizzy_mavros_state.parquet')
+def _write_state_topic(conn: sqlite3.Connection) -> None:
+    """Insert a synthetic /bizzy/mavros/state table + index entry."""
+    conn.execute('''
+        CREATE TABLE t_bizzy_mavros_state (
+            t_ns INTEGER,
+            mode TEXT,
+            armed INTEGER,
+            connected INTEGER
+        )
+    ''')
+    rows = [
+        (_START_NS + i * 1_000_000_000,
+         mode,
+         int(armed),
+         int(True))
+        for i, (mode, armed) in enumerate([
+            ('MANUAL', False),
+            ('MANUAL', False),
+            ('AUTO', True),
+            ('AUTO', True),
+            ('MANUAL', False),
+        ])
+    ]
+    conn.executemany(
+        'INSERT INTO t_bizzy_mavros_state VALUES (?, ?, ?, ?)', rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/state', 't_bizzy_mavros_state',
+         'mavros_msgs/msg/State', 5),
+    )
 
 
 def test_mode_timeline_renders_when_state_present(tmp_path):
-    parquet_dir = tmp_path / 'parquet'
-    parquet_dir.mkdir()
-    _write_state_parquet(parquet_dir)
-    (parquet_dir / '_topic_index.json').write_text(json.dumps({
-        '/bizzy/mavros/state': {
-            'file': '_bizzy_mavros_state.parquet',
-            'msg_type': 'mavros_msgs/msg/State',
-            'count': 5,
-        },
-    }))
-    _write_meta(parquet_dir, total_messages=5)
+    db_path = tmp_path / 'data.db'
+    with _open_extract_db(db_path) as conn:
+        _write_state_topic(conn)
+        conn.commit()
     output_dir = tmp_path / 'report'
 
-    result = generate(parquet_dir, output_dir, namespace='bizzy')
+    result = generate(db_path, output_dir, namespace='bizzy')
 
     assert result.png_path is not None
     assert result.png_path.exists()
@@ -68,13 +92,12 @@ def test_mode_timeline_renders_when_state_present(tmp_path):
 
 
 def test_mode_timeline_warns_when_no_topics_present(tmp_path):
-    parquet_dir = tmp_path / 'parquet'
-    parquet_dir.mkdir()
-    (parquet_dir / '_topic_index.json').write_text('{}')
-    _write_meta(parquet_dir, total_messages=0)
+    db_path = tmp_path / 'data.db'
+    with _open_extract_db(db_path) as conn:
+        conn.commit()
     output_dir = tmp_path / 'report'
 
-    result = generate(parquet_dir, output_dir, namespace='bizzy')
+    result = generate(db_path, output_dir, namespace='bizzy')
 
     assert result.png_path is None
-    assert result.warnings, 'expected at least one warning when topics missing'
+    assert result.warnings, 'expected warnings when topics missing'

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_meta, load_topic
+from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
 from ._common import PlotResult, save_figure, step_plot_strings, to_elapsed_s
 
@@ -24,17 +24,17 @@ TITLE = 'Mode timeline'
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Render the three-lane mode timeline."""
-    meta = load_meta(parquet_dir)
+    meta = load_meta(db_path)
     t0 = meta['start_ns']
 
-    state = load_topic(parquet_dir, topic('mavros/state', namespace))
+    state = load_topic(db_path, topic('mavros/state', namespace))
     mission = load_topic(
-        parquet_dir, topic('marine/status/mission_manager', namespace),
+        db_path, topic('marine/status/mission_manager', namespace),
     )
-    bt = load_topic(parquet_dir, topic('behavior_tree_log', namespace))
+    bt = load_topic(db_path, topic('behavior_tree_log', namespace))
 
     if state is None and mission is None and bt is None:
         return PlotResult(

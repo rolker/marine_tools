@@ -12,16 +12,16 @@ import matplotlib
 # ensures CLI runs don't try to open a display.
 matplotlib.use('Agg')
 
-from .parquet_reader import load_index, load_meta  # noqa: E402
 from .plots import TIER_1  # noqa: E402
 from .plots._common import PlotResult  # noqa: E402
+from .sqlite_reader import load_index, load_meta  # noqa: E402
 
 
 _TIERS = {1: TIER_1}
 
 
 def render_report(
-    parquet_dir: Path,
+    db_path: Path,
     output_dir: Path,
     *,
     namespace: str = 'bizzy',
@@ -37,24 +37,24 @@ def render_report(
         raise ValueError(f'tier {tier} not implemented (only 1)')
 
     results: list[PlotResult] = [
-        fn(parquet_dir, output_dir, namespace) for fn in plots
+        fn(db_path, output_dir, namespace) for fn in plots
     ]
 
     summary_path = output_dir / 'summary.md'
     summary_path.write_text(
-        _render_summary_md(parquet_dir, results, namespace),
+        _render_summary_md(db_path, results, namespace),
     )
     return summary_path
 
 
 def _render_summary_md(
-    parquet_dir: Path,
+    db_path: Path,
     results: list[PlotResult],
     namespace: str,
 ) -> str:
     """Compose the markdown report from plot results + bag metadata."""
-    meta = load_meta(parquet_dir)
-    index = load_index(parquet_dir)
+    meta = load_meta(db_path)
+    index = load_index(db_path)
     start = datetime.fromtimestamp(meta['start_ns'] / 1e9, tz=timezone.utc)
     duration_s = meta['duration_ns'] / 1e9
 

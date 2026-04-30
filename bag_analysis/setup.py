@@ -21,8 +21,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'bag_to_parquet = bag_analysis.cli.bag_to_parquet:main',
-            'parquet_to_report = bag_analysis.cli.parquet_to_report:main',
+            'bag_to_sqlite = bag_analysis.cli.bag_to_sqlite:main',
+            'sqlite_to_report = bag_analysis.cli.sqlite_to_report:main',
         ],
     },
 )

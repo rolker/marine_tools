@@ -11,6 +11,10 @@
   <depend>rosbag2_py</depend>
   <depend>rosidl_runtime_py</depend>
 
+  <!-- Message packages we have extractors for; types we don't extract
+       (tf2_msgs, visualization_msgs, std_msgs/Header, etc.) need to be
+       on the ROS path at runtime but aren't declared here — the reader
+       skips topics whose types fail to resolve. -->
   <depend>diagnostic_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>marine_interfaces</depend>
@@ -19,15 +23,11 @@
   <depend>nav_msgs</depend>
   <depend>sbg_driver</depend>
   <depend>sensor_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>tf2_msgs</depend>
   <depend>udp_bridge_interfaces</depend>
-  <depend>visualization_msgs</depend>
 
   <exec_depend>python3-matplotlib</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-pandas</exec_depend>
-  <exec_depend>python3-pyarrow</exec_depend>
 
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_meta, load_topic
+from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
 from ._common import PlotResult, save_figure, to_elapsed_s
 
@@ -17,15 +17,15 @@ TITLE = 'Speed + heading vs course over ground'
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Render speed (top) and heading-vs-COG (bottom)."""
-    meta = load_meta(parquet_dir)
+    meta = load_meta(db_path)
     t0 = meta['start_ns']
 
-    odom = load_topic(parquet_dir, topic('odom', namespace))
-    gps_vel = load_topic(parquet_dir, topic('sensors/sbg/gps_vel', namespace))
-    gps_hdt = load_topic(parquet_dir, topic('sensors/sbg/gps_hdt', namespace))
+    odom = load_topic(db_path, topic('odom', namespace))
+    gps_vel = load_topic(db_path, topic('sensors/sbg/gps_vel', namespace))
+    gps_hdt = load_topic(db_path, topic('sensors/sbg/gps_hdt', namespace))
 
     if odom is None and gps_vel is None and gps_hdt is None:
         return PlotResult(

@@ -3,13 +3,15 @@
 Two-stage post-deployment bag analysis for marine ROS 2 deployments.
 
 ```
-.mcap bag → parquet sidecars → markdown report + PNG plots
+.mcap bag → SQLite extract → markdown report + PNG plots
 ```
 
-The first stage (`bag_to_parquet`) reads a rosbag2 once and writes one
-parquet file per topic. The second stage (`parquet_to_report`) loads
-those parquet files and renders the Tier-1 report (7 plots + a summary
-table) without ever re-reading the bag.
+The first stage (`bag_to_sqlite`) reads a rosbag2 once and writes one
+table per topic into a single SQLite file. The second stage
+(`sqlite_to_report`) loads those tables and renders the Tier-1 report
+(7 plots + a summary) without ever re-reading the bag. Ad-hoc questions
+(e.g. peak current during line 3) are answerable directly via the
+`sqlite3` CLI on the same DB file.
 
 ## Tier-1 plot inventory
 
@@ -26,32 +28,39 @@ table) without ever re-reading the bag.
 ## Usage
 
 ```bash
-# Extract a bag to parquet (one-time per bag)
-ros2 run bag_analysis bag_to_parquet \
+# Extract a bag to SQLite (one-time per bag)
+ros2 run bag_analysis bag_to_sqlite \
     --bag /path/to/2026-04-29T21-43-29+00-00 \
-    --output ~/data/bag_reports/2026-04-29T21-43-29+00-00/parquet
+    --output ~/data/bag_reports/2026-04-29T21-43-29+00-00/data.db
 
-# Render the Tier-1 report from parquet (cheap; rerun freely)
-ros2 run bag_analysis parquet_to_report \
-    --parquet-dir ~/data/bag_reports/2026-04-29T21-43-29+00-00/parquet \
+# Render the Tier-1 report from the SQLite (cheap; rerun freely)
+ros2 run bag_analysis sqlite_to_report \
+    --db ~/data/bag_reports/2026-04-29T21-43-29+00-00/data.db \
     --output ~/data/bag_reports/2026-04-29T21-43-29+00-00/report
 ```
 
 Both CLIs accept `--robot-namespace` (default `bizzy`) so the same code
 runs against IzzyBoat or any other namespace once topics align.
 
+### Ad-hoc queries
+
+The extract is a regular SQLite database, so the `sqlite3` CLI gives you
+quick answers without touching Python:
+
+```bash
+sqlite3 ~/data/bag_reports/.../data.db \
+    "SELECT MAX(voltage), MIN(voltage) FROM t_bizzy_mavros_battery"
+
+sqlite3 .../data.db ".tables"            # list per-topic tables
+sqlite3 .../data.db "SELECT topic, count FROM _topic_index ORDER BY count DESC LIMIT 10"
+```
+
 ## Output layout
 
 ```
-<output>/parquet/
-├── _bag_meta.json            # start_ns, duration_ns, source path
-├── _topic_index.json         # topic → file, msg type, count
-├── _bizzy_mavros_battery.parquet
-├── _bizzy_odom.parquet
-└── ...
-
+<output>/data.db                 # SQLite extract — _bag_meta + _topic_index + one t_<topic> table per topic
 <output>/report/
-├── summary.md                # bag header + per-plot sections
+├── summary.md                   # bag header + per-plot sections
 ├── mode_timeline.png
 ├── track.png
 └── ...
@@ -59,43 +68,47 @@ runs against IzzyBoat or any other namespace once topics align.
 
 The `report/` directory is what gets committed under
 `unh_echoboats_project11/docs/logs/<year>/<deployment>/<bag-name>/`
-alongside the deployment log. The `parquet/` directory stays on the
-analyst's machine — regenerate it from the bag if you need it again.
+alongside the deployment log. `data.db` stays on the analyst's machine —
+regenerate it from the bag if you need it again.
 
 ## Extending
 
 ### Add a message extractor
 
-1. Create `bag_analysis/extractors/<short_name>.py` with an `extract(msg)
-   -> dict[str, Any]` function that returns a flat-keyed dict of the
-   columns you want in parquet.
-2. Register the extractor in `bag_analysis/extractors/__init__.py` keyed
-   by the canonical message-type string (e.g. `'sensor_msgs/msg/Imu'`).
+1. Create `bag_analysis/extractors/<short_name>.py` with an
+   `extract(msg) -> dict[str, Any]` returning a flat-keyed dict of
+   columns to land in SQLite.
+2. Register the extractor in `bag_analysis/extractors/__init__.py`
+   keyed by the canonical message-type string (e.g.
+   `'sensor_msgs/msg/Imu'`).
 
 Unknown types fall through to a JSON-string fallback — no need to add
-extractors for topics you don't actually plot.
+extractors for topics you don't actually plot. Topics whose message
+type isn't installed on the ROS path are skipped with a warning rather
+than crashing the pipeline.
 
 ### Add a plot
 
 1. Create `bag_analysis/plots/<plot_name>.py` exposing
-   `generate(parquet_dir, output_dir, namespace) -> PlotResult`.
-2. Register the plot in `bag_analysis/plots/__init__.py` along with the
-   tier it belongs to.
+   `generate(db_path, output_dir, namespace) -> PlotResult`.
+2. Register the plot in `bag_analysis/plots/__init__.py` along with
+   the tier it belongs to.
 
 `PlotResult` carries the PNG path plus a list of summary stats that
 land in `summary.md`.
 
 ## Schema
 
-Parquet files are one-per-topic. Filenames are the topic name with `/`
-replaced by `_` (so `/bizzy/mavros/battery` → `_bizzy_mavros_battery.parquet`).
-Schemas are inferred per-topic from the first batch of messages. Every
-file has a `t_ns` column (int64 nanoseconds since epoch) plus the
-flattened message fields.
+`data.db` holds:
 
-`_topic_index.json` maps `<topic> -> {file, msg_type, count}`.
-`_bag_meta.json` carries `start_ns`, `duration_ns`, `source_bag_path`,
-and `total_messages`.
+- One table per topic, named `t_<sanitized_topic>` (e.g.
+  `/bizzy/mavros/battery` → `t_bizzy_mavros_battery`). Every table has
+  a `t_ns` column (int64 ns since epoch, indexed) plus columns for the
+  flattened message fields.
+- `_bag_meta` (key, value) — `start_ns`, `duration_ns`,
+  `source_bag_path`, `total_messages`. Values stored as JSON strings.
+- `_topic_index` (topic, table_name, msg_type, count) — the inventory
+  the report stage uses to find tables.
 
 Schema versioning is deferred until something outside `bag_analysis`
 needs to read these files — for now, the contract is "regenerate from
@@ -105,7 +118,7 @@ the bag if the schema changes."
 
 Tests live under `test/` and use boundary mocks rather than a real bag
 fixture: they construct ROS message instances directly for the
-extractor tests and write small synthetic parquet files for the plot
+extractor tests and write small synthetic SQLite databases for the plot
 tests. Run via the standard ROS workflow:
 
 ```bash

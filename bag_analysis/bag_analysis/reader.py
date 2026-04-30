@@ -60,12 +60,19 @@ def iter_messages(
     bag_path: Path,
     *,
     topics: list[str] | None = None,
+    on_unresolved: str = 'warn',
 ) -> Iterator[tuple[str, Any, int]]:
     """
     Yield (topic, msg, t_ns) for every message in the bag.
 
     `topics`, if given, is a whitelist applied via the storage filter so
     only those topics are deserialized.
+
+    Topics whose message type can't be resolved on the ROS path
+    (e.g. a custom package not built into the current overlay) are
+    skipped. With `on_unresolved='warn'` a single warning is printed
+    per unresolved type the first time it's seen; with 'silent', nothing
+    is printed. The pipeline never crashes on a missing type.
     """
     reader, topic_types = open_reader(bag_path)
 
@@ -73,12 +80,28 @@ def iter_messages(
         reader.set_filter(rosbag2_py.StorageFilter(topics=topics))
 
     msg_classes: dict[str, Any] = {}
+    unresolved: set[str] = set()
     while reader.has_next():
         topic, data, t_ns = reader.read_next()
         msg_type_name = topic_types[topic]
+
+        if msg_type_name in unresolved:
+            continue
+
         msg_class = msg_classes.get(msg_type_name)
         if msg_class is None:
-            msg_class = get_message(msg_type_name)
+            try:
+                msg_class = get_message(msg_type_name)
+            except (ModuleNotFoundError, ValueError) as exc:
+                unresolved.add(msg_type_name)
+                if on_unresolved == 'warn':
+                    print(
+                        f'  warn: skipping {msg_type_name} '
+                        f'(unresolved: {exc})',
+                        flush=True,
+                    )
+                continue
             msg_classes[msg_type_name] = msg_class
+
         msg = deserialize_message(data, msg_class)
         yield topic, msg, t_ns

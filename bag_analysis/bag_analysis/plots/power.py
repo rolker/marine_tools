@@ -6,7 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_meta, load_topic
+from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
 from ._common import PlotResult, save_figure, to_elapsed_s
 
@@ -16,14 +16,14 @@ TITLE = 'Power: battery + PWM channels'
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Render battery V/I + RC/PWM channels in a 2x1 figure."""
-    meta = load_meta(parquet_dir)
+    meta = load_meta(db_path)
     t0 = meta['start_ns']
 
-    battery = load_topic(parquet_dir, topic('mavros/battery', namespace))
-    rcout = load_topic(parquet_dir, topic('mavros/rc/out', namespace))
+    battery = load_topic(db_path, topic('mavros/battery', namespace))
+    rcout = load_topic(db_path, topic('mavros/rc/out', namespace))
 
     if battery is None and rcout is None:
         return PlotResult(

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_meta, load_topic
+from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
 from ._common import PlotResult, save_figure, to_elapsed_s
 
@@ -16,14 +16,14 @@ TITLE = 'Comms: UDP bridge throughput + drops'
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Render byte-rate (top) and drop-rate (bottom) for udp_bridge."""
-    meta = load_meta(parquet_dir)
+    meta = load_meta(db_path)
     t0 = meta['start_ns']
 
     stats = load_topic(
-        parquet_dir, topic('udp_bridge/topic_statistics', namespace),
+        db_path, topic('udp_bridge/topic_statistics', namespace),
     )
     if stats is None or stats.empty:
         return PlotResult(

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..parquet_reader import load_index, load_meta, load_topic
+from ..sqlite_reader import load_index, load_meta, load_topic
 from ._common import PlotResult, save_figure, to_elapsed_s
 
 
@@ -20,15 +20,15 @@ TITLE = 'Sensor health: diagnostics + topic rates'
 
 
 def generate(
-    parquet_dir: Path, output_dir: Path, namespace: str,
+    db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
     """Render diagnostics-over-time and per-topic rate bars."""
-    meta = load_meta(parquet_dir)
+    meta = load_meta(db_path)
     t0 = meta['start_ns']
     duration_s = meta['duration_ns'] / 1e9
 
-    diag = load_topic(parquet_dir, '/diagnostics')
-    index = load_index(parquet_dir)
+    diag = load_topic(db_path, '/diagnostics')
+    index = load_index(db_path)
 
     fig, (ax_d, ax_r) = plt.subplots(2, 1, figsize=(12, 7))
     summary: list[str] = []
