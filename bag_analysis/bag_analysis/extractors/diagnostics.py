@@ -19,12 +19,29 @@ LEVEL_ERROR = 2
 LEVEL_STALE = 3
 
 
+def _level_int(level: Any) -> int:
+    """Coerce a DiagnosticStatus.level value to a plain int.
+
+    rclpy delivers ROS ``byte`` fields as Python ``bytes`` of length 1,
+    not as ``int``. Comparing ``b'\\x01' == 1`` is silently False, so
+    the level constants below never matched and every count came out as
+    zero on real bag data. Normalise once up-front.
+    """
+    if isinstance(level, (bytes, bytearray)):
+        return level[0] if level else 0
+    return int(level)
+
+
 def extract(msg) -> dict[str, Any]:
     """Aggregate a DiagnosticArray into per-level counts + flagged-name lists."""
     statuses = list(msg.status)
-    levels = [s.level for s in statuses]
-    error_names = [s.name for s in statuses if s.level == LEVEL_ERROR]
-    warn_names = [s.name for s in statuses if s.level == LEVEL_WARN]
+    levels = [_level_int(s.level) for s in statuses]
+    error_names = [
+        s.name for s, lvl in zip(statuses, levels) if lvl == LEVEL_ERROR
+    ]
+    warn_names = [
+        s.name for s, lvl in zip(statuses, levels) if lvl == LEVEL_WARN
+    ]
     return {
         **header_fields(msg.header),
         'n_status': len(statuses),
