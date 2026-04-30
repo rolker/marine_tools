@@ -100,3 +100,17 @@ and `total_messages`.
 Schema versioning is deferred until something outside `bag_analysis`
 needs to read these files — for now, the contract is "regenerate from
 the bag if the schema changes."
+
+## Tests
+
+Tests live under `test/` and use boundary mocks rather than a real bag
+fixture: they construct ROS message instances directly for the
+extractor tests and write small synthetic parquet files for the plot
+tests. Run via the standard ROS workflow:
+
+```bash
+cd <workspace>/layers/main/sensors_ws
+colcon build --packages-select bag_analysis --symlink-install
+colcon test --packages-select bag_analysis
+colcon test-result --verbose
+```
