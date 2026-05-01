@@ -21,6 +21,7 @@ from . import (
     behavior_tree,
     diagnostics,
     heartbeat,
+    imu,
     mavros_state,
     navsatfix,
     odometry,
@@ -48,6 +49,7 @@ EXTRACTORS: dict[str, Extractor] = {
     'sbg_driver/msg/SbgGpsVel': sbg.extract_gps_vel,
     'sbg_driver/msg/SbgStatus': sbg.extract_status,
     'sensor_msgs/msg/BatteryState': battery.extract,
+    'sensor_msgs/msg/Imu': imu.extract,
     'sensor_msgs/msg/NavSatFix': navsatfix.extract,
     'udp_bridge_interfaces/msg/BridgeInfo':
         udp_bridge.extract_bridge_info,

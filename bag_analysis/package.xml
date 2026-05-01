@@ -14,14 +14,17 @@
   <!-- Message packages we have extractors for; types we don't extract
        (tf2_msgs, visualization_msgs, std_msgs/Header, etc.) need to be
        on the ROS path at runtime but aren't declared here — the reader
-       skips topics whose types fail to resolve. -->
+       skips topics whose types fail to resolve. sbg_driver extractors
+       are kept in the source tree as a fallback for SBG-equipped boats
+       but the package itself isn't declared as a dependency, since the
+       SBG Ellipse-D on BizzyBoat is a temporary loaner; the reader's
+       skip-on-unresolved path handles bags that include or omit it. -->
   <depend>diagnostic_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>marine_interfaces</depend>
   <depend>mavros_msgs</depend>
   <depend>nav2_msgs</depend>
   <depend>nav_msgs</depend>
-  <depend>sbg_driver</depend>
   <depend>sensor_msgs</depend>
   <depend>udp_bridge_interfaces</depend>
 
