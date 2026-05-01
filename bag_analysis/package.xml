@@ -3,7 +3,7 @@
 <package format="3">
   <name>bag_analysis</name>
   <version>0.0.1</version>
-  <description>Two-stage post-deployment bag analysis: extract a rosbag2 to columnar parquet sidecars, then render a Tier-1 report (mode timeline, track, speed/heading, power, comms, sensor health, altitude) as PNGs + summary.md.</description>
+  <description>Two-stage post-deployment bag analysis: extract a rosbag2 to a SQLite database (one table per topic), then render a Tier-1 report (mode timeline, track, speed/heading, power, comms, sensor health, altitude) as PNGs + summary.md.</description>
   <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
   <license>BSD-3-Clause</license>
 

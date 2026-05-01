@@ -2,7 +2,7 @@
 
 The exact Heartbeat schema varies across marine_interfaces versions, so
 this extractor introspects scalar fields rather than hard-coding them —
-that way new fields land in parquet automatically and renames don't
+new fields land in the SQLite extract automatically and renames don't
 break extraction.
 """
 

@@ -1,11 +1,11 @@
 """
 Per-message-type extractors that flatten ROS messages to flat dicts
-suitable for parquet rows.
+suitable for one row per message in a SQLite table.
 
 Dispatch is by canonical "pkg/msg/Type" string. Unknown types fall
 through to a JSON-string fallback so unsupported topics don't crash
 the pipeline — they get a single `json` column with `repr(msg)` and
-the topic still ends up in parquet for downstream introspection.
+the topic still gets a SQLite table for downstream introspection.
 
 Adding a new extractor:
     1. Drop a module under `extractors/` with `extract(msg) -> dict`.
@@ -64,7 +64,7 @@ def _json_fallback(msg: Any) -> dict[str, Any]:
 
 
 def extract(msg_type: str, msg: Any) -> dict[str, Any]:
-    """Flatten a ROS message into a parquet-friendly dict."""
+    """Flatten a ROS message into a flat dict for one SQLite row."""
     fn = EXTRACTORS.get(msg_type)
     if fn is None:
         return _json_fallback(msg)

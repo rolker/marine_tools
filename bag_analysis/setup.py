@@ -16,7 +16,7 @@ setup(
     maintainer='Roland Arsenault',
     maintainer_email='roland@ccom.unh.edu',
     description=('Two-stage post-deployment bag analysis: extract rosbag2 '
-                 'to parquet, then render a Tier-1 report.'),
+                 'to SQLite, then render a Tier-1 report.'),
     license='BSD-3-Clause',
     tests_require=['pytest'],
     entry_points={

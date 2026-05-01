@@ -18,12 +18,12 @@ table per topic into a single SQLite file. The second stage
 | Plot | What it shows | Topics |
 |---|---|---|
 | Mode timeline | mavros mode + autonomy state vs time | `mavros/state`, `marine/status/mission_manager`, `behavior_tree_log` |
-| Track | Lat/lon path, colored by GNSS fix grade | `sensors/sbg/gps_pos`, `mavros/global_position/raw/fix` |
-| Speed/heading vs COG | Drift indicator | `odom`, `sensors/sbg/ekf_nav`, `sensors/sbg/gps_vel`, `sensors/sbg/gps_hdt` |
-| Power | Battery V/I, PWM channels, derived watts | `mavros/battery`, `mavros/rc/out` |
-| Comms | UDP bridge throughput + drops | `udp_bridge/...` |
+| Track | Lat/lon path, colored by GNSS status | `mavros/global_position/raw/fix` (primary), `sensors/sbg/gps_pos` (fallback) |
+| Speed/heading vs COG | Drift indicator | `odom`, `mavros/global_position/raw/gps_vel` (primary); `sensors/sbg/gps_vel`, `sensors/sbg/gps_hdt` (supplementary) |
+| Power | Battery voltage + PWM channels | `mavros/battery`, `mavros/rc/out` |
+| Comms | UDP bridge throughput + drops (Mbps) | `udp_bridge/bridge_info`, `udp_bridge/topic_statistics` |
 | Sensor health | Per-topic message rates + diagnostic levels | `/diagnostics`, bag metadata |
-| Altitude/heave | Altitude vs time (launch/recovery, tide proxy) | `sensors/sbg/ekf_nav` |
+| Altitude/heave | Altitude vs time (launch/recovery, tide proxy) | `mavros/global_position/raw/fix` (primary), `sensors/sbg/ekf_nav` (fallback) |
 
 ## Usage
 
