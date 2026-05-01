@@ -31,6 +31,25 @@ def to_elapsed_s(t_ns: pd.Series, t0_ns: int) -> pd.Series:
     return (t_ns - t0_ns) / 1e9
 
 
+# Unit convention for bandwidth columns across plots:
+#   * udp_bridge_interfaces `*_bytes_per_second` and `DataRates.*_bytes_per_second`
+#                           → bytes/sec (multiply by 8 then ÷ 1e6 → Mbps)
+#   * MikroTik `tx-byte` / `rx-byte` cumulative counters
+#                           → bytes  (diff over interval, then same conversion)
+#   * Starlink `*_throughput_bps`
+#                           → bits/sec (just ÷ 1e6 → Mbps; do NOT multiply by 8)
+#
+# Pick Mbps everywhere when rendering; convert at extractor or plot
+# time. The 8× factor between bytes/sec and bits/sec has been observed
+# to cause attribution errors in network-analysis writeups when these
+# sources are combined without an explicit convention — keep it
+# centralised here.
+
+def bytes_per_s_to_mbps(bps: pd.Series) -> pd.Series:
+    """Convert bytes/sec to megabits/sec."""
+    return bps * 8.0 / 1e6
+
+
 def save_figure(fig, output_dir: Path, plot_name: str) -> Path:
     """Save a figure to <output_dir>/<plot_name>.png and close it."""
     output_dir.mkdir(parents=True, exist_ok=True)
