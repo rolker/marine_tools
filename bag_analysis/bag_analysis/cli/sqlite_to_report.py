@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from ..report import render_report
+from ..sqlite_reader import load_meta
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,8 +29,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Output directory for summary.md + PNG plots',
     )
     p.add_argument(
-        '--robot-namespace', default='bizzy',
-        help='Robot namespace prefix for plots (default: bizzy)',
+        '--robot-namespace', default=None,
+        help=('Robot namespace prefix for plots. Defaults to the value '
+              'recorded in the DB _bag_meta by bag_to_sqlite, falling '
+              "back to 'bizzy' if absent."),
     )
     p.add_argument(
         '--tier', type=int, default=1,
@@ -68,9 +71,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    namespace = args.robot_namespace
+    if namespace is None:
+        namespace = load_meta(db_path).get('robot_namespace', 'bizzy')
+
     summary = render_report(
         db_path, output_dir,
-        namespace=args.robot_namespace,
+        namespace=namespace,
         tier=args.tier,
     )
     print(f'wrote {summary}', flush=True)

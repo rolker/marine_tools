@@ -33,9 +33,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         '--robot-namespace', default='bizzy',
-        help=('Robot namespace (default: bizzy). Currently informational '
-              '— extraction is namespace-agnostic; the value is recorded '
-              'in the meta table for downstream report generation.'),
+        help=('Robot namespace (default: bizzy). Recorded in the SQLite '
+              '_bag_meta table so sqlite_to_report can default to the '
+              'same namespace without re-specifying it on the CLI; '
+              'extraction itself is namespace-agnostic.'),
     )
     return p
 
@@ -81,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         source_bag_path=bag_path,
         start_ns=start_ns,
         duration_ns=duration_ns,
+        robot_namespace=args.robot_namespace,
     )
     print(
         f'done: {meta["total_messages"]} messages written, '

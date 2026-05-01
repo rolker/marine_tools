@@ -76,11 +76,15 @@ class SqliteBagWriter:
         source_bag_path: Path,
         start_ns: int,
         duration_ns: int,
+        robot_namespace: str | None = None,
     ) -> dict[str, Any]:
         """Write per-topic tables + _bag_meta + _topic_index to the DB.
 
         Removes any existing DB file first so stale schema doesn't
-        carry across runs. Returns the bag-meta dict for caller logging.
+        carry across runs. ``robot_namespace`` is recorded in
+        ``_bag_meta`` so the report stage can default to the same
+        namespace the extract was run for. Returns the bag-meta dict
+        for caller logging.
         """
         if self.db_path.exists():
             self.db_path.unlink()
@@ -104,12 +108,14 @@ class SqliteBagWriter:
                     'count': len(rows),
                 }
 
-            meta = {
+            meta: dict[str, Any] = {
                 'source_bag_path': str(source_bag_path),
                 'start_ns': start_ns,
                 'duration_ns': duration_ns,
                 'total_messages': sum(e['count'] for e in index.values()),
             }
+            if robot_namespace is not None:
+                meta['robot_namespace'] = robot_namespace
 
             conn.execute(
                 'CREATE TABLE _bag_meta '
