@@ -1,4 +1,5 @@
-"""Speed and heading-vs-COG plot.
+"""
+Speed and heading-vs-COG plot.
 
 Primary sources are mavros: ``odom`` for body-frame speed,
 ``mavros/global_position/raw/gps_vel`` for ground-truth speed-over-
@@ -19,9 +20,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from ._common import PlotResult, save_figure, to_elapsed_s
 from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
-from ._common import PlotResult, save_figure, to_elapsed_s
 
 
 PLOT_NAME = 'speed_heading'
@@ -155,7 +156,8 @@ def _enu_velocity_to_compass(vel_east: float, vel_north: float) -> float:
 def _enu_quaternion_to_compass(
     w: float, x: float, y: float, z: float,
 ) -> float:
-    """ENU body-orientation quaternion → compass-true heading degrees.
+    """
+    ENU body-orientation quaternion → compass-true heading degrees.
 
     Yaw is rotation about the up axis; in ENU yaw=0 means the body x
     axis points east. Compass heading = (90 - yaw_deg) mod 360 so that

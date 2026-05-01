@@ -1,4 +1,5 @@
-"""nav2_msgs/BehaviorTreeLog extractor.
+"""
+nav2_msgs/BehaviorTreeLog extractor.
 
 A BehaviorTreeLog message carries a list of state-change events. The
 mode-timeline plot needs message-level granularity, not event-level —

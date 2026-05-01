@@ -1,4 +1,5 @@
-"""Tests for the mode_timeline plot.
+"""
+Tests for the mode_timeline plot.
 
 Build a tiny SQLite extract by hand (no rosbag2 round trip) and exercise
 the plot's load → DataFrame → matplotlib path end-to-end. A real bag
@@ -6,8 +7,8 @@ fixture would dwarf this by orders of magnitude for the same assertions.
 """
 
 import json
-import sqlite3
 from pathlib import Path
+import sqlite3
 
 from bag_analysis.plots.mode_timeline import generate
 
@@ -44,14 +45,14 @@ def _open_extract_db(db_path: Path) -> sqlite3.Connection:
 
 def _write_state_topic(conn: sqlite3.Connection) -> None:
     """Insert a synthetic /bizzy/mavros/state table + index entry."""
-    conn.execute('''
+    conn.execute("""
         CREATE TABLE t_bizzy_mavros_state (
             t_ns INTEGER,
             mode TEXT,
             armed INTEGER,
             connected INTEGER
         )
-    ''')
+    """)
     rows = [
         (_START_NS + i * 1_000_000_000,
          mode,

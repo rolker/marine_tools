@@ -1,4 +1,5 @@
-"""udp_bridge_interfaces extractors.
+"""
+udp_bridge_interfaces extractors.
 
 Both extractors aggregate their nested structure into a single flat row
 per message. The schemas are wide and lists are nested two levels deep,

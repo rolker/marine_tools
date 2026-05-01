@@ -1,4 +1,5 @@
-"""marine_interfaces/Heartbeat extractor.
+"""
+marine_interfaces/Heartbeat extractor.
 
 The exact Heartbeat schema varies across marine_interfaces versions, so
 this extractor introspects scalar fields rather than hard-coding them —

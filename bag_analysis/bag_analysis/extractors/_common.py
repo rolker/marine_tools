@@ -11,10 +11,11 @@ def stamp_to_ns(stamp) -> int:
 
 
 def header_fields(header) -> dict[str, Any]:
-    """Standard fields for a std_msgs/Header.
+    """
+    Return frame_id + header_t_ns for a std_msgs/Header.
 
-    Returns frame_id + header_t_ns (publisher-stamp time, distinct from
-    the bag-receive timestamp that lands in the row's t_ns column).
+    ``header_t_ns`` is the publisher-stamp time, distinct from the
+    bag-receive timestamp that lands in the row's ``t_ns`` column.
     """
     return {
         'frame_id': header.frame_id,

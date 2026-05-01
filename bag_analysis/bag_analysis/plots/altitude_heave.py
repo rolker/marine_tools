@@ -1,4 +1,5 @@
-"""Altitude / heave plot: launch + recovery, tide proxy.
+"""
+Altitude / heave plot: launch + recovery, tide proxy.
 
 Primary source is mavros NavSatFix (``mavros/global_position/raw/fix``),
 which publishes MSL altitude on every ArduPilot/mavros boat. SBG
@@ -14,16 +15,15 @@ rejects them cleanly without smearing the launch/recovery transitions.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import math
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from ._common import PlotResult, save_figure, to_elapsed_s
 from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
-from ._common import PlotResult, save_figure, to_elapsed_s
 
 
 PLOT_NAME = 'altitude_heave'
@@ -101,7 +101,8 @@ def _render(output_dir: Path, df: pd.DataFrame, t0: int, *, source: str,
 def _rolling_median_by_seconds(
     t_ns: pd.Series, values: pd.Series, window_s: float,
 ) -> tuple[pd.Series, int]:
-    """Apply a centered rolling median sized in seconds.
+    """
+    Apply a centered rolling median sized in seconds.
 
     Estimates the sample period from the median of ``diff(t_ns)`` and
     converts to a sample count. Falls back to no smoothing when the

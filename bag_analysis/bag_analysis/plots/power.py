@@ -1,4 +1,5 @@
-"""Power plot: battery voltage + RC/PWM channels.
+"""
+Power plot: battery voltage + RC/PWM channels.
 
 BizzyBoat has no current sensor; ``BatteryState.current`` reads as a
 constant placeholder (~0.01 A) and any current/watts derived from it
@@ -12,9 +13,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from ._common import PlotResult, save_figure, to_elapsed_s
 from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
-from ._common import PlotResult, save_figure, to_elapsed_s
 
 
 PLOT_NAME = 'power'

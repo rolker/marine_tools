@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from rclpy.serialization import deserialize_message
-from rosidl_runtime_py.utilities import get_message
 import rosbag2_py
+from rosidl_runtime_py.utilities import get_message
 
 
 def _detect_storage_id(bag_path: Path) -> str:

@@ -1,4 +1,5 @@
-"""Tests for udp_bridge_interfaces extractors.
+"""
+Tests for udp_bridge_interfaces extractors.
 
 Construct BridgeInfo and TopicStatisticsArray with the schema actually
 shipped in udp_bridge_interfaces (TopicStatistics with a DataRates send
@@ -8,6 +9,10 @@ and assert the extractor emits the correct totals.
 
 import math
 
+from bag_analysis.extractors.udp_bridge import (
+    extract_bridge_info,
+    extract_topic_statistics_array,
+)
 from udp_bridge_interfaces.msg import (
     BridgeInfo,
     DataRates,
@@ -15,11 +20,6 @@ from udp_bridge_interfaces.msg import (
     RemoteConnection,
     TopicStatistics,
     TopicStatisticsArray,
-)
-
-from bag_analysis.extractors.udp_bridge import (
-    extract_bridge_info,
-    extract_topic_statistics_array,
 )
 
 

@@ -1,4 +1,7 @@
-"""CLI: extract a rosbag2 to a SQLite database.
+"""
+CLI: extract a rosbag2 to a SQLite database.
+
+Usage::
 
     ros2 run bag_analysis bag_to_sqlite --bag <bag-dir> --output <db-path>
 """
@@ -6,8 +9,8 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
+import sys
 
 from ..extractors import extract
 from ..reader import iter_messages, open_reader

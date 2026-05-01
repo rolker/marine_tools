@@ -1,4 +1,5 @@
-"""Comms plot: udp_bridge throughput + drops over time.
+"""
+Comms plot: udp_bridge throughput + drops over time.
 
 Reads the per-message rate columns the udp_bridge extractors now emit
 directly (no more `.diff()` of cumulative counters, which gave
@@ -18,14 +19,14 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..sqlite_reader import load_meta, load_topic
-from ..topics import topic
 from ._common import (
-    PlotResult,
     bytes_per_s_to_mbps,
+    PlotResult,
     save_figure,
     to_elapsed_s,
 )
+from ..sqlite_reader import load_meta, load_topic
+from ..topics import topic
 
 
 PLOT_NAME = 'comms'

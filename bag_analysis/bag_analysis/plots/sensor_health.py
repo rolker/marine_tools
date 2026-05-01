@@ -1,4 +1,5 @@
-"""Sensor health plot: diagnostics over time + per-topic message rates.
+"""
+Sensor health plot: diagnostics over time + per-topic message rates.
 
 Top panel: stacked counts of WARN/ERROR statuses from /diagnostics.
 Bottom panel: 15 highest-volume topics by average rate (Hz). Topics
@@ -11,8 +12,8 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from ..sqlite_reader import load_index, load_meta, load_topic
 from ._common import PlotResult, save_figure, to_elapsed_s
+from ..sqlite_reader import load_index, load_meta, load_topic
 
 
 PLOT_NAME = 'sensor_health'

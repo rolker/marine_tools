@@ -1,4 +1,5 @@
-"""Mode timeline plot.
+"""
+Mode timeline plot.
 
 Three-lane step plot of:
   - mavros/state.mode                       (Pixhawk flight mode)
@@ -14,9 +15,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from ._common import PlotResult, save_figure, step_plot_strings, to_elapsed_s
 from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
-from ._common import PlotResult, save_figure, step_plot_strings, to_elapsed_s
 
 
 PLOT_NAME = 'mode_timeline'

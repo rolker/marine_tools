@@ -1,4 +1,5 @@
-"""Tests for diagnostic_msgs/DiagnosticArray extractor.
+"""
+Tests for diagnostic_msgs/DiagnosticArray extractor.
 
 Constructs a DiagnosticArray with statuses at every level and checks
 that counts are non-zero and flagged-name lists pick up the right
@@ -6,9 +7,8 @@ entries. Also covers the bytes-vs-int level-field quirk that produced
 all-zero counts on real bag data.
 """
 
-from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
-
 from bag_analysis.extractors.diagnostics import extract
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
 
 def _status(name: str, level: int) -> DiagnosticStatus:
@@ -41,23 +41,24 @@ def test_extract_counts_each_level():
 
 
 def test_extract_handles_bytes_level_field():
-    """Level is a `byte` field; rclpy can deliver it as bytes, not int.
+    """
+    Level is a `byte` field; rclpy can deliver it as bytes, not int.
 
     The extractor casts to int up-front so counts work either way; this
     test simulates the bytes path with a duck-typed status object.
     """
     class FakeStatus:
+
         def __init__(self, name: str, level: bytes) -> None:
             self.name = name
             self.level = level
 
+    class _Stamp:
+        sec = 0
+        nanosec = 0
+
     class FakeHeader:
         frame_id = ''
-
-        class _Stamp:
-            sec = 0
-            nanosec = 0
-
         stamp = _Stamp()
 
     class FakeArray:

@@ -1,4 +1,5 @@
-"""Tests for sensor_msgs/BatteryState extractor.
+"""
+Tests for sensor_msgs/BatteryState extractor.
 
 Construct BatteryState messages directly and exercise the extractor's
 flatten contract — no rosbag2 round-trip needed for this layer.
@@ -6,9 +7,8 @@ flatten contract — no rosbag2 round-trip needed for this layer.
 
 import math
 
-from sensor_msgs.msg import BatteryState
-
 from bag_analysis.extractors.battery import extract
+from sensor_msgs.msg import BatteryState
 
 
 def _build_battery_state() -> BatteryState:

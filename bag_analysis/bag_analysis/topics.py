@@ -42,6 +42,7 @@ def topic(name: str, namespace: str = 'bizzy') -> str:
     '/diagnostics'
     >>> topic('odom', 'izzy')
     '/izzy/odom'
+
     """
     canonical = name if name.startswith('/') else '/' + name
     if canonical in SYSTEM_TOPICS:

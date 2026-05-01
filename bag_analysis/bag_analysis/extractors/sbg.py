@@ -1,4 +1,5 @@
-"""sbg_driver message extractors.
+"""
+sbg_driver message extractors.
 
 Pull scalar fields from the various sbg_driver messages. Each message
 has a `status` sub-struct with bit-fields; we extract the numeric

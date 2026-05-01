@@ -12,11 +12,12 @@ import pandas as pd
 
 @dataclass
 class PlotResult:
-    """Result of a plot generator.
+    """
+    Result of a plot generator.
 
-    `png_path` is None when the plot couldn't render (e.g. all source
+    ``png_path`` is None when the plot couldn't render (e.g. all source
     topics absent). Callers render placeholders in the summary.md from
-    `warnings` in that case.
+    ``warnings`` in that case.
     """
 
     plot_name: str
@@ -60,7 +61,8 @@ def save_figure(fig, output_dir: Path, plot_name: str) -> Path:
 
 
 def step_plot_strings(ax, t, values, ylabel: str) -> None:
-    """Step-plot a string-valued column with categorical y-ticks.
+    """
+    Step-plot a string-valued column with categorical y-ticks.
 
     Maps unique strings to integer y-positions and labels them, since
     matplotlib's step renderer expects numeric y.

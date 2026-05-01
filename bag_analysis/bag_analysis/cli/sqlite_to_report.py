@@ -1,15 +1,17 @@
-"""CLI: render a Tier-1 report from a previously extracted SQLite DB.
+"""
+CLI: render a Tier-1 report from a previously extracted SQLite DB.
 
-    ros2 run bag_analysis sqlite_to_report \\
-        --db <data.db> --output <out>
+Usage::
+
+    ros2 run bag_analysis sqlite_to_report --db <data.db> --output <out>
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import sqlite3
 import sys
-from pathlib import Path
 
 from ..report import render_report
 from ..sqlite_reader import load_meta

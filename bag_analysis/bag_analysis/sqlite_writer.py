@@ -18,11 +18,11 @@ much larger bags we'd switch to streamed batch inserts.
 
 from __future__ import annotations
 
+from collections import defaultdict
 import json
+from pathlib import Path
 import re
 import sqlite3
-from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -32,7 +32,8 @@ _TOPIC_SANITIZE_RE = re.compile(r'[^A-Za-z0-9_]+')
 
 
 def topic_to_table(topic: str) -> str:
-    """Sanitize a topic name into a SQLite table name.
+    """
+    Sanitize a topic name into a SQLite table name.
 
     The ``t_`` prefix avoids leading-underscore tables and keeps
     user/topic tables visually distinct from the reserved
@@ -44,6 +45,7 @@ def topic_to_table(topic: str) -> str:
     't_bizzy_mavros_battery'
     >>> topic_to_table('/diagnostics')
     't_diagnostics'
+
     """
     sanitized = _TOPIC_SANITIZE_RE.sub('_', topic).strip('_')
     return f't_{sanitized}'
@@ -53,6 +55,7 @@ class SqliteBagWriter:
     """Accumulate rows per topic and flush to one SQLite DB at finalize()."""
 
     def __init__(self, db_path: Path) -> None:
+        """Open the writer; the DB file is created on ``finalize()``."""
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -78,7 +81,8 @@ class SqliteBagWriter:
         duration_ns: int,
         robot_namespace: str | None = None,
     ) -> dict[str, Any]:
-        """Write per-topic tables + _bag_meta + _topic_index to the DB.
+        """
+        Write per-topic tables + _bag_meta + _topic_index to the DB.
 
         Removes any existing DB file first so stale schema doesn't
         carry across runs. ``robot_namespace`` is recorded in

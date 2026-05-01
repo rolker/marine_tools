@@ -1,4 +1,5 @@
-"""diagnostic_msgs/DiagnosticArray extractor.
+"""
+diagnostic_msgs/DiagnosticArray extractor.
 
 Per-message summary: counts by level plus a pipe-joined list of names
 in WARN or ERROR state. This intentionally drops the per-status
@@ -20,10 +21,11 @@ LEVEL_STALE = 3
 
 
 def _level_int(level: Any) -> int:
-    """Coerce a DiagnosticStatus.level value to a plain int.
+    r"""
+    Coerce a DiagnosticStatus.level value to a plain int.
 
     rclpy delivers ROS ``byte`` fields as Python ``bytes`` of length 1,
-    not as ``int``. Comparing ``b'\\x01' == 1`` is silently False, so
+    not as ``int``. Comparing ``b'\x01' == 1`` is silently False, so
     the level constants below never matched and every count came out as
     zero on real bag data. Normalise once up-front.
     """

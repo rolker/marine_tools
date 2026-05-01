@@ -1,4 +1,5 @@
-"""Track plot: lat/lon path colored by GNSS status.
+"""
+Track plot: lat/lon path colored by GNSS status.
 
 Primary source is mavros NavSatFix (``mavros/global_position/raw/fix``);
 SBG ``sensors/sbg/gps_pos`` is a fallback for SBG-only bags. Coloring
@@ -12,9 +13,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from ._common import PlotResult, save_figure
 from ..sqlite_reader import load_topic
 from ..topics import topic
-from ._common import PlotResult, save_figure
 
 
 PLOT_NAME = 'track'

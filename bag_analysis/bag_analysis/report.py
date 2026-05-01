@@ -1,4 +1,5 @@
-"""Report orchestrator: runs the configured plot tier and writes summary.md.
+"""
+Report orchestrator: run the configured plot tier and write summary.md.
 
 Importing ``.plots`` triggers ``plots/__init__.py`` which selects
 matplotlib's Agg backend before any pyplot import, so this CLI flow
@@ -25,7 +26,8 @@ def render_report(
     namespace: str = 'bizzy',
     tier: int = 1,
 ) -> Path:
-    """Run plot generators and write summary.md + PNGs.
+    """
+    Run plot generators and write summary.md + PNGs.
 
     Returns the path of the written summary.md.
     """

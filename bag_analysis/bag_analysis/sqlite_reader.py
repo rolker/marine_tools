@@ -11,8 +11,8 @@ expected sensor was offline or the bag started before a node came up.
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pandas as pd
@@ -42,7 +42,8 @@ def load_meta(db_path: Path) -> dict[str, Any]:
 
 
 def load_topic(db_path: Path, topic: str) -> pd.DataFrame | None:
-    """Load a topic's table as a DataFrame, or None if absent.
+    """
+    Load a topic's table as a DataFrame, or None if absent.
 
     A None return lets the caller short-circuit a plot when an expected
     topic isn't in the bag — strictly preferable to a try/except dance
