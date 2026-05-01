@@ -27,9 +27,12 @@ def _build_battery_state() -> BatteryState:
 
 def test_battery_extract_pulls_scalar_fields():
     fields = extract(_build_battery_state())
-    assert math.isclose(fields['voltage'], 24.5)
-    assert math.isclose(fields['current'], -3.2)
-    assert math.isclose(fields['percentage'], 0.78)
+    # BatteryState floats are float32 in the .msg definition; round-trip
+    # through the message class loses precision below ~1e-6, so a tight
+    # default rel_tol fails. Loosen the tolerance to that of float32.
+    assert math.isclose(fields['voltage'], 24.5, rel_tol=1e-6)
+    assert math.isclose(fields['current'], -3.2, rel_tol=1e-6)
+    assert math.isclose(fields['percentage'], 0.78, rel_tol=1e-6)
     assert fields['location'] == 'main'
     assert fields['serial_number'] == 'BAT-1'
 
@@ -37,8 +40,8 @@ def test_battery_extract_pulls_scalar_fields():
 def test_battery_extract_summarizes_cell_voltage_array():
     fields = extract(_build_battery_state())
     assert fields['n_cells'] == 6
-    assert math.isclose(fields['cell_voltage_min'], 4.04)
-    assert math.isclose(fields['cell_voltage_max'], 4.07)
+    assert math.isclose(fields['cell_voltage_min'], 4.04, rel_tol=1e-6)
+    assert math.isclose(fields['cell_voltage_max'], 4.07, rel_tol=1e-6)
 
 
 def test_battery_extract_handles_empty_cell_voltage():
