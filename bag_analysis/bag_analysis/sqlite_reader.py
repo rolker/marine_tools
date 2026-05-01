@@ -46,7 +46,10 @@ def load_topic(db_path: Path, topic: str) -> pd.DataFrame | None:
 
     A None return lets the caller short-circuit a plot when an expected
     topic isn't in the bag — strictly preferable to a try/except dance
-    around a missing table.
+    around a missing table. Rows are returned ordered by ``t_ns`` so
+    plots get a time-sorted series; SQLite gives no order guarantee
+    without an explicit ORDER BY, even though writes are time-ordered
+    in practice.
     """
     index = load_index(db_path)
     entry = index.get(topic)
@@ -54,6 +57,6 @@ def load_topic(db_path: Path, topic: str) -> pd.DataFrame | None:
         return None
     with sqlite3.connect(db_path) as conn:
         return pd.read_sql(
-            f'SELECT * FROM {entry["table_name"]}',
+            f'SELECT * FROM {entry["table_name"]} ORDER BY t_ns',
             conn,
         )
