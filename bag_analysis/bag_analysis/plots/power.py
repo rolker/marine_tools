@@ -1,4 +1,10 @@
-"""Power plot: battery V/I/W + RC/PWM channels."""
+"""Power plot: battery voltage + RC/PWM channels.
+
+BizzyBoat has no current sensor; ``BatteryState.current`` reads as a
+constant placeholder (~0.01 A) and any current/watts derived from it
+is meaningless. The voltage trace IS real and useful for end-of-day
+SoC checks; PWM channels are the closest available proxy for load.
+"""
 
 from __future__ import annotations
 
@@ -12,13 +18,13 @@ from ._common import PlotResult, save_figure, to_elapsed_s
 
 
 PLOT_NAME = 'power'
-TITLE = 'Power: battery + PWM channels'
+TITLE = 'Battery voltage + PWM channels'
 
 
 def generate(
     db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
-    """Render battery V/I + RC/PWM channels in a 2x1 figure."""
+    """Render battery voltage + RC/PWM channels in a 2x1 figure."""
     meta = load_meta(db_path)
     t0 = meta['start_ns']
 
@@ -36,29 +42,14 @@ def generate(
 
     if battery is not None and 'voltage' in battery.columns:
         t = to_elapsed_s(battery['t_ns'], t0)
-        ax_bat.plot(t, battery['voltage'], label='V', linewidth=0.7)
-        if 'current' in battery.columns:
-            ax_i = ax_bat.twinx()
-            ax_i.plot(
-                t, battery['current'], label='I',
-                color='tab:orange', linewidth=0.7,
-            )
-            ax_i.set_ylabel('current (A)')
-            watts = battery['voltage'] * battery['current']
-            summary.append(
-                f'- battery: V {battery.voltage.min():.2f}–'
-                f'{battery.voltage.max():.2f}, '
-                f'I peak {battery.current.max():.2f} A, '
-                f'P peak {watts.max():.0f} W',
-            )
-        else:
-            summary.append(
-                f'- battery: V {battery.voltage.min():.2f}–'
-                f'{battery.voltage.max():.2f}',
-            )
+        ax_bat.plot(t, battery['voltage'], linewidth=0.7)
         ax_bat.set_ylabel('voltage (V)')
-        ax_bat.legend(loc='upper left', fontsize=8)
         ax_bat.grid(alpha=0.3)
+        summary.append(
+            f'- battery voltage: '
+            f'{battery.voltage.min():.2f}–{battery.voltage.max():.2f} V '
+            f'(mean {battery.voltage.mean():.2f})',
+        )
     else:
         ax_bat.text(0.5, 0.5, 'battery: n/a',
                     transform=ax_bat.transAxes,
