@@ -1,20 +1,18 @@
-"""Report orchestrator: runs the configured plot tier and writes summary.md."""
+"""Report orchestrator: runs the configured plot tier and writes summary.md.
+
+Importing ``.plots`` triggers ``plots/__init__.py`` which selects
+matplotlib's Agg backend before any pyplot import, so this CLI flow
+is headless-safe without further setup here.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 
-import matplotlib
-
-# Headless backend; set before any pyplot import in the package.
-# Plot modules import pyplot transitively, so configuring Agg here
-# ensures CLI runs don't try to open a display.
-matplotlib.use('Agg')
-
-from .plots import TIER_1  # noqa: E402
-from .plots._common import PlotResult  # noqa: E402
-from .sqlite_reader import load_index, load_meta  # noqa: E402
+from .plots import TIER_1
+from .plots._common import PlotResult
+from .sqlite_reader import load_index, load_meta
 
 
 _TIERS = {1: TIER_1}
