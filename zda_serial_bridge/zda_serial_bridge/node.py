@@ -58,10 +58,14 @@ class ZdaSerialBridgeNode(Node):
         self.declare_parameter('baud', 9600)
         self.declare_parameter('talker_id', 'GP')
         # SbgUtcTimeStatus.clock_utc_status:
-        #   0 unknown, 1 valid (no leap seconds), 2 valid with leap seconds.
-        # Default 1: emit as soon as the device claims UTC validity. Bump to
-        # 2 if a downstream consumer cares about leap-second correctness.
-        self.declare_parameter('min_utc_status', 1)
+        #   0 unknown, 1 UTC initialized but leap seconds NOT yet known,
+        #   2 UTC fully valid (leap-second almanac downloaded).
+        # Default 2: status 1 emits GPS time mislabeled as UTC and is wrong
+        # by the GPS-UTC offset (~18 s) until the SBG receives the
+        # leap-second almanac. For sonar time-tagging that is a data
+        # integrity issue, not a cosmetic one. Drop to 1 only if a
+        # downstream consumer prefers degraded time over no time.
+        self.declare_parameter('min_utc_status', 2)
         # Optional stricter gate: also require PPS sync.
         self.declare_parameter('require_utc_sync', False)
         self.declare_parameter('reconnect_delay_sec', 2.0)
