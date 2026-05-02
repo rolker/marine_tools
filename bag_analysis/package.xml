@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bag_analysis</name>
+  <version>0.0.1</version>
+  <description>Two-stage post-deployment bag analysis: extract a rosbag2 to a SQLite database (one table per topic), then render a Tier-1 report (mode timeline, track, speed/heading, power, comms, sensor health, altitude) as PNGs + summary.md.</description>
+  <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <depend>rclpy</depend>
+  <depend>rosbag2_py</depend>
+  <depend>rosidl_runtime_py</depend>
+
+  <!-- Message packages we have extractors for; types we don't extract
+       (tf2_msgs, visualization_msgs, std_msgs/Header, etc.) need to be
+       on the ROS path at runtime but aren't declared here — the reader
+       skips topics whose types fail to resolve. sbg_driver extractors
+       are kept in the source tree as a fallback for SBG-equipped boats
+       but the package itself isn't declared as a dependency, since the
+       SBG Ellipse-D on BizzyBoat is a temporary loaner; the reader's
+       skip-on-unresolved path handles bags that include or omit it. -->
+  <depend>diagnostic_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>marine_interfaces</depend>
+  <depend>mavros_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>udp_bridge_interfaces</depend>
+
+  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pandas</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
