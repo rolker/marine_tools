@@ -7,7 +7,7 @@ payload path used by /bizzy/marine/heartbeat and /bizzy/marine/status/
 mission_manager.
 """
 
-from bag_analysis.extractors.heartbeat import extract, _sanitize_key
+from bag_analysis.extractors.heartbeat import _sanitize_key, extract
 from marine_interfaces.msg import Heartbeat, KeyValue
 
 

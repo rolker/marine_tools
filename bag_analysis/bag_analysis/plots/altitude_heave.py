@@ -50,7 +50,8 @@ def _trim_in_water(
 def generate(
     db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
-    """Plot altitude over time, smoothed with a rolling-median window.
+    """
+    Plot altitude over time, smoothed with a rolling-median window.
 
     When ``_bag_meta`` carries a launch/recovery window (set by the
     extractor's launch_recovery detector), the altitude plot is trimmed

@@ -85,7 +85,8 @@ _RESTING_AVG_S = 30
 
 
 def _thruster_channels(rcout: pd.DataFrame) -> list[str]:
-    """Pick the RCOut columns most likely to be thruster outputs.
+    """
+    Pick the RCOut columns most likely to be thruster outputs.
 
     Heuristic: ``ch_*`` columns whose values vary most. Two channels
     are returned (BizzyBoat is two-thruster) when at least two qualify;
@@ -105,7 +106,8 @@ def _thruster_channels(rcout: pd.DataFrame) -> list[str]:
 def _estimate_v_oc(
     voltage: pd.DataFrame, rcout: pd.DataFrame, thruster_cols: list[str],
 ) -> pd.Series:
-    """Estimate V_oc(t) = 90 s rolling max of idle-window voltage.
+    """
+    Estimate V_oc(t) = 90 s rolling max of idle-window voltage.
 
     Aligns voltage and rcout by nearest ``t_ns``, then masks voltage
     samples to those where every thruster channel sits in the idle

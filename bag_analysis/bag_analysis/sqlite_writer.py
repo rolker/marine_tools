@@ -71,7 +71,8 @@ def _add_missing_columns(
 
 
 class SqliteBagWriter:
-    """Accumulate rows per topic and flush to a SQLite DB at finalize().
+    """
+    Accumulate rows per topic and flush to a SQLite DB at finalize().
 
     Parameters
     ----------
@@ -83,9 +84,11 @@ class SqliteBagWriter:
         columns), and a new row is added to ``_bags``. If False
         (default), any existing DB at ``db_path`` is removed first so
         stale schema doesn't carry across runs.
+
     """
 
     def __init__(self, db_path: Path, append: bool = False) -> None:
+        """Open the writer; the DB file is created/extended on ``finalize()``."""
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -117,7 +120,8 @@ class SqliteBagWriter:
         duration_ns: int,
         robot_namespace: str | None = None,
     ) -> dict[str, Any]:
-        """Write per-topic tables + bag metadata + launch/recovery detection.
+        """
+        Write per-topic tables + bag metadata + launch/recovery detection.
 
         Returns the bag-meta dict for caller logging.
         """

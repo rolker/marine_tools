@@ -88,7 +88,7 @@ def test_mode_timeline_renders_when_state_present(tmp_path):
     assert result.png_path is not None
     assert result.png_path.exists()
     assert result.png_path.suffix == '.png'
-    assert any('mavros: 5' in line for line in result.summary)
+    assert any('FCU mode: 5' in line for line in result.summary)
     assert any('2 unique modes' in line for line in result.summary)
 
 

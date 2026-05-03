@@ -46,7 +46,7 @@ SMOOTHING_ROLLING_WINDOW_S = 10
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     cur = conn.execute(
-        'SELECT 1 FROM sqlite_master WHERE type=\'table\' AND name=?',
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
         (table,),
     )
     return cur.fetchone() is not None
@@ -61,7 +61,9 @@ def _candidate_altitude_tables(namespace: str) -> list[tuple[str, str]]:
     ]
 
 
-def _detect_from_series(t_ns: pd.Series, altitude: pd.Series) -> tuple[Optional[int], Optional[int]]:
+def _detect_from_series(
+    t_ns: pd.Series, altitude: pd.Series,
+) -> tuple[Optional[int], Optional[int]]:
     """Run the altitude-window algorithm on a sorted (t_ns, altitude) pair."""
     if altitude.dropna().empty:
         return None, None
@@ -97,8 +99,11 @@ def _detect_from_series(t_ns: pd.Series, altitude: pd.Series) -> tuple[Optional[
     return int(launch_dt.value), int(recovery_dt.value)
 
 
-def detect(conn: sqlite3.Connection, namespace: str) -> tuple[Optional[int], Optional[int]]:
-    """Detect the in-water window across all altitude data in the DB.
+def detect(
+    conn: sqlite3.Connection, namespace: str,
+) -> tuple[Optional[int], Optional[int]]:
+    """
+    Detect the in-water window across all altitude data in the DB.
 
     Tries altitude sources in preference order (SBG EKF first, then
     mavros). Returns ``(launch_t_ns, recovery_t_ns)`` for the longest

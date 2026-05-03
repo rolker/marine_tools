@@ -18,7 +18,8 @@ from ._common import header_fields
 
 
 def _bool_bits(obj) -> int:
-    """Pack the boolean fields of a ROS msg sub-struct into an int bitmask.
+    """
+    Pack the boolean fields of a ROS msg sub-struct into an int bitmask.
 
     The sbg_driver ROS bindings expand the firmware bitfields into
     individual boolean fields rather than keeping the raw uint word.
