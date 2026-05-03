@@ -35,12 +35,15 @@ def format_zda(
     and an XOR checksum computed over the body. Local-zone fields are left
     empty so the time is interpreted as UTC.
     """
-    frac = nanosec / 1e9
-    sec_full = second + frac
-    # ``%05.2f`` yields ``SS.SS`` zero-padded; works for the leap-second
-    # case (sec=60 → ``60.00``) since the integer part stays 2 digits.
+    # Truncate the fraction to centiseconds rather than rounding via
+    # ``%05.2f`` on ``second + nanosec/1e9``. Rounding would carry 99.5 cs
+    # into the integer second (e.g. ``sec=59, nanosec=999_999_999`` →
+    # ``60.00``) without carrying into minute/hour/day, producing invalid
+    # ``$ZDA`` sentences across boundaries. Truncation preserves the
+    # integer second as published (leap-second sec=60 still emits ``60.00``).
+    cs = min(99, nanosec // 10_000_000)
     body = (f'{talker_id}ZDA,'
-            f'{hour:02d}{minute:02d}{sec_full:05.2f},'
+            f'{hour:02d}{minute:02d}{second:02d}.{cs:02d},'
             f'{day:02d},{month:02d},{year:04d},,')
     chk = 0
     for c in body:

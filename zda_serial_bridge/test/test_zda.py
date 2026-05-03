@@ -49,9 +49,19 @@ def test_zda_talker_id_override():
 
 
 def test_zda_fractional_truncation_to_centiseconds():
-    # 999_999_999 ns → 0.999... s → rounded to 1.00 by %.2f. Expected:
-    # the integer-second field stays untouched (we do NOT carry into sec)
-    # and the fractional rounds. This documents the chosen behaviour.
+    # 999_999_999 ns truncates to 99 cs; the integer second stays at 12.
     sentence = format_zda(2026, 5, 1, 16, 56, 12, 999_999_999)
-    # %05.2f on 12.999... → '13.00' (printf-style rounding rolls integer)
-    assert sentence.startswith('$GPZDA,165613.00,01,05,2026,,*')
+    assert sentence.startswith('$GPZDA,165612.99,01,05,2026,,*')
+
+
+def test_zda_does_not_round_across_minute_boundary():
+    # sec=59 + 999_999_999 ns must NOT roll the integer second to 60 (which
+    # would emit an invalid ``165960.00`` since higher fields aren't carried).
+    sentence = format_zda(2026, 5, 1, 16, 59, 59, 999_999_999)
+    assert sentence.startswith('$GPZDA,165959.99,01,05,2026,,*')
+
+
+def test_zda_truncation_at_99_centiseconds():
+    # Truncation maps the top-of-second band (>= 990 ms) to 99 cs.
+    sentence = format_zda(2026, 5, 1, 0, 0, 0, 990_000_000)
+    assert sentence.startswith('$GPZDA,000000.99,01,05,2026,,*')
