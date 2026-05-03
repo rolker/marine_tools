@@ -35,28 +35,53 @@ TITLE = 'Altitude / heave (launch + recovery, tide proxy)'
 _DEFAULT_SMOOTH_WINDOW_S = 10.0
 
 
+def _trim_in_water(
+    df: pd.DataFrame, launch_t_ns: int | None, recovery_t_ns: int | None,
+) -> tuple[pd.DataFrame, str]:
+    """Trim to the launch/recovery window when known; tag the source string."""
+    if launch_t_ns is None or recovery_t_ns is None:
+        return df, ''
+    trimmed = df[
+        (df['t_ns'] >= launch_t_ns) & (df['t_ns'] <= recovery_t_ns)
+    ].reset_index(drop=True)
+    return trimmed, ' (in-water window only)'
+
+
 def generate(
     db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
-    """Plot altitude over time, smoothed with a rolling-median window."""
+    """Plot altitude over time, smoothed with a rolling-median window.
+
+    When ``_bag_meta`` carries a launch/recovery window (set by the
+    extractor's launch_recovery detector), the altitude plot is trimmed
+    to that window so the wave-induced heave is visible at full y-axis
+    resolution rather than being compressed by the metres-tall crane
+    pre/post.
+    """
     meta = load_meta(db_path)
     t0 = meta['start_ns']
+    launch_t_ns = meta.get('launch_t_ns')
+    recovery_t_ns = meta.get('recovery_t_ns')
 
     nav = load_topic(
         db_path, topic('mavros/global_position/raw/fix', namespace),
     )
     if nav is not None and 'altitude' in nav.columns:
-        return _render(
-            output_dir, nav, t0,
-            source='mavros/global_position/raw/fix (MSL)',
-        )
+        nav, suffix = _trim_in_water(nav, launch_t_ns, recovery_t_ns)
+        if len(nav) >= 3:
+            return _render(
+                output_dir, nav, t0,
+                source=f'mavros/global_position/raw/fix (MSL){suffix}',
+            )
 
     ekf = load_topic(db_path, topic('sensors/sbg/ekf_nav', namespace))
     if ekf is not None and 'altitude' in ekf.columns:
-        return _render(
-            output_dir, ekf, t0,
-            source='sensors/sbg/ekf_nav (ellipsoidal, fallback)',
-        )
+        ekf, suffix = _trim_in_water(ekf, launch_t_ns, recovery_t_ns)
+        if len(ekf) >= 3:
+            return _render(
+                output_dir, ekf, t0,
+                source=f'sensors/sbg/ekf_nav (ellipsoidal, fallback){suffix}',
+            )
 
     return PlotResult(
         plot_name=PLOT_NAME, title=TITLE,
