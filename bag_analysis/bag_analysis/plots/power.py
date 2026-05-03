@@ -103,9 +103,18 @@ def _thruster_channels(rcout: pd.DataFrame) -> list[str]:
     return moving[:2] if moving else []
 
 
+def _voltage_rolling_max(voltage: pd.DataFrame) -> pd.Series:
+    """Plain time-windowed rolling max of voltage, no PWM-idle masking."""
+    v = voltage.copy()
+    v.index = pd.to_datetime(v['t_ns'], unit='ns')
+    rolling_max = v['voltage'].rolling(f'{_V_OC_WINDOW_S}s').max()
+    rolling_max.index = range(len(rolling_max))
+    return rolling_max.ffill().bfill()
+
+
 def _estimate_v_oc(
     voltage: pd.DataFrame, rcout: pd.DataFrame, thruster_cols: list[str],
-) -> pd.Series:
+) -> tuple[pd.Series, str]:
     """
     Estimate V_oc(t) = 90 s rolling max of idle-window voltage.
 
@@ -113,36 +122,76 @@ def _estimate_v_oc(
     samples to those where every thruster channel sits in the idle
     band. The 90 s rolling-max over those idle samples (forward-filled
     across active periods) is the V_oc estimate.
+
+    Returns
+    -------
+    (v_oc, method) where method is one of:
+      - ``'idle-pwm-rolling-max'`` — primary method
+      - ``'fallback-no-thruster-channels'`` — no movable RCOut channels
+        found; used overall voltage rolling max
+      - ``'fallback-no-idle-samples'`` — thruster channels never sat in
+        the idle band; used overall voltage rolling max
+
+    The fallbacks tend to *underestimate* V_oc (and thus current/power)
+    because the rolling max sees voltage that's already drooping under
+    load — surface this in the caller's warnings list.
+
     """
     if not thruster_cols:
-        idle_mask = pd.Series(True, index=voltage.index)
-    else:
-        merged = pd.merge_asof(
-            voltage[['t_ns', 'voltage']].sort_values('t_ns'),
-            rcout[['t_ns'] + thruster_cols].sort_values('t_ns'),
-            on='t_ns', direction='nearest',
-        )
-        idle_mask = pd.Series(True, index=merged.index)
-        for col in thruster_cols:
-            v = merged[col].astype(float)
-            idle_mask &= v.between(_IDLE_PWM_LOW, _IDLE_PWM_HIGH)
-        merged['idle_voltage'] = np.where(idle_mask, merged['voltage'], np.nan)
-        # Use a time-based rolling max so irregular sampling rates
-        # don't distort the window.
-        merged.index = pd.to_datetime(merged['t_ns'], unit='ns')
-        rolling_max = (
-            merged['idle_voltage']
-            .rolling(f'{_V_OC_WINDOW_S}s').max()
-            .ffill().bfill()
-        )
-        rolling_max.index = range(len(rolling_max))
-        return rolling_max
-    # Fallback: no thruster discrimination → use voltage rolling max.
-    voltage = voltage.copy()
-    voltage.index = pd.to_datetime(voltage['t_ns'], unit='ns')
-    rolling_max = voltage['voltage'].rolling(f'{_V_OC_WINDOW_S}s').max()
+        return _voltage_rolling_max(voltage), 'fallback-no-thruster-channels'
+
+    merged = pd.merge_asof(
+        voltage[['t_ns', 'voltage']].sort_values('t_ns'),
+        rcout[['t_ns'] + thruster_cols].sort_values('t_ns'),
+        on='t_ns', direction='nearest',
+    )
+    idle_mask = pd.Series(True, index=merged.index)
+    for col in thruster_cols:
+        v = merged[col].astype(float)
+        idle_mask &= v.between(_IDLE_PWM_LOW, _IDLE_PWM_HIGH)
+    if not idle_mask.any():
+        return _voltage_rolling_max(voltage), 'fallback-no-idle-samples'
+
+    merged['idle_voltage'] = np.where(idle_mask, merged['voltage'], np.nan)
+    # Time-based rolling max so irregular sampling rates don't distort
+    # the window.
+    merged.index = pd.to_datetime(merged['t_ns'], unit='ns')
+    rolling_max = (
+        merged['idle_voltage']
+        .rolling(f'{_V_OC_WINDOW_S}s').max()
+        .ffill().bfill()
+    )
     rolling_max.index = range(len(rolling_max))
-    return rolling_max.ffill().bfill()
+    return rolling_max, 'idle-pwm-rolling-max'
+
+
+def _segmented_energy_wh(
+    t_s: np.ndarray, power: np.ndarray, gap_threshold_s: float = 5.0,
+) -> float:
+    """
+    Trapezoidal energy integration that splits on recording gaps.
+
+    On a multi-bag append, the combined timestamp series can have
+    minute-or-more gaps between bags (rotation, recording stop). A
+    plain ``np.trapz`` interpolates power linearly across that gap
+    and adds fictitious Wh. Splitting at any ``dt > gap_threshold_s``
+    avoids that. The 5 s default is well above normal sampling rates
+    (battery is typically 10 Hz) but well below realistic bag-rotation
+    gaps.
+    """
+    if len(t_s) < 2:
+        return 0.0
+    arr_t = np.asarray(t_s, dtype=float)
+    arr_p = np.asarray(power, dtype=float)
+    dt = np.diff(arr_t)
+    breaks = np.where(dt > gap_threshold_s)[0]
+    starts = np.concatenate([[0], breaks + 1])
+    ends = np.concatenate([breaks + 1, [len(arr_t)]])
+    total_ws = 0.0
+    for s, e in zip(starts, ends):
+        if e - s >= 2:
+            total_ws += float(np.trapz(arr_p[s:e], arr_t[s:e]))
+    return total_ws / 3600.0
 
 
 def _resting_voltage(
@@ -164,6 +213,51 @@ def _resting_voltage(
     return float(window['voltage'].mean())
 
 
+def _voltage_only_summary(
+    bat_w: pd.DataFrame, start_v: float | None, end_v: float | None,
+    extra_warning: str,
+) -> list[str]:
+    """Summary text for the rcout-absent fallback (voltage trace only)."""
+    v = bat_w['voltage'].astype(float)
+    summary = [
+        '- battery: 2× Torqeedo Power 24-3500 LiFePO4 in parallel '
+        f'({_CAPACITY_WH:.0f} Wh nominal)',
+    ]
+    if start_v is not None:
+        summary.append(f'- start V (resting, pre-launch): {start_v:.2f} V')
+    if end_v is not None:
+        summary.append(f'- end V (resting, post-recovery): {end_v:.2f} V')
+    if len(v):
+        summary.append(
+            f'- voltage in-water: range {v.min():.2f}–{v.max():.2f} V, '
+            f'mean {v.mean():.2f} V'
+        )
+    summary.append(f'- {extra_warning}')
+    return summary
+
+
+def _render_voltage_only(
+    bat_w: pd.DataFrame, t0: int, output_dir: Path, *,
+    start_v: float | None, end_v: float | None,
+    window_label: str, warning: str,
+) -> PlotResult:
+    """Render a single-pane voltage-only figure when rcout isn't available."""
+    fig, ax = plt.subplots(figsize=(12, 4))
+    elapsed = to_elapsed_s(bat_w['t_ns'], t0)
+    ax.plot(elapsed, bat_w['voltage'].astype(float), linewidth=0.7)
+    ax.set_ylabel('voltage (V)')
+    ax.set_xlabel('elapsed time (s)')
+    ax.grid(alpha=0.3)
+    fig.suptitle(f'{TITLE} — {window_label} (voltage only)')
+    fig.tight_layout()
+    png = save_figure(fig, output_dir, PLOT_NAME)
+    return PlotResult(
+        plot_name=PLOT_NAME, title=TITLE, png_path=png,
+        summary=_voltage_only_summary(bat_w, start_v, end_v, warning),
+        warnings=[warning],
+    )
+
+
 def generate(
     db_path: Path, output_dir: Path, namespace: str,
 ) -> PlotResult:
@@ -180,13 +274,6 @@ def generate(
         return PlotResult(
             plot_name=PLOT_NAME, title=TITLE,
             warnings=['battery voltage absent — power plot skipped'],
-        )
-
-    if rcout is None:
-        return PlotResult(
-            plot_name=PLOT_NAME, title=TITLE,
-            warnings=['rc/out absent — V-drop model needs PWM idle '
-                      'detection; power plot skipped'],
         )
 
     # Resting voltages: averaged across a small window straddling the
@@ -209,29 +296,50 @@ def generate(
             (battery['t_ns'] >= launch_t_ns)
             & (battery['t_ns'] <= recovery_t_ns)
         ].reset_index(drop=True)
-        rc_w = rcout[
-            (rcout['t_ns'] >= launch_t_ns)
-            & (rcout['t_ns'] <= recovery_t_ns)
-        ].reset_index(drop=True)
+        rc_w = (
+            rcout[
+                (rcout['t_ns'] >= launch_t_ns)
+                & (rcout['t_ns'] <= recovery_t_ns)
+            ].reset_index(drop=True)
+            if rcout is not None else None
+        )
         window_label = 'in-water'
     else:
         bat_w = battery.reset_index(drop=True)
-        rc_w = rcout.reset_index(drop=True)
+        rc_w = rcout.reset_index(drop=True) if rcout is not None else None
         window_label = 'full bag'
 
+    if rc_w is None:
+        return _render_voltage_only(
+            bat_w, t0, output_dir,
+            start_v=start_v, end_v=end_v, window_label=window_label,
+            warning=('rc/out absent — V-drop current/power not '
+                     'estimable; rendering voltage trace only'),
+        )
+
+    warnings: list[str] = []
     thruster_cols = _thruster_channels(rc_w)
-    v_oc = _estimate_v_oc(bat_w, rc_w, thruster_cols)
+    v_oc, v_oc_method = _estimate_v_oc(bat_w, rc_w, thruster_cols)
+    if v_oc_method == 'fallback-no-thruster-channels':
+        warnings.append(
+            'no movable thruster RCOut channels detected; V_oc estimated '
+            'from overall voltage rolling max (likely underestimates I/P)'
+        )
+    elif v_oc_method == 'fallback-no-idle-samples':
+        warnings.append(
+            'thrusters never sat in idle PWM band; V_oc estimated from '
+            'overall voltage rolling max (likely underestimates I/P)'
+        )
+
     v_load = bat_w['voltage'].astype(float).reset_index(drop=True)
     v_drop = (v_oc - v_load).clip(lower=0.0)
     current = (v_drop / _R_INT_OHMS)
     power = v_load * current
 
-    # Trapezoidal energy integration over time in seconds.
+    # Energy integration: split on recording gaps so multi-bag append
+    # boundaries don't add fictitious Wh.
     t_s = bat_w['t_ns'].astype('int64').to_numpy() / 1e9
-    if len(t_s) >= 2:
-        energy_wh = float(np.trapz(power.to_numpy(), t_s) / 3600.0)
-    else:
-        energy_wh = 0.0
+    energy_wh = _segmented_energy_wh(t_s, power.to_numpy())
     pct_capacity = 100.0 * energy_wh / _CAPACITY_WH if _CAPACITY_WH else 0.0
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
@@ -306,4 +414,5 @@ def generate(
 
     return PlotResult(
         plot_name=PLOT_NAME, title=TITLE, png_path=png, summary=summary,
+        warnings=warnings,
     )
