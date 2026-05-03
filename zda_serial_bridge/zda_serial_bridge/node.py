@@ -88,9 +88,17 @@ class ZdaSerialBridgeNode(Node):
         self._stale_error = float(
             self.get_parameter('stale_age_error_sec').value)
 
-        if len(self._talker_id) != 2 or not self._talker_id.isalpha():
+        # ``isalpha()`` accepts non-ASCII letters (e.g. ``'ßZ'``), and
+        # ``.upper()`` on some of them expands length (``'ß'`` → ``'SS'``),
+        # which would survive this gate but raise UnicodeEncodeError later
+        # when the sentence is encoded to ASCII. Restrict to plain ASCII
+        # NMEA talker characters at startup so the failure is loud and early.
+        if (len(self._talker_id) != 2
+                or not self._talker_id.isascii()
+                or not self._talker_id.isalpha()):
             raise ValueError(
-                f'talker_id must be 2 alphabetic chars, got {self._talker_id!r}')
+                f'talker_id must be 2 ASCII alphabetic chars, '
+                f'got {self._talker_id!r}')
         self._talker_id = self._talker_id.upper()
 
         self._lock = threading.Lock()
@@ -201,30 +209,50 @@ class ZdaSerialBridgeNode(Node):
         now_ns = self.get_clock().now().nanoseconds
 
         last_emit_age = (
-            float('inf') if self._last_emit_ns is None
+            None if self._last_emit_ns is None
             else (now_ns - self._last_emit_ns) / 1e9
         )
         last_msg_age = (
-            float('inf') if self._last_msg_ns is None
+            None if self._last_msg_ns is None
             else (now_ns - self._last_msg_ns) / 1e9
         )
+
+        msg_stale_error = (
+            last_msg_age is None or last_msg_age > self._stale_error)
+        emit_stale_error = (
+            last_emit_age is None or last_emit_age > self._stale_error)
+        msg_stale_warn = (
+            last_msg_age is None or last_msg_age > self._stale_warn)
+        emit_stale_warn = (
+            last_emit_age is None or last_emit_age > self._stale_warn)
 
         if self._serial is None:
             level = DiagnosticStatus.ERROR
             msg_text = f'Serial not connected ({self._device})'
-        elif last_msg_age > self._stale_error:
+        elif msg_stale_error:
             level = DiagnosticStatus.ERROR
-            msg_text = f'No SbgUtcTime for {last_msg_age:.1f}s'
-        elif last_emit_age > self._stale_error:
+            msg_text = (
+                'No SbgUtcTime received yet' if last_msg_age is None
+                else f'No SbgUtcTime for {last_msg_age:.1f}s'
+            )
+        elif emit_stale_error:
             level = DiagnosticStatus.ERROR
-            msg_text = (f'No ZDA emitted for {last_emit_age:.1f}s '
-                        f'(last status: {self._last_status_text})')
-        elif last_msg_age > self._stale_warn:
+            age_text = (
+                'never emitted' if last_emit_age is None
+                else f'last emitted {last_emit_age:.1f}s ago'
+            )
+            msg_text = (f'No ZDA emitted ({age_text}; '
+                        f'last status: {self._last_status_text})')
+        elif msg_stale_warn:
             level = DiagnosticStatus.WARN
             msg_text = f'SbgUtcTime stale: {last_msg_age:.1f}s'
-        elif last_emit_age > self._stale_warn:
+        elif emit_stale_warn:
             level = DiagnosticStatus.WARN
-            msg_text = (f'ZDA stale: {last_emit_age:.1f}s '
+            age_text = (
+                'never emitted' if last_emit_age is None
+                else f'{last_emit_age:.1f}s'
+            )
+            msg_text = (f'ZDA stale: {age_text} '
                         f'(last status: {self._last_status_text})')
         else:
             level = DiagnosticStatus.OK
@@ -245,10 +273,10 @@ class ZdaSerialBridgeNode(Node):
             KeyValue(key='serial_error_count',
                      value=str(self._serial_error_count)),
             KeyValue(key='last_emit_age_s',
-                     value=('inf' if last_emit_age == float('inf')
+                     value=('never' if last_emit_age is None
                             else f'{last_emit_age:.2f}')),
             KeyValue(key='last_msg_age_s',
-                     value=('inf' if last_msg_age == float('inf')
+                     value=('never' if last_msg_age is None
                             else f'{last_msg_age:.2f}')),
             KeyValue(key='clock_utc_status',
                      value=str(self._last_clock_utc_status)),
