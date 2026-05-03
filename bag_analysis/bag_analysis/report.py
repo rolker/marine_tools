@@ -58,6 +58,9 @@ def _render_summary_md(
     start = datetime.fromtimestamp(meta['start_ns'] / 1e9, tz=timezone.utc)
     duration_s = meta['duration_ns'] / 1e9
     bag_paths: list[str] = meta.get('source_bag_paths', []) or []
+    if not bag_paths and 'source_bag_path' in meta:
+        # Backward compat: pre-multi-bag DBs stored a singular key.
+        bag_paths = [meta['source_bag_path']]
     bag_count = meta.get('bag_count', 1)
 
     if bag_count > 1:
