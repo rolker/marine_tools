@@ -222,6 +222,22 @@ class SqliteBagWriter:
         robot_namespace: str | None,
     ) -> dict[str, Any]:
         with sqlite3.connect(self.db_path) as conn:
+            # Detect legacy schema (pre-multi-bag DBs only have _bag_meta
+            # and _topic_index — no _bags table). Reject up front rather
+            # than fail mid-write with a raw "no such table: _bags" error.
+            cur = conn.execute(
+                'SELECT 1 FROM sqlite_master '
+                "WHERE type='table' AND name='_bags'"
+            )
+            if cur.fetchone() is None:
+                raise ValueError(
+                    f'Legacy bag_analysis DB schema at {self.db_path}: '
+                    f'missing _bags table. Pre-multi-bag extracts cannot '
+                    f'be appended to directly. Re-extract without '
+                    f'--append (delete the DB first), then append '
+                    f'additional bags to the new DB.'
+                )
+
             existing_meta = self._read_meta(conn)
             existing_namespace = existing_meta.get('robot_namespace')
             if (

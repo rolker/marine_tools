@@ -35,10 +35,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Whitelist of topics; default: all topics in the bag',
     )
     p.add_argument(
-        '--robot-namespace', default='bizzy',
-        help=('Robot namespace (default: bizzy). Recorded in the SQLite '
-              '_bag_meta table so sqlite_to_report can default to the '
-              'same namespace without re-specifying it on the CLI; '
+        '--robot-namespace', default=None,
+        help=('Robot namespace (default: bizzy on fresh extract; '
+              'inherited from the existing DB on --append unless '
+              'overridden). Recorded in the SQLite _bag_meta table so '
+              'sqlite_to_report can default to the same namespace; '
               'extraction itself is namespace-agnostic.'),
     )
     p.add_argument(
@@ -81,6 +82,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f'  -> {db_path}', flush=True)
     print(f'  topics in bag: {len(topic_types)}', flush=True)
 
+    namespace = args.robot_namespace
+    if namespace is None and not args.append:
+        namespace = 'bizzy'
+
     writer = SqliteBagWriter(db_path, append=args.append)
     n = 0
     for topic, msg, t_ns in iter_messages(bag_path, topics=args.topics):
@@ -94,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         source_bag_path=bag_path,
         start_ns=start_ns,
         duration_ns=duration_ns,
-        robot_namespace=args.robot_namespace,
+        robot_namespace=namespace,
     )
     print(
         f'done: {meta["total_messages"]} messages written, '
