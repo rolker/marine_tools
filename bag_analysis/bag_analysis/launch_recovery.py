@@ -122,5 +122,7 @@ def detect(
             continue
         if df.empty:
             continue
-        return _detect_from_series(df['t_ns'], df['altitude'])
+        result = _detect_from_series(df['t_ns'], df['altitude'])
+        if result[0] is not None:
+            return result
     return None, None
