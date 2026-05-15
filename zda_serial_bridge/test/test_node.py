@@ -12,9 +12,8 @@ from unittest.mock import MagicMock, patch
 from diagnostic_msgs.msg import DiagnosticStatus
 import pytest
 import rclpy
-import serial
-
 from sbg_driver.msg import SbgUtcTime
+import serial
 from zda_serial_bridge.node import ZdaSerialBridgeNode
 
 
