@@ -62,6 +62,12 @@ from ..sqlite_reader import load_meta, load_topic
 from ..topics import topic
 
 
+# numpy 2.0 renamed np.trapz → np.trapezoid and emits DeprecationWarning
+# on every np.trapz call. Use the new name when available so reports
+# don't spew warnings; fall back transparently on numpy < 2.0.
+_trapezoid = getattr(np, 'trapezoid', np.trapz)
+
+
 PLOT_NAME = 'power'
 TITLE = 'Battery voltage + estimated current/power (V-drop model)'
 
@@ -211,7 +217,7 @@ def _segmented_energy_wh(
     total_ws = 0.0
     for s, e in zip(starts, ends):
         if e - s >= 2:
-            total_ws += float(np.trapz(arr_p[s:e], arr_t[s:e]))
+            total_ws += float(_trapezoid(arr_p[s:e], arr_t[s:e]))
     return total_ws / 3600.0
 
 
