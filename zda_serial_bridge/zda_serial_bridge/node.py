@@ -119,6 +119,17 @@ class ZdaSerialBridgeNode(Node):
         self._last_emit_ns: Optional[int] = None
         self._last_msg_ns: Optional[int] = None
         self._last_status_text = 'startup'
+        # Explicit, machine-readable gate state. Drives the diagnostic
+        # level for the "messages arriving but no emit yet" branch so
+        # the logic doesn't depend on parsing the human-readable
+        # _last_status_text. Values:
+        #   None              — no SbgUtcTime received yet
+        #   'suppressed_status' — clock_utc_status < min_utc_status
+        #   'suppressed_sync' — require_utc_sync=True and not synced
+        #   'open'            — gate is open (emit attempted; may have
+        #                       failed at the transport layer, but that
+        #                       is a separate ERROR class).
+        self._gate_state: Optional[str] = None
         self._last_clock_utc_status = -1
         self._last_clock_utc_sync = False
 
@@ -177,14 +188,21 @@ class ZdaSerialBridgeNode(Node):
 
         if self._last_clock_utc_status < self._min_utc_status:
             self._suppressed_count += 1
+            self._gate_state = 'suppressed_status'
             self._last_status_text = (
                 f'suppressed: clock_utc_status={self._last_clock_utc_status} '
                 f'< {self._min_utc_status}')
             return
         if self._require_utc_sync and not self._last_clock_utc_sync:
             self._suppressed_count += 1
+            self._gate_state = 'suppressed_sync'
             self._last_status_text = 'suppressed: clock_utc_sync=False'
             return
+        # Gate is open: clock_utc_status meets the minimum and (if
+        # required) sync is asserted. Mark even before the write
+        # attempt — a transport failure further down is reported via
+        # _serial_error_count / level=ERROR, not by reverting the gate.
+        self._gate_state = 'open'
 
         sentence = format_zda(
             int(msg.year), int(msg.month), int(msg.day),
@@ -234,6 +252,7 @@ class ZdaSerialBridgeNode(Node):
             last_emit_ns = self._last_emit_ns
             last_msg_ns = self._last_msg_ns
             last_status_text = self._last_status_text
+            gate_state = self._gate_state
             write_count = self._write_count
             suppressed_count = self._suppressed_count
             serial_error_count = self._serial_error_count
@@ -277,11 +296,11 @@ class ZdaSerialBridgeNode(Node):
             level = DiagnosticStatus.ERROR
             msg_text = f'No SbgUtcTime for {last_msg_age:.1f}s'
         elif last_emit_ns is None:
-            # Messages are arriving but emission gate is closed.
-            # last_status_text records why: "suppressed: ..." for the
-            # intentional UTC-validity gate (OK), anything else is
-            # transitional (warming up to first valid UTC).
-            if last_status_text.startswith('suppressed'):
+            # Messages are arriving but no emit has happened yet.
+            # gate_state is the source of truth (not a string-match on
+            # last_status_text). 'suppressed_*' is intentional gating
+            # (OK); anything else is transitional warmup.
+            if gate_state in ('suppressed_status', 'suppressed_sync'):
                 level = DiagnosticStatus.OK
                 msg_text = f'output gated: {last_status_text}'
             else:
@@ -325,6 +344,8 @@ class ZdaSerialBridgeNode(Node):
             KeyValue(key='clock_utc_status',
                      value=str(last_clock_utc_status)),
             KeyValue(key='clock_utc_sync', value=str(last_clock_utc_sync)),
+            KeyValue(key='gate_state',
+                     value=str(gate_state) if gate_state else 'unknown'),
             KeyValue(key='last_status', value=last_status_text),
         ]
 

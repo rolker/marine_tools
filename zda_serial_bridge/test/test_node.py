@@ -190,6 +190,37 @@ def test_diagnostic_intentional_suppression_is_ok(mock_serial_cls):
 
 
 @patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_gate_state_decoupled_from_status_text(mock_serial_cls):
+    """Diagnostic level must come from gate_state enum, not _last_status_text.
+
+    Regression guard: an earlier implementation distinguished
+    intentional suppression from transitional warmup by parsing
+    ``self._last_status_text.startswith('suppressed')``. That coupled
+    the diagnostic level to a human-readable string; any future edit
+    to the suppression wording (translation, capitalisation, prefix
+    change) would silently flip OK → WARN.
+
+    Simulate that future edit here by replacing the status text with
+    something that does NOT start with 'suppressed'. The diagnostic
+    must still report OK because gate_state is the source of truth.
+    """
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        node._node_start_ns -= int((node._startup_grace + 1) * 1e9)
+        node._on_utc_time(_make_msg(clock_utc_status=0))
+        assert node._gate_state == 'suppressed_status'
+        # Simulate future code editing the human-readable text. As
+        # long as gate_state stays 'suppressed_*', diagnostic stays OK.
+        node._last_status_text = 'gated by clock_utc_status (translated label)'
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.OK, (level, msg_text)
+        assert 'output gated' in msg_text, msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
 def test_diagnostic_recovers_to_ok_after_first_emit(mock_serial_cls):
     """Once the gate opens and an emit lands, diagnostic should be OK."""
     mock_serial_cls.return_value = MagicMock()
