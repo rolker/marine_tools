@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import logging
 from pathlib import Path
 import re
 import sqlite3
@@ -29,6 +30,9 @@ from typing import Any
 import pandas as pd
 
 from . import launch_recovery
+
+
+_logger = logging.getLogger(__name__)
 
 
 _TOPIC_SANITIZE_RE = re.compile(r'[^A-Za-z0-9_]+')
@@ -199,11 +203,6 @@ class SqliteBagWriter:
             )
             meta['launch_t_ns'] = launch_t_ns
             meta['recovery_t_ns'] = recovery_t_ns
-            meta['in_water_duration_ns'] = (
-                (recovery_t_ns - launch_t_ns)
-                if (launch_t_ns is not None and recovery_t_ns is not None)
-                else None
-            )
 
             self._write_meta(conn, meta)
             conn.commit()
@@ -250,9 +249,25 @@ class SqliteBagWriter:
                     f'(existing={existing_namespace!r}, '
                     f'new={robot_namespace!r}). Cannot mix namespaces in one DB.'
                 )
-            namespace = (
-                robot_namespace or existing_namespace or 'bizzy'
-            )
+            if robot_namespace is not None:
+                namespace = robot_namespace
+            elif existing_namespace is not None:
+                namespace = existing_namespace
+            else:
+                # No --robot-namespace flag and no stored value in the
+                # DB. Defaulting to 'bizzy' will produce wrong topic-
+                # table mappings on any other vehicle, and reports
+                # generated from this DB will look authoritative
+                # despite being wrong. Surface that loudly.
+                namespace = 'bizzy'
+                _logger.warning(
+                    '--append on %s: no stored robot_namespace and no '
+                    '--robot-namespace override; defaulting to %r. If '
+                    'this DB is for a non-BizzyBoat platform, the '
+                    'resulting topic-table mappings will be wrong. '
+                    'Re-extract with --robot-namespace=<name> to fix.',
+                    self.db_path, namespace,
+                )
 
             existing_index = self._read_topic_index(conn)
             new_index = dict(existing_index)
@@ -324,11 +339,6 @@ class SqliteBagWriter:
             )
             meta['launch_t_ns'] = launch_t_ns
             meta['recovery_t_ns'] = recovery_t_ns
-            meta['in_water_duration_ns'] = (
-                (recovery_t_ns - launch_t_ns)
-                if (launch_t_ns is not None and recovery_t_ns is not None)
-                else None
-            )
 
             self._write_meta(conn, meta)
             conn.commit()
