@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from diagnostic_msgs.msg import DiagnosticStatus
 import pytest
 import rclpy
+import serial
 
 from sbg_driver.msg import SbgUtcTime
 from zda_serial_bridge.node import ZdaSerialBridgeNode
@@ -200,6 +201,94 @@ def test_diagnostic_recovers_to_ok_after_first_emit(mock_serial_cls):
         level, msg_text = _capture_diag(node)
         assert level == DiagnosticStatus.OK, (level, msg_text)
         assert msg_text == 'OK', msg_text
+    finally:
+        node.destroy_node()
+
+
+# --------------------------------------------------------------- reconnect
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_reconnect_after_write_failure(mock_serial_cls):
+    """Write failure closes the port; next valid message re-opens it."""
+    failing_port = MagicMock()
+    failing_port.write.side_effect = serial.SerialException('cable yanked')
+    healthy_port = MagicMock()
+    # Two successive serial.Serial(...) calls: the first returns the
+    # failing port (used at startup); the reconnect attempt returns
+    # the healthy port.
+    mock_serial_cls.side_effect = [failing_port, healthy_port]
+
+    node = ZdaSerialBridgeNode()
+    try:
+        # Bypass the reconnect-delay rate limit for the test.
+        node._reconnect_delay = 0.0
+
+        # First valid message: write fails → port closed, error counted.
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        assert node._serial is None, (
+            'failed write should close the port'
+        )
+        assert node._serial_error_count == 1
+        assert node._write_count == 0
+        assert 'write error' in node._last_status_text
+
+        # Reset the rate-limit clock so the next call attempts a re-open.
+        node._last_open_attempt_ns = 0
+
+        # Next valid message: reconnect succeeds, write goes through.
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        assert node._serial is healthy_port
+        assert node._write_count == 1
+        assert healthy_port.write.call_count == 1
+        assert node._last_status_text == 'OK'
+        # serial.Serial called exactly twice: initial open + one reconnect.
+        assert mock_serial_cls.call_count == 2
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_reconnect_respects_rate_limit(mock_serial_cls):
+    """A second open attempt within reconnect_delay must be skipped."""
+    failing_port = MagicMock()
+    failing_port.write.side_effect = serial.SerialException('cable yanked')
+    healthy_port = MagicMock()
+    mock_serial_cls.side_effect = [failing_port, healthy_port]
+
+    node = ZdaSerialBridgeNode()
+    try:
+        # Keep the default ~2 s reconnect_delay; the rate-limit clock
+        # was set during the initial _open_serial in __init__, so a
+        # write-failure followed immediately by another _on_utc_time
+        # should NOT trigger another open attempt yet.
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        assert node._serial is None
+        opens_before = mock_serial_cls.call_count
+
+        # Immediate second call: rate-limit must suppress the open.
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        assert mock_serial_cls.call_count == opens_before, (
+            'open attempt within reconnect_delay should be rate-limited'
+        )
+        assert node._serial is None
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_open_failure_at_startup_keeps_node_alive(mock_serial_cls):
+    """Startup with serial open failing must not crash; node stays up."""
+    mock_serial_cls.side_effect = serial.SerialException('no device')
+
+    node = ZdaSerialBridgeNode()
+    try:
+        assert node._serial is None
+        assert node._serial_error_count == 1
+        # Diagnostics should report ERROR for the closed port.
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.ERROR
+        assert 'Serial not connected' in msg_text
     finally:
         node.destroy_node()
 
