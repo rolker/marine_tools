@@ -165,6 +165,21 @@ def _estimate_v_oc(
     return rolling_max, 'idle-pwm-rolling-max'
 
 
+def _max_v_sag(v_oc: pd.Series, v_load: pd.Series) -> float:
+    """
+    Largest ``V_oc − V_load`` over the window (V).
+
+    Not the same as ``V_oc[argmin(V_load)] − min(V_load)``: when ``V_oc``
+    drifts (the rolling max sees lower idle voltages later in a long
+    deployment), the worst voltage droop need not coincide with the
+    moment ``V_load`` is at its absolute minimum.
+    """
+    if not (len(v_load) and len(v_oc)):
+        return 0.0
+    diff = v_oc - v_load
+    return float(diff.max()) if len(diff) else 0.0
+
+
 def _segmented_energy_wh(
     t_s: np.ndarray, power: np.ndarray, gap_threshold_s: float = 5.0,
 ) -> float:
@@ -384,10 +399,7 @@ def generate(
     max_v = float(v_load.max()) if len(v_load) else float('nan')
     peak_i = float(current.max()) if len(current) else 0.0
     peak_p = float(power.max()) if len(power) else 0.0
-    sag = (
-        float(v_oc.iloc[v_load.idxmin()] - min_v)
-        if len(v_load) and len(v_oc) else 0.0
-    )
+    sag = _max_v_sag(v_oc, v_load)
 
     summary = [
         '- battery: 2× Torqeedo Power 24-3500 LiFePO4 in parallel '
@@ -400,7 +412,7 @@ def generate(
     summary += [
         f'- voltage {window_label}: range {min_v:.2f}–{max_v:.2f} V, '
         f'mean {mean_v:.2f} V',
-        f'- max V sag (V_oc − V_load at min): {sag:.2f} V',
+        f'- max V sag (max of V_oc − V_load): {sag:.2f} V',
         f'- estimated peak current ({window_label}): {peak_i:.1f} A',
         f'- estimated peak power ({window_label}): {peak_p:.0f} W',
         f'- estimated energy used ({window_label}): {energy_wh:.0f} Wh '

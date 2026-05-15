@@ -13,10 +13,12 @@ import sqlite3
 
 from bag_analysis.plots.power import (
     _IDLE_PWM_HIGH,
+    _max_v_sag,
     _segmented_energy_wh,
     generate,
 )
 import numpy as np
+import pandas as pd
 
 
 _START_NS = 1_700_000_000_000_000_000
@@ -228,6 +230,26 @@ def test_voltage_only_summary_uses_full_bag_label_when_window_missing(tmp_path):
     summary_text = '\n'.join(result.summary)
     assert 'voltage in-water:' not in summary_text, summary_text
     assert 'voltage full bag:' in summary_text, summary_text
+
+
+def test_max_v_sag_returns_global_max_of_diff_not_at_v_load_min():
+    """Max sag = max(V_oc - V_load), not (V_oc at V_load argmin) - min(V_load)."""
+    # V_oc drifts down as battery discharges; the worst V-drop is in the
+    # earlier high-V_oc period (diff=6), not at the absolute V_load min
+    # in the later low-V_oc period (diff=5).
+    v_oc = pd.Series([28.0, 28.0, 25.0, 25.0])
+    v_load = pd.Series([23.0, 22.0, 23.0, 20.0])
+    # OLD bug: V_oc.iloc[v_load.idxmin()] - min(v_load) = 25 - 20 = 5.0
+    # CORRECT: max(V_oc - V_load) = max([5, 6, 2, 5]) = 6.0
+    assert _max_v_sag(v_oc, v_load) == 6.0
+
+
+def test_max_v_sag_handles_empty_inputs():
+    """Empty series → 0.0 (don't crash)."""
+    assert _max_v_sag(pd.Series([], dtype=float),
+                      pd.Series([], dtype=float)) == 0.0
+    assert _max_v_sag(pd.Series([25.0]),
+                      pd.Series([], dtype=float)) == 0.0
 
 
 def test_segmented_energy_skips_gaps():
