@@ -9,6 +9,7 @@ exercised here directly with mocked serial I/O.
 
 from unittest.mock import MagicMock, patch
 
+from diagnostic_msgs.msg import DiagnosticStatus
 import pytest
 import rclpy
 
@@ -121,3 +122,101 @@ def test_rejects_non_ascii_talker_id(mock_serial_cls):
     rclpy.init(args=['--ros-args', '-p', 'talker_id:=ßZ'])
     with pytest.raises(ValueError, match='ASCII'):
         ZdaSerialBridgeNode()
+
+
+# --------------------------------------------------------------- diagnostics
+
+
+def _capture_diag(node) -> tuple[int, str]:
+    """Trigger a diagnostic publish on ``node`` and return (level, msg_text)."""
+    node._diag_pub = MagicMock()
+    node._publish_diagnostics()
+    diag_arr = node._diag_pub.publish.call_args.args[0]
+    status = diag_arr.status[0]
+    return status.level, status.message
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_warmup_no_message_yet_is_ok(mock_serial_cls):
+    """Cold start with no SbgUtcTime yet, within startup grace → OK."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        # Node just constructed, _last_msg_ns=None, _node_start_ns is now.
+        # Within startup_grace_sec (default 5s) the diagnostic must be OK
+        # with a "starting up" message — not an ERROR alarm.
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.OK, (level, msg_text)
+        assert 'starting up' in msg_text, msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_past_grace_no_message_is_error(mock_serial_cls):
+    """No SbgUtcTime past startup grace → ERROR (real silence)."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        # Rewind _node_start_ns so we're past the grace window.
+        node._node_start_ns -= int((node._startup_grace + 1) * 1e9)
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.ERROR, (level, msg_text)
+        assert 'No SbgUtcTime' in msg_text, msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_intentional_suppression_is_ok(mock_serial_cls):
+    """Messages arriving but gated by min_utc_status → OK, not ERROR."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        # Past the startup grace so we're not relying on the warmup OK
+        # path — the suppression gate must produce OK on its own merits.
+        node._node_start_ns -= int((node._startup_grace + 1) * 1e9)
+        # Suppressed messages: messages arriving (so last_msg_age is not
+        # None), but emission gated → _last_emit_ns stays None and
+        # _last_status_text starts with "suppressed".
+        node._on_utc_time(_make_msg(clock_utc_status=0))
+        assert node._last_emit_ns is None
+        assert node._last_status_text.startswith('suppressed')
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.OK, (level, msg_text)
+        assert 'output gated' in msg_text, msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_recovers_to_ok_after_first_emit(mock_serial_cls):
+    """Once the gate opens and an emit lands, diagnostic should be OK."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        assert node._last_emit_ns is not None
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.OK, (level, msg_text)
+        assert msg_text == 'OK', msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_stale_after_emit_then_silence(mock_serial_cls):
+    """Was emitting, then SbgUtcTime stops past error threshold → ERROR."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        # Rewind both timestamps to past the error threshold.
+        elapsed = int((node._stale_error + 1) * 1e9)
+        node._last_msg_ns -= elapsed
+        node._last_emit_ns -= elapsed
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.ERROR, (level, msg_text)
+        assert 'No SbgUtcTime for' in msg_text, msg_text
+    finally:
+        node.destroy_node()

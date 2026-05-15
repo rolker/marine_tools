@@ -75,6 +75,12 @@ class ZdaSerialBridgeNode(Node):
         # 1 Hz topic, so anything past a couple of seconds is a real gap.
         self.declare_parameter('stale_age_warn_sec', 2.5)
         self.declare_parameter('stale_age_error_sec', 10.0)
+        # Cold-start grace: during this window after node startup, the
+        # absence of any SbgUtcTime message is reported as "starting up"
+        # (OK), not "no data ever" (ERROR). Without this, the diagnostic
+        # alarms ERROR on the very first tick because the SBG driver
+        # hasn't had a chance to publish its first sample yet.
+        self.declare_parameter('startup_grace_sec', 5.0)
 
         self._device = self.get_parameter('device').value
         self._baud = int(self.get_parameter('baud').value)
@@ -87,6 +93,9 @@ class ZdaSerialBridgeNode(Node):
         self._stale_warn = float(self.get_parameter('stale_age_warn_sec').value)
         self._stale_error = float(
             self.get_parameter('stale_age_error_sec').value)
+        self._startup_grace = float(
+            self.get_parameter('startup_grace_sec').value)
+        self._node_start_ns = self.get_clock().now().nanoseconds
 
         # ``isalpha()`` accepts non-ASCII letters (e.g. ``'ßZ'``), and
         # ``.upper()`` on some of them expands length (``'ß'`` → ``'SS'``),
@@ -217,42 +226,53 @@ class ZdaSerialBridgeNode(Node):
             else (now_ns - self._last_msg_ns) / 1e9
         )
 
-        msg_stale_error = (
-            last_msg_age is None or last_msg_age > self._stale_error)
-        emit_stale_error = (
-            last_emit_age is None or last_emit_age > self._stale_error)
-        msg_stale_warn = (
-            last_msg_age is None or last_msg_age > self._stale_warn)
-        emit_stale_warn = (
-            last_emit_age is None or last_emit_age > self._stale_warn)
+        # Distinguish three cold-start scenarios that the previous logic
+        # collapsed into a single ERROR:
+        #   1. Node just started, SBG hasn't published yet — OK (warmup).
+        #   2. SbgUtcTime arriving but emission gated by min_utc_status /
+        #      require_utc_sync — OK (intentional, not a transport bug).
+        #   3. Truly stale (had data, gone silent past threshold) — ERROR.
+        node_age = (now_ns - self._node_start_ns) / 1e9
+        in_startup_grace = node_age < self._startup_grace
 
         if self._serial is None:
             level = DiagnosticStatus.ERROR
             msg_text = f'Serial not connected ({self._device})'
-        elif msg_stale_error:
+        elif last_msg_age is None:
+            # No SbgUtcTime received yet — warmup vs real silence.
+            if in_startup_grace:
+                level = DiagnosticStatus.OK
+                msg_text = (f'starting up ({node_age:.1f}s); '
+                            'no SbgUtcTime yet')
+            else:
+                level = DiagnosticStatus.ERROR
+                msg_text = (f'No SbgUtcTime received '
+                            f'({node_age:.0f}s after startup)')
+        elif last_msg_age > self._stale_error:
             level = DiagnosticStatus.ERROR
-            msg_text = (
-                'No SbgUtcTime received yet' if last_msg_age is None
-                else f'No SbgUtcTime for {last_msg_age:.1f}s'
-            )
-        elif emit_stale_error:
+            msg_text = f'No SbgUtcTime for {last_msg_age:.1f}s'
+        elif self._last_emit_ns is None:
+            # Messages are arriving but emission gate is closed.
+            # _last_status_text records why: "suppressed: ..." for the
+            # intentional UTC-validity gate (OK), anything else is
+            # transitional (warming up to first valid UTC).
+            if self._last_status_text.startswith('suppressed'):
+                level = DiagnosticStatus.OK
+                msg_text = f'output gated: {self._last_status_text}'
+            else:
+                level = DiagnosticStatus.WARN
+                msg_text = (f'no ZDA emitted yet '
+                            f'(last status: {self._last_status_text})')
+        elif last_emit_age > self._stale_error:
             level = DiagnosticStatus.ERROR
-            age_text = (
-                'never emitted' if last_emit_age is None
-                else f'last emitted {last_emit_age:.1f}s ago'
-            )
-            msg_text = (f'No ZDA emitted ({age_text}; '
-                        f'last status: {self._last_status_text})')
-        elif msg_stale_warn:
+            msg_text = (f'No ZDA emitted for {last_emit_age:.1f}s '
+                        f'(last status: {self._last_status_text})')
+        elif last_msg_age > self._stale_warn:
             level = DiagnosticStatus.WARN
             msg_text = f'SbgUtcTime stale: {last_msg_age:.1f}s'
-        elif emit_stale_warn:
+        elif last_emit_age > self._stale_warn:
             level = DiagnosticStatus.WARN
-            age_text = (
-                'never emitted' if last_emit_age is None
-                else f'{last_emit_age:.1f}s'
-            )
-            msg_text = (f'ZDA stale: {age_text} '
+            msg_text = (f'ZDA stale: {last_emit_age:.1f}s '
                         f'(last status: {self._last_status_text})')
         else:
             level = DiagnosticStatus.OK
