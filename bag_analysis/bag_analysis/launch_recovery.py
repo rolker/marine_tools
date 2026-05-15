@@ -11,13 +11,18 @@ then rises sharply at recovery.
 Algorithm (deliberately simple — easy to revisit when ramp launches
 or other deployment modes appear):
 
-1. Pick an altitude source, preferring SBG EKF over mavros raw fix.
+1. Run steps 2–4 against every available altitude source.
 2. Resample to 1 Hz median, then 10 s rolling median (matches the
    altitude_heave plot's smoothing).
 3. Find the minimum smoothed altitude. The *in-water* window is
    defined as samples within ``IN_WATER_THRESHOLD_M`` of that minimum.
 4. Take the **longest contiguous run** of in-water samples; report
-   its first/last timestamps as ``launch_t_ns`` / ``recovery_t_ns``.
+   its first/last timestamps as the window for that source.
+5. Across sources, return the *longest* such window. The candidate
+   order in :func:`_candidate_altitude_tables` (SBG EKF before mavros)
+   is preserved only as a tie-breaker, so a partial SBG track can't
+   silently truncate the deployment window when mavros covers the
+   full bag.
 
 Returns ``(None, None)`` when:
 - No altitude source is present in the DB
@@ -105,11 +110,21 @@ def detect(
     """
     Detect the in-water window across all altitude data in the DB.
 
-    Tries altitude sources in preference order (SBG EKF first, then
-    mavros). Returns ``(launch_t_ns, recovery_t_ns)`` for the longest
-    in-water run, or ``(None, None)`` if no usable altitude source is
-    present or the run is too short to be plausible.
+    Runs the in-water-window algorithm against **every** available
+    altitude source and returns the longest detected window. The
+    candidate order in :func:`_candidate_altitude_tables` (SBG EKF
+    before mavros) is preserved only as a tie-breaker — strictly
+    greater run lengths displace it. This prevents a partial SBG
+    track (late startup, dropout, missing in one appended bag) from
+    silently truncating the deployment window when a less-preferred
+    source covers the full bag.
+
+    Returns ``(launch_t_ns, recovery_t_ns)`` or ``(None, None)`` if
+    no usable altitude source is present or no run is long enough to
+    be plausible.
     """
+    best: Optional[tuple[int, int]] = None
+    best_run_ns = 0
     for table, col in _candidate_altitude_tables(namespace):
         if not _table_exists(conn, table):
             continue
@@ -122,7 +137,15 @@ def detect(
             continue
         if df.empty:
             continue
-        result = _detect_from_series(df['t_ns'], df['altitude'])
-        if result[0] is not None:
-            return result
-    return None, None
+        launch_ns, recovery_ns = _detect_from_series(df['t_ns'], df['altitude'])
+        if launch_ns is None or recovery_ns is None:
+            continue
+        run_ns = recovery_ns - launch_ns
+        # Strictly-greater so the preference order in
+        # _candidate_altitude_tables wins on ties.
+        if run_ns > best_run_ns:
+            best = (launch_ns, recovery_ns)
+            best_run_ns = run_ns
+    if best is None:
+        return None, None
+    return best
