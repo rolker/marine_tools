@@ -276,6 +276,40 @@ def test_reconnect_respects_rate_limit(mock_serial_cls):
 
 
 @patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_timer_attempts_reconnect_when_serial_closed(mock_serial_cls):
+    """Reconnect runs from the diagnostic timer too, not just from _on_utc_time.
+
+    Field scenario: serial port dies AND the SBG publisher stops at the
+    same time. With reconnect only inside _on_utc_time, the bridge would
+    never recover. The 1 Hz diagnostic timer must trigger _open_serial
+    independently — rate-limited by the same _last_open_attempt_ns, so
+    1 Hz polling is fine.
+    """
+    # First Serial(...) call fails; the diagnostic-timer reopen succeeds.
+    healthy_port = MagicMock()
+    mock_serial_cls.side_effect = [
+        serial.SerialException('no device at boot'),
+        healthy_port,
+    ]
+    node = ZdaSerialBridgeNode()
+    try:
+        # Startup open failed → _serial is None, no further message flow.
+        assert node._serial is None
+        node._reconnect_delay = 0.0
+        node._last_open_attempt_ns = 0
+
+        # No _on_utc_time call — the diagnostic tick alone must reopen.
+        _capture_diag(node)
+
+        assert node._serial is healthy_port, (
+            'diagnostic timer should trigger _open_serial when port is closed'
+        )
+        assert mock_serial_cls.call_count == 2
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
 def test_open_failure_at_startup_keeps_node_alive(mock_serial_cls):
     """Startup with serial open failing must not crash; node stays up."""
     mock_serial_cls.side_effect = serial.SerialException('no device')

@@ -215,15 +215,40 @@ class ZdaSerialBridgeNode(Node):
             self._close_serial()
 
     def _publish_diagnostics(self) -> None:
+        # Reconnect on every diagnostic tick so port recovery doesn't
+        # depend on continued SbgUtcTime flow. _open_serial is itself
+        # rate-limited by _reconnect_delay, so a 1 Hz call here only
+        # actually re-opens at most every `reconnect_delay_sec`.
+        if self._serial is None:
+            self._open_serial()
+
+        # Snapshot state under the lock so a write-then-close racing
+        # with the diagnostic publisher can't observe a half-mutated
+        # view. The diagnostic publisher only reads, but the fields
+        # below are written under _lock elsewhere; holding the lock
+        # while we copy them is the simplest contention-bounded
+        # invariant. (Lock is also obtained in _open_serial /
+        # _close_serial / _on_utc_time so the contention is small.)
+        with self._lock:
+            serial_open = self._serial is not None
+            last_emit_ns = self._last_emit_ns
+            last_msg_ns = self._last_msg_ns
+            last_status_text = self._last_status_text
+            write_count = self._write_count
+            suppressed_count = self._suppressed_count
+            serial_error_count = self._serial_error_count
+            last_clock_utc_status = self._last_clock_utc_status
+            last_clock_utc_sync = self._last_clock_utc_sync
+
         now_ns = self.get_clock().now().nanoseconds
 
         last_emit_age = (
-            None if self._last_emit_ns is None
-            else (now_ns - self._last_emit_ns) / 1e9
+            None if last_emit_ns is None
+            else (now_ns - last_emit_ns) / 1e9
         )
         last_msg_age = (
-            None if self._last_msg_ns is None
-            else (now_ns - self._last_msg_ns) / 1e9
+            None if last_msg_ns is None
+            else (now_ns - last_msg_ns) / 1e9
         )
 
         # Distinguish three cold-start scenarios that the previous logic
@@ -235,7 +260,7 @@ class ZdaSerialBridgeNode(Node):
         node_age = (now_ns - self._node_start_ns) / 1e9
         in_startup_grace = node_age < self._startup_grace
 
-        if self._serial is None:
+        if not serial_open:
             level = DiagnosticStatus.ERROR
             msg_text = f'Serial not connected ({self._device})'
         elif last_msg_age is None:
@@ -251,29 +276,29 @@ class ZdaSerialBridgeNode(Node):
         elif last_msg_age > self._stale_error:
             level = DiagnosticStatus.ERROR
             msg_text = f'No SbgUtcTime for {last_msg_age:.1f}s'
-        elif self._last_emit_ns is None:
+        elif last_emit_ns is None:
             # Messages are arriving but emission gate is closed.
-            # _last_status_text records why: "suppressed: ..." for the
+            # last_status_text records why: "suppressed: ..." for the
             # intentional UTC-validity gate (OK), anything else is
             # transitional (warming up to first valid UTC).
-            if self._last_status_text.startswith('suppressed'):
+            if last_status_text.startswith('suppressed'):
                 level = DiagnosticStatus.OK
-                msg_text = f'output gated: {self._last_status_text}'
+                msg_text = f'output gated: {last_status_text}'
             else:
                 level = DiagnosticStatus.WARN
                 msg_text = (f'no ZDA emitted yet '
-                            f'(last status: {self._last_status_text})')
+                            f'(last status: {last_status_text})')
         elif last_emit_age > self._stale_error:
             level = DiagnosticStatus.ERROR
             msg_text = (f'No ZDA emitted for {last_emit_age:.1f}s '
-                        f'(last status: {self._last_status_text})')
+                        f'(last status: {last_status_text})')
         elif last_msg_age > self._stale_warn:
             level = DiagnosticStatus.WARN
             msg_text = f'SbgUtcTime stale: {last_msg_age:.1f}s'
         elif last_emit_age > self._stale_warn:
             level = DiagnosticStatus.WARN
             msg_text = (f'ZDA stale: {last_emit_age:.1f}s '
-                        f'(last status: {self._last_status_text})')
+                        f'(last status: {last_status_text})')
         else:
             level = DiagnosticStatus.OK
             msg_text = 'OK'
@@ -287,11 +312,10 @@ class ZdaSerialBridgeNode(Node):
             KeyValue(key='device', value=self._device),
             KeyValue(key='baud', value=str(self._baud)),
             KeyValue(key='talker_id', value=self._talker_id),
-            KeyValue(key='write_count', value=str(self._write_count)),
-            KeyValue(key='suppressed_count',
-                     value=str(self._suppressed_count)),
+            KeyValue(key='write_count', value=str(write_count)),
+            KeyValue(key='suppressed_count', value=str(suppressed_count)),
             KeyValue(key='serial_error_count',
-                     value=str(self._serial_error_count)),
+                     value=str(serial_error_count)),
             KeyValue(key='last_emit_age_s',
                      value=('never' if last_emit_age is None
                             else f'{last_emit_age:.2f}')),
@@ -299,10 +323,9 @@ class ZdaSerialBridgeNode(Node):
                      value=('never' if last_msg_age is None
                             else f'{last_msg_age:.2f}')),
             KeyValue(key='clock_utc_status',
-                     value=str(self._last_clock_utc_status)),
-            KeyValue(key='clock_utc_sync',
-                     value=str(self._last_clock_utc_sync)),
-            KeyValue(key='last_status', value=self._last_status_text),
+                     value=str(last_clock_utc_status)),
+            KeyValue(key='clock_utc_sync', value=str(last_clock_utc_sync)),
+            KeyValue(key='last_status', value=last_status_text),
         ]
 
         diag_msg = DiagnosticArray()
