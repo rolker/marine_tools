@@ -25,12 +25,25 @@ def generate_launch_description() -> LaunchDescription:
     # wrong topic when this package is dropped on another vehicle.
     utc_topic_arg = DeclareLaunchArgument(
         'utc_time_topic', default_value='utc_time')
+    # Safety knobs — surfacing as launch args lets operators tune them
+    # via `ros2 launch ... arg:=value` without editing this file.
+    # See node.py for the meaning of each (clock_utc_status semantics,
+    # sync-requirement rationale, cold-start grace).
+    min_utc_status_arg = DeclareLaunchArgument(
+        'min_utc_status', default_value='2')
+    require_utc_sync_arg = DeclareLaunchArgument(
+        'require_utc_sync', default_value='false')
+    startup_grace_arg = DeclareLaunchArgument(
+        'startup_grace_sec', default_value='5.0')
 
     return LaunchDescription([
         device_arg,
         baud_arg,
         talker_arg,
         utc_topic_arg,
+        min_utc_status_arg,
+        require_utc_sync_arg,
+        startup_grace_arg,
         Node(
             package='zda_serial_bridge',
             executable='zda_serial_bridge',
@@ -40,6 +53,9 @@ def generate_launch_description() -> LaunchDescription:
                 'device': LaunchConfiguration('device'),
                 'baud': LaunchConfiguration('baud'),
                 'talker_id': LaunchConfiguration('talker_id'),
+                'min_utc_status': LaunchConfiguration('min_utc_status'),
+                'require_utc_sync': LaunchConfiguration('require_utc_sync'),
+                'startup_grace_sec': LaunchConfiguration('startup_grace_sec'),
             }],
             remappings=[
                 ('utc_time', LaunchConfiguration('utc_time_topic')),

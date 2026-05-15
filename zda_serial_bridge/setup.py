@@ -12,6 +12,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # Python-launch only; broaden this glob (e.g. 'launch/*.launch.*')
+        # if a future contributor adds YAML or XML launch files.
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
