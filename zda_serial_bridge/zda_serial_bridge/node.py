@@ -18,6 +18,24 @@ from sbg_driver.msg import SbgUtcTime
 import serial
 
 
+def validate_talker_id(raw: str) -> str:
+    """
+    Validate and normalise a NMEA talker ID.
+
+    ``isalpha()`` accepts non-ASCII letters (e.g. ``'ßZ'``), and
+    ``.upper()`` on some of them expands length (``'ß'`` → ``'SS'``),
+    which would survive a permissive gate but raise UnicodeEncodeError
+    later when the sentence is encoded to ASCII. Restrict to plain
+    ASCII NMEA talker characters so the failure is loud and early.
+
+    Returns the upper-cased two-character ID, or raises ``ValueError``.
+    """
+    if (len(raw) != 2 or not raw.isascii() or not raw.isalpha()):
+        raise ValueError(
+            f'talker_id must be 2 ASCII alphabetic chars, got {raw!r}')
+    return raw.upper()
+
+
 def format_zda(
     year: int,
     month: int,
@@ -97,18 +115,7 @@ class ZdaSerialBridgeNode(Node):
             self.get_parameter('startup_grace_sec').value)
         self._node_start_ns = self.get_clock().now().nanoseconds
 
-        # ``isalpha()`` accepts non-ASCII letters (e.g. ``'ßZ'``), and
-        # ``.upper()`` on some of them expands length (``'ß'`` → ``'SS'``),
-        # which would survive this gate but raise UnicodeEncodeError later
-        # when the sentence is encoded to ASCII. Restrict to plain ASCII
-        # NMEA talker characters at startup so the failure is loud and early.
-        if (len(self._talker_id) != 2
-                or not self._talker_id.isascii()
-                or not self._talker_id.isalpha()):
-            raise ValueError(
-                f'talker_id must be 2 ASCII alphabetic chars, '
-                f'got {self._talker_id!r}')
-        self._talker_id = self._talker_id.upper()
+        self._talker_id = validate_talker_id(self._talker_id)
 
         self._lock = threading.Lock()
         self._serial: Optional[serial.Serial] = None

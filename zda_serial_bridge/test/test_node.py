@@ -14,7 +14,7 @@ import pytest
 import rclpy
 from sbg_driver.msg import SbgUtcTime
 import serial
-from zda_serial_bridge.node import ZdaSerialBridgeNode
+from zda_serial_bridge.node import validate_talker_id, ZdaSerialBridgeNode
 
 
 @pytest.fixture(autouse=True)
@@ -113,15 +113,23 @@ def test_emitted_payload_is_valid_zda(mock_serial_cls):
         node.destroy_node()
 
 
-@patch('zda_serial_bridge.node.serial.Serial')
-def test_rejects_non_ascii_talker_id(mock_serial_cls):
-    """Non-ASCII letters that pass ``isalpha()`` must fail at startup, not later."""
-    fake_port = MagicMock()
-    mock_serial_cls.return_value = fake_port
-    rclpy.shutdown()
-    rclpy.init(args=['--ros-args', '-p', 'talker_id:=ßZ'])
+@pytest.mark.parametrize(
+    'bad_talker_id', ['ßZ', 'g1', 'GPS', '', 'g', 'G P', '#A'],
+)
+def test_rejects_invalid_talker_id(bad_talker_id):
+    """validate_talker_id rejects non-ASCII, non-alpha, and wrong-length input."""
+    # Test the validator directly — no rclpy context manipulation needed,
+    # so this doesn't interact with the autouse _ros_context fixture and
+    # leaves the global rclpy state untouched for the rest of the suite.
     with pytest.raises(ValueError, match='ASCII'):
-        ZdaSerialBridgeNode()
+        validate_talker_id(bad_talker_id)
+
+
+def test_validate_talker_id_normalises_case():
+    """Lowercase / mixed-case talker IDs are upper-cased on the way through."""
+    assert validate_talker_id('gp') == 'GP'
+    assert validate_talker_id('Gp') == 'GP'
+    assert validate_talker_id('GP') == 'GP'
 
 
 # --------------------------------------------------------------- diagnostics
@@ -191,19 +199,7 @@ def test_diagnostic_intentional_suppression_is_ok(mock_serial_cls):
 
 @patch('zda_serial_bridge.node.serial.Serial')
 def test_diagnostic_gate_state_decoupled_from_status_text(mock_serial_cls):
-    """Diagnostic level must come from gate_state enum, not _last_status_text.
-
-    Regression guard: an earlier implementation distinguished
-    intentional suppression from transitional warmup by parsing
-    ``self._last_status_text.startswith('suppressed')``. That coupled
-    the diagnostic level to a human-readable string; any future edit
-    to the suppression wording (translation, capitalisation, prefix
-    change) would silently flip OK → WARN.
-
-    Simulate that future edit here by replacing the status text with
-    something that does NOT start with 'suppressed'. The diagnostic
-    must still report OK because gate_state is the source of truth.
-    """
+    """Diagnostic level must come from gate_state, not _last_status_text wording."""
     mock_serial_cls.return_value = MagicMock()
     node = ZdaSerialBridgeNode()
     try:
@@ -308,14 +304,7 @@ def test_reconnect_respects_rate_limit(mock_serial_cls):
 
 @patch('zda_serial_bridge.node.serial.Serial')
 def test_diagnostic_timer_attempts_reconnect_when_serial_closed(mock_serial_cls):
-    """Reconnect runs from the diagnostic timer too, not just from _on_utc_time.
-
-    Field scenario: serial port dies AND the SBG publisher stops at the
-    same time. With reconnect only inside _on_utc_time, the bridge would
-    never recover. The 1 Hz diagnostic timer must trigger _open_serial
-    independently — rate-limited by the same _last_open_attempt_ns, so
-    1 Hz polling is fine.
-    """
+    """Reconnect runs from the diagnostic timer, not only from _on_utc_time."""
     # First Serial(...) call fails; the diagnostic-timer reopen succeeds.
     healthy_port = MagicMock()
     mock_serial_cls.side_effect = [
