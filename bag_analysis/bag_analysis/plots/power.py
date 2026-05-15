@@ -140,10 +140,16 @@ def _estimate_v_oc(
     if not thruster_cols:
         return _voltage_rolling_max(voltage), 'fallback-no-thruster-channels'
 
+    # 500 ms tolerance keeps battery samples from inheriting PWM values
+    # from an rcout row arbitrarily far away (e.g. when one stream drops
+    # out): typical rates are battery 10 Hz / rcout 50 Hz, so a 500 ms
+    # gap is well into "no nearby data" territory and an idle classification
+    # built on it would be unreliable. Rows beyond tolerance get NaN PWM,
+    # which fails idle_mask.between() and is excluded from V_oc.
     merged = pd.merge_asof(
         voltage[['t_ns', 'voltage']].sort_values('t_ns'),
         rcout[['t_ns'] + thruster_cols].sort_values('t_ns'),
-        on='t_ns', direction='nearest',
+        on='t_ns', direction='nearest', tolerance=int(0.5e9),
     )
     idle_mask = pd.Series(True, index=merged.index)
     for col in thruster_cols:

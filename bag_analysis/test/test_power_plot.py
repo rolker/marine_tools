@@ -232,6 +232,69 @@ def test_voltage_only_summary_uses_full_bag_label_when_window_missing(tmp_path):
     assert 'voltage full bag:' in summary_text, summary_text
 
 
+def test_power_ignores_rcout_outside_battery_time_range(tmp_path):
+    """rcout that doesn't overlap battery in time must not classify samples as idle.
+
+    Pre-fix, merge_asof(..., direction='nearest') with no tolerance would
+    happily inherit a PWM value from a row arbitrarily far away. With the
+    500 ms tolerance, battery samples that have no rcout within ±500 ms
+    get NaN PWM and are excluded from idle_mask. In this test every
+    battery sample is >90 s from any rcout row, so the fallback path
+    (no-idle-samples) is expected.
+    """
+    db_path = tmp_path / 'data.db'
+    # battery: 60 idle-voltage samples at t = +100..+159 s.
+    # No launch/recovery metadata so the full bag is used, putting battery
+    # and rcout into the same DataFrames without in-water filtering.
+    voltages = [28.0] * 60
+    conn = _open_extract_db(db_path, include_launch_recovery=False)
+    conn.execute('CREATE TABLE t_bizzy_mavros_battery (t_ns INTEGER, voltage REAL)')
+    bat_rows = [
+        (_START_NS + (100 + i) * 1_000_000_000, v)
+        for i, v in enumerate(voltages)
+    ]
+    conn.executemany(
+        'INSERT INTO t_bizzy_mavros_battery VALUES (?, ?)', bat_rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/battery', 't_bizzy_mavros_battery',
+         'sensor_msgs/msg/BatteryState', len(bat_rows)),
+    )
+    # rcout: 6 samples at t = 0..5 s — entirely before any battery sample.
+    # PWM values alternate inside the idle band [1480, 1520] to give each
+    # channel std > 5 so _thruster_channels picks them up; otherwise the
+    # 'no-thruster-channels' fallback fires before merge_asof is reached.
+    conn.execute('CREATE TABLE t_bizzy_mavros_rc_out (t_ns INTEGER, ch_1 INTEGER, ch_3 INTEGER)')
+    rcout_rows = [
+        (_START_NS + i * 1_000_000_000, 1490 if i % 2 else 1510,
+         1490 if i % 2 else 1510)
+        for i in range(6)
+    ]
+    conn.executemany(
+        'INSERT INTO t_bizzy_mavros_rc_out VALUES (?, ?, ?)', rcout_rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/rc/out', 't_bizzy_mavros_rc_out',
+         'mavros_msgs/msg/RCOut', len(rcout_rows)),
+    )
+    conn.commit()
+    conn.close()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    # The non-overlapping rcout must not satisfy "idle samples found" —
+    # the no-idle fallback warning should fire (not "no thruster channels",
+    # which would mean the test setup didn't reach the merge_asof path).
+    warnings_text = ' | '.join(result.warnings or [])
+    assert 'never sat in idle' in warnings_text.lower(), (
+        f'expected no-idle-samples fallback when rcout is outside battery '
+        f'time range; got warnings: {result.warnings}'
+    )
+
+
 def test_max_v_sag_returns_global_max_of_diff_not_at_v_load_min():
     """Max sag = max(V_oc - V_load), not (V_oc at V_load argmin) - min(V_load)."""
     # V_oc drifts down as battery discharges; the worst V-drop is in the
