@@ -215,7 +215,7 @@ def _resting_voltage(
 
 def _voltage_only_summary(
     bat_w: pd.DataFrame, start_v: float | None, end_v: float | None,
-    extra_warning: str,
+    window_label: str, extra_warning: str,
 ) -> list[str]:
     """Summary text for the rcout-absent fallback (voltage trace only)."""
     v = bat_w['voltage'].astype(float)
@@ -229,7 +229,7 @@ def _voltage_only_summary(
         summary.append(f'- end V (resting, post-recovery): {end_v:.2f} V')
     if len(v):
         summary.append(
-            f'- voltage in-water: range {v.min():.2f}–{v.max():.2f} V, '
+            f'- voltage {window_label}: range {v.min():.2f}–{v.max():.2f} V, '
             f'mean {v.mean():.2f} V'
         )
     summary.append(f'- {extra_warning}')
@@ -253,7 +253,9 @@ def _render_voltage_only(
     png = save_figure(fig, output_dir, PLOT_NAME)
     return PlotResult(
         plot_name=PLOT_NAME, title=TITLE, png_path=png,
-        summary=_voltage_only_summary(bat_w, start_v, end_v, warning),
+        summary=_voltage_only_summary(
+            bat_w, start_v, end_v, window_label, warning,
+        ),
         warnings=[warning],
     )
 
@@ -396,12 +398,12 @@ def generate(
     if end_v is not None:
         summary.append(f'- end V (resting, post-recovery): {end_v:.2f} V')
     summary += [
-        f'- voltage in-water: range {min_v:.2f}–{max_v:.2f} V, '
+        f'- voltage {window_label}: range {min_v:.2f}–{max_v:.2f} V, '
         f'mean {mean_v:.2f} V',
         f'- max V sag (V_oc − V_load at min): {sag:.2f} V',
-        f'- estimated peak current: {peak_i:.1f} A',
-        f'- estimated peak power: {peak_p:.0f} W',
-        f'- estimated energy used: {energy_wh:.0f} Wh '
+        f'- estimated peak current ({window_label}): {peak_i:.1f} A',
+        f'- estimated peak power ({window_label}): {peak_p:.0f} W',
+        f'- estimated energy used ({window_label}): {energy_wh:.0f} Wh '
         f'({pct_capacity:.1f}% of {_CAPACITY_WH:.0f} Wh nominal)',
         '- caveats: V-drop model anchored to a single 2026-04-27 '
         f'reference ({_PEAK_REF_CURRENT_A:.0f} A @ PWM '

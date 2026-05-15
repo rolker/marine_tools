@@ -25,7 +25,9 @@ _LAUNCH_NS = _START_NS + 5_000_000_000
 _RECOVERY_NS = _START_NS + 55_000_000_000
 
 
-def _open_extract_db(db_path: Path) -> sqlite3.Connection:
+def _open_extract_db(
+    db_path: Path, *, include_launch_recovery: bool = True,
+) -> sqlite3.Connection:
     """Create the empty bag_to_sqlite skeleton (meta + index tables)."""
     conn = sqlite3.connect(db_path)
     conn.execute(
@@ -39,16 +41,19 @@ def _open_extract_db(db_path: Path) -> sqlite3.Connection:
         '  count INTEGER'
         ')',
     )
-    conn.executemany(
-        'INSERT INTO _bag_meta(key, value) VALUES (?, ?)',
-        [
-            ('source_bag_paths', json.dumps(['/dev/null'])),
-            ('start_ns', json.dumps(_START_NS)),
-            ('duration_ns', json.dumps(_DURATION_NS)),
-            ('total_messages', json.dumps(0)),
+    meta_rows = [
+        ('source_bag_paths', json.dumps(['/dev/null'])),
+        ('start_ns', json.dumps(_START_NS)),
+        ('duration_ns', json.dumps(_DURATION_NS)),
+        ('total_messages', json.dumps(0)),
+    ]
+    if include_launch_recovery:
+        meta_rows += [
             ('launch_t_ns', json.dumps(_LAUNCH_NS)),
             ('recovery_t_ns', json.dumps(_RECOVERY_NS)),
-        ],
+        ]
+    conn.executemany(
+        'INSERT INTO _bag_meta(key, value) VALUES (?, ?)', meta_rows,
     )
     return conn
 
@@ -164,6 +169,65 @@ def test_power_warns_when_no_idle_samples(tmp_path):
         'idle' in w.lower() or 'thruster' in w.lower()
         for w in (result.warnings or [])
     ), f'expected fallback warning, got: {result.warnings}'
+
+
+def test_power_summary_uses_in_water_label_when_window_known(tmp_path):
+    """When launch/recovery metadata is present, summary lines say 'in-water'."""
+    db_path = tmp_path / 'data.db'
+    voltages = [28.0] * 10 + [25.0] * 50
+    ch_1 = [1500] * 10 + [1900] * 50
+    ch_3 = [1500] * 10 + [1900] * 50
+    with _open_extract_db(db_path) as conn:
+        _write_battery(conn, voltages)
+        _write_rcout(conn, {'ch_1': ch_1, 'ch_3': ch_3})
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    summary_text = '\n'.join(result.summary)
+    assert 'voltage in-water:' in summary_text, summary_text
+    assert 'peak current (in-water)' in summary_text, summary_text
+    assert 'peak power (in-water)' in summary_text, summary_text
+    assert 'energy used (in-water)' in summary_text, summary_text
+
+
+def test_power_summary_uses_full_bag_label_when_window_missing(tmp_path):
+    """No launch/recovery metadata → summary says 'full bag', not 'in-water'."""
+    db_path = tmp_path / 'data.db'
+    voltages = [28.0] * 10 + [25.0] * 50
+    ch_1 = [1500] * 10 + [1900] * 50
+    ch_3 = [1500] * 10 + [1900] * 50
+    with _open_extract_db(db_path, include_launch_recovery=False) as conn:
+        _write_battery(conn, voltages)
+        _write_rcout(conn, {'ch_1': ch_1, 'ch_3': ch_3})
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    summary_text = '\n'.join(result.summary)
+    # The fallback path must NOT claim in-water-only stats.
+    assert 'voltage in-water:' not in summary_text, summary_text
+    assert 'peak current (in-water)' not in summary_text, summary_text
+    # Should be labeled as full-bag instead.
+    assert 'voltage full bag:' in summary_text, summary_text
+    assert 'peak current (full bag)' in summary_text, summary_text
+
+
+def test_voltage_only_summary_uses_full_bag_label_when_window_missing(tmp_path):
+    """rcout-absent + no launch/recovery → voltage-only summary says 'full bag'."""
+    db_path = tmp_path / 'data.db'
+    with _open_extract_db(db_path, include_launch_recovery=False) as conn:
+        _write_battery(conn, [28.0] * 60)
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    summary_text = '\n'.join(result.summary)
+    assert 'voltage in-water:' not in summary_text, summary_text
+    assert 'voltage full bag:' in summary_text, summary_text
 
 
 def test_segmented_energy_skips_gaps():
