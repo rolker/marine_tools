@@ -25,7 +25,22 @@ issue: 8
 **CI**: copilot-pull-request-reviewer = success (no other checks configured)
 
 ### Actions
-- [ ] **Fix:** Add parameter validation after `__init__` line 115 — raise `ValueError` if `_stale_warn > _stale_error` or any of `_stale_warn`/`_stale_error`/`_startup_grace`/`_reconnect_delay` is negative. Add a `test_node.py` unit test.
-- [ ] **Fix:** Lift blocking serial I/O out from under `self._lock`. In `_open_serial`, construct `serial.Serial(...)` outside the lock and atomically swap `self._serial` under it. In `_on_utc_time` write path, snapshot the serial reference under the lock, drop the lock for `write()`, then re-acquire briefly to update counters / `_last_emit_ns`. Move the `_last_msg_ns` / `_gate_state` / `_suppressed_count` writes at node.py:192–212 inside the lock (resolves the snapshot-comment honesty issue at lines 250–256 in the same change).
-- [ ] (Optional) Add a one-liner "Tests added: `test_node.py`, `test_zda.py`" section to the PR body so the bot's stale "Test plan" comparison stops re-firing.
-- [ ] After fixes pushed, re-request Copilot review.
+- [x] **Fix:** Add parameter validation after `__init__` line 115 (commit `7c45153`).
+- [x] **Fix:** Lift blocking serial I/O out from under `self._lock` (commit `c7ef31b`).
+- [x] (Optional) Add a "Tests added" section to PR body (via `gh api PATCH` — `gh pr edit --body-file` was the silent classic-Projects no-op).
+- [x] After fixes pushed, re-request Copilot review (user clicked Reviewers → Copilot in the web UI; the API path silently no-ops — see `reference_copilot_review_no_api_trigger.md`).
+
+## External Review
+**Status**: complete
+**When**: 2026-05-18 17:00
+**By**: Claude Code Agent (Claude Opus 4.7 (1M context))
+
+**PR**: #9 — Copilot re-review against HEAD `c7ef31b`, 4 valid + 0 false positives.
+**CI**: copilot-pull-request-reviewer = success (run 26047546692).
+
+### Actions
+- [x] **Fix:** `destroy_node()` annotated `-> bool` but rclpy returns `None` (commit `6d085df`).
+- [x] **Refactor:** Drop bare `self._serial is None` pre-check at the top of `_publish_diagnostics` — kept every read of `_serial` under the lock as the file documents (commit `ae9c65b`).
+- [x] **Fix:** Re-gating after successful emit was reported as `WARN: ZDA stale` (misleading — bridge isn't broken, gate is functioning). New dedicated branch reports `re-gated: ...` as WARN, escalating to ERROR past `stale_age_error_sec`. UX choice ratified by user (commit `fc1c435`). +2 tests.
+- [x] **Fix:** Wrap typed `LaunchConfiguration` substitutions (`baud`, `min_utc_status`, `require_utc_sync`, `startup_grace_sec`) with `ParameterValue(..., value_type=...)`. Works today via YAML coercion on Jazzy but the type-strict wrapper is the documented best practice (commit `bf99fae`).
+- [ ] After push, optionally re-request Copilot review (manual click; see memory note).
