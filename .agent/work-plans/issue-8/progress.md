@@ -43,4 +43,19 @@ issue: 8
 - [x] **Refactor:** Drop bare `self._serial is None` pre-check at the top of `_publish_diagnostics` — kept every read of `_serial` under the lock as the file documents (commit `ae9c65b`).
 - [x] **Fix:** Re-gating after successful emit was reported as `WARN: ZDA stale` (misleading — bridge isn't broken, gate is functioning). New dedicated branch reports `re-gated: ...` as WARN, escalating to ERROR past `stale_age_error_sec`. UX choice ratified by user (commit `fc1c435`). +2 tests.
 - [x] **Fix:** Wrap typed `LaunchConfiguration` substitutions (`baud`, `min_utc_status`, `require_utc_sync`, `startup_grace_sec`) with `ParameterValue(..., value_type=...)`. Works today via YAML coercion on Jazzy but the type-strict wrapper is the documented best practice (commit `bf99fae`).
-- [ ] After push, optionally re-request Copilot review (manual click; see memory note).
+- [x] After push, optionally re-request Copilot review (manual click; see memory note).
+
+## External Review
+**Status**: complete
+**When**: 2026-05-18 18:00
+**By**: Claude Code Agent (Claude Opus 4.7 (1M context))
+
+**PR**: #9 — Copilot re-review against HEAD `607c087`, 4 valid + 1 false positive.
+**CI**: copilot-pull-request-reviewer = success.
+
+### Actions
+- [x] **Docs:** Correct misleading autouse-fixture comment on `test_rejects_invalid_talker_id` (commit `24b9fe6`).
+- [x] **Fix:** Throttle the open-failure `logger.error` (`throttle_duration_sec=30.0`) to prevent rosout flood when the device is permanently absent. Verified rclpy throttle semantics in Jazzy source (commit `9fadf3e`).
+- [x] **Fix:** Defensive `self._serial is None` re-check inside the second lock block of `_open_serial`. Closes `new_serial` on lost open-race / close-during-open so the FD doesn't leak under MultiThreadedExecutor (commit `00b10bc`).
+- [x] **Fix:** Hoist `last_msg_age > stale_warn` above the gated branches in `_publish_diagnostics`. Previously slowing SBG msgs during cold-start gating reported `OK output gated`, masking upstream degradation. +1 regression test (commit `75f6539`).
+- [x] **FP:** `talker_id` `str(...)` coercion. PARAMETER_STRING enforcement in rclpy (plus yesterday's `ParameterValue` work on the launch substitutions) makes the AttributeError path unreachable; adding `str(...)` would in fact suppress rclpy's loud-and-early type rejection.
