@@ -14,7 +14,9 @@ import pytest
 import rclpy
 from sbg_driver.msg import SbgUtcTime
 import serial
-from zda_serial_bridge.node import validate_talker_id, ZdaSerialBridgeNode
+from zda_serial_bridge.node import (
+    validate_talker_id, validate_timing_params, ZdaSerialBridgeNode,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -130,6 +132,42 @@ def test_validate_talker_id_normalises_case():
     assert validate_talker_id('gp') == 'GP'
     assert validate_talker_id('Gp') == 'GP'
     assert validate_talker_id('GP') == 'GP'
+
+
+# --------------------------------------------------- timing-param validation
+
+
+@pytest.mark.parametrize('warn,err', [(10.0, 5.0), (1.0, 0.5), (3.1, 3.0)])
+def test_rejects_inverted_stale_ages(warn, err):
+    """Warn > error makes the WARN branch unreachable — must raise."""
+    with pytest.raises(ValueError, match='WARN branch'):
+        validate_timing_params(warn, err, 5.0, 2.0)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('stale_age_warn_sec', -1.0),
+    ('stale_age_error_sec', -0.1),
+    ('startup_grace_sec', -2.0),
+    ('reconnect_delay_sec', -0.5),
+])
+def test_rejects_negative_timing_params(field, value):
+    """Negative durations are nonsense — must raise loudly at construction."""
+    kwargs = {
+        'stale_age_warn_sec': 2.0,
+        'stale_age_error_sec': 10.0,
+        'startup_grace_sec': 5.0,
+        'reconnect_delay_sec': 2.0,
+    }
+    kwargs[field] = value
+    with pytest.raises(ValueError, match='must be >= 0'):
+        validate_timing_params(**kwargs)
+
+
+def test_accepts_valid_timing_params():
+    """Defaults and the zero-everything corner case both pass."""
+    validate_timing_params(2.5, 10.0, 5.0, 2.0)
+    validate_timing_params(0.0, 0.0, 0.0, 0.0)
+    validate_timing_params(5.0, 5.0, 0.0, 0.0)  # warn == error is fine
 
 
 # --------------------------------------------------------------- diagnostics

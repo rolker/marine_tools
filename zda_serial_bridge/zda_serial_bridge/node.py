@@ -36,6 +36,35 @@ def validate_talker_id(raw: str) -> str:
     return raw.upper()
 
 
+def validate_timing_params(
+    stale_age_warn_sec: float,
+    stale_age_error_sec: float,
+    startup_grace_sec: float,
+    reconnect_delay_sec: float,
+) -> None:
+    """
+    Validate the four timing parameters at node construction.
+
+    Raises ``ValueError`` if any value is negative, or if
+    ``stale_age_warn_sec > stale_age_error_sec`` (which would make the
+    WARN branch of the diagnostic ladder unreachable — the ERROR branch
+    catches first — producing a silently degraded diagnostic ladder
+    that's hard to spot in the field).
+    """
+    for name, value in (
+            ('stale_age_warn_sec', stale_age_warn_sec),
+            ('stale_age_error_sec', stale_age_error_sec),
+            ('startup_grace_sec', startup_grace_sec),
+            ('reconnect_delay_sec', reconnect_delay_sec)):
+        if value < 0:
+            raise ValueError(f'{name} must be >= 0, got {value}')
+    if stale_age_warn_sec > stale_age_error_sec:
+        raise ValueError(
+            f'stale_age_warn_sec ({stale_age_warn_sec}) must be <= '
+            f'stale_age_error_sec ({stale_age_error_sec}); otherwise '
+            f'the WARN branch of the diagnostic ladder is unreachable.')
+
+
 def format_zda(
     year: int,
     month: int,
@@ -116,6 +145,9 @@ class ZdaSerialBridgeNode(Node):
         self._node_start_ns = self.get_clock().now().nanoseconds
 
         self._talker_id = validate_talker_id(self._talker_id)
+        validate_timing_params(
+            self._stale_warn, self._stale_error,
+            self._startup_grace, self._reconnect_delay)
 
         self._lock = threading.Lock()
         self._serial: Optional[serial.Serial] = None
