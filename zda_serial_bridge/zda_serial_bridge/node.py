@@ -304,10 +304,13 @@ class ZdaSerialBridgeNode(Node):
     def _publish_diagnostics(self) -> None:
         # Reconnect on every diagnostic tick so port recovery doesn't
         # depend on continued SbgUtcTime flow. _open_serial is itself
-        # rate-limited by _reconnect_delay, so a 1 Hz call here only
-        # actually re-opens at most every `reconnect_delay_sec`.
-        if self._serial is None:
-            self._open_serial()
+        # idempotent (returns immediately if already open) and
+        # rate-limited by _reconnect_delay, so a 1 Hz unconditional
+        # call here only actually re-opens at most every
+        # `reconnect_delay_sec`. Avoiding the bare ``self._serial is
+        # None`` pre-check keeps every read of ``self._serial`` under
+        # the lock.
+        self._open_serial()
 
         # Snapshot state under the lock. Every writer in
         # _on_utc_time / _open_serial / _close_serial brackets its
