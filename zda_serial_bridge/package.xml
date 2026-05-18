@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>zda_serial_bridge</name>
+  <version>0.0.1</version>
+  <description>Subscribe to an SBG SbgUtcTime topic and emit NMEA $ZDA time/date sentences to a serial port for downstream sonar/sounder time-tagging.</description>
+  <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <depend>rclpy</depend>
+  <depend>sbg_driver</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>python3-serial</depend>
+
+  <!-- launch / launch_ros are imported by zda_serial.launch.py and must
+       be present at runtime for `ros2 launch zda_serial_bridge ...` to
+       work on a minimal install that only pulls this package. -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
