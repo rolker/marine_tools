@@ -1,0 +1,345 @@
+"""
+Tests for the power plot.
+
+Build a tiny SQLite extract by hand (no rosbag2 round trip) and exercise
+the plot's load -> DataFrame -> matplotlib path end-to-end. Cases focus
+on the new V-drop machinery: the rcout-missing fallback, the no-idle-
+sample fallback, and the segmented energy integration.
+"""
+
+import json
+from pathlib import Path
+import sqlite3
+
+from bag_analysis.plots.power import (
+    _IDLE_PWM_HIGH,
+    _max_v_sag,
+    _segmented_energy_wh,
+    generate,
+)
+import numpy as np
+import pandas as pd
+
+
+_START_NS = 1_700_000_000_000_000_000
+_DURATION_NS = 60_000_000_000  # 60 s
+_LAUNCH_NS = _START_NS + 5_000_000_000
+_RECOVERY_NS = _START_NS + 55_000_000_000
+
+
+def _open_extract_db(
+    db_path: Path, *, include_launch_recovery: bool = True,
+) -> sqlite3.Connection:
+    """Create the empty bag_to_sqlite skeleton (meta + index tables)."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        'CREATE TABLE _bag_meta (key TEXT PRIMARY KEY, value TEXT)',
+    )
+    conn.execute(
+        'CREATE TABLE _topic_index ('
+        '  topic TEXT PRIMARY KEY, '
+        '  table_name TEXT, '
+        '  msg_type TEXT, '
+        '  count INTEGER'
+        ')',
+    )
+    meta_rows = [
+        ('source_bag_paths', json.dumps(['/dev/null'])),
+        ('start_ns', json.dumps(_START_NS)),
+        ('duration_ns', json.dumps(_DURATION_NS)),
+        ('total_messages', json.dumps(0)),
+    ]
+    if include_launch_recovery:
+        meta_rows += [
+            ('launch_t_ns', json.dumps(_LAUNCH_NS)),
+            ('recovery_t_ns', json.dumps(_RECOVERY_NS)),
+        ]
+    conn.executemany(
+        'INSERT INTO _bag_meta(key, value) VALUES (?, ?)', meta_rows,
+    )
+    return conn
+
+
+def _write_battery(conn: sqlite3.Connection, voltages: list[float]) -> None:
+    """Insert /bizzy/mavros/battery samples at 1 Hz starting at _START_NS."""
+    conn.execute('CREATE TABLE t_bizzy_mavros_battery (t_ns INTEGER, voltage REAL)')
+    rows = [
+        (_START_NS + i * 1_000_000_000, v) for i, v in enumerate(voltages)
+    ]
+    conn.executemany(
+        'INSERT INTO t_bizzy_mavros_battery VALUES (?, ?)', rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/battery', 't_bizzy_mavros_battery',
+         'sensor_msgs/msg/BatteryState', len(rows)),
+    )
+
+
+def _write_rcout(
+    conn: sqlite3.Connection, channels: dict[str, list[int]],
+) -> None:
+    """Insert /bizzy/mavros/rc/out samples at 1 Hz with given channel PWM."""
+    n = max(len(v) for v in channels.values())
+    cols = sorted(channels.keys())
+    cols_sql = ', '.join(f'{c} INTEGER' for c in cols)
+    conn.execute(f'CREATE TABLE t_bizzy_mavros_rc_out (t_ns INTEGER, {cols_sql})')
+    rows = [
+        tuple([_START_NS + i * 1_000_000_000] + [channels[c][i] for c in cols])
+        for i in range(n)
+    ]
+    placeholders = ', '.join(['?'] * (len(cols) + 1))
+    conn.executemany(
+        f'INSERT INTO t_bizzy_mavros_rc_out VALUES ({placeholders})', rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/rc/out', 't_bizzy_mavros_rc_out',
+         'mavros_msgs/msg/RCOut', n),
+    )
+
+
+def test_power_renders_with_voltage_and_idle_rcout(tmp_path):
+    """End-to-end: voltage trace + RCOut with idle samples + load samples."""
+    db_path = tmp_path / 'data.db'
+    voltages = [28.0] * 10 + [25.0] * 50  # 10s idle, 50s under load
+    ch_1 = [1500] * 10 + [1900] * 50  # idle, then loaded
+    ch_3 = [1500] * 10 + [1900] * 50
+    with _open_extract_db(db_path) as conn:
+        _write_battery(conn, voltages)
+        _write_rcout(conn, {'ch_1': ch_1, 'ch_3': ch_3})
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    assert result.png_path is not None
+    assert result.png_path.exists()
+    assert any('estimated peak current' in line for line in result.summary)
+    assert any('estimated energy used' in line for line in result.summary)
+    # No fallback warnings expected when idle samples are present.
+    assert all('fallback' not in (w or '') for w in (result.warnings or []))
+
+
+def test_power_voltage_only_when_rcout_missing(tmp_path):
+    """When rcout is absent, render voltage-only with a warning."""
+    db_path = tmp_path / 'data.db'
+    with _open_extract_db(db_path) as conn:
+        _write_battery(conn, [28.0] * 60)
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    # Plot still renders (voltage-only single pane).
+    assert result.png_path is not None
+    assert result.png_path.exists()
+    # Warning surfaces the degradation.
+    assert any('rc/out absent' in w for w in (result.warnings or []))
+    # Summary should NOT include current/power/energy (those need rcout).
+    assert not any(
+        'estimated peak current' in line for line in result.summary
+    )
+    assert not any(
+        'estimated energy used' in line for line in result.summary
+    )
+
+
+def test_power_warns_when_no_idle_samples(tmp_path):
+    """Bags where thrusters never sit in idle should warn + fall back."""
+    db_path = tmp_path / 'data.db'
+    voltages = [25.0] * 60
+    # Channels MUST vary (so _thruster_channels picks them) but never
+    # enter the idle band [1480, 1520]. Alternate between two values
+    # comfortably above idle.
+    above_idle_a = _IDLE_PWM_HIGH + 100
+    above_idle_b = _IDLE_PWM_HIGH + 300
+    ch_1 = [above_idle_a if i % 2 else above_idle_b for i in range(60)]
+    ch_3 = list(ch_1)
+    with _open_extract_db(db_path) as conn:
+        _write_battery(conn, voltages)
+        _write_rcout(conn, {'ch_1': ch_1, 'ch_3': ch_3})
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    assert result.png_path is not None
+    # Either fallback ('no thruster channels' or 'no idle samples') is
+    # acceptable; both indicate V_oc came from overall rolling max.
+    assert any(
+        'idle' in w.lower() or 'thruster' in w.lower()
+        for w in (result.warnings or [])
+    ), f'expected fallback warning, got: {result.warnings}'
+
+
+def test_power_summary_uses_in_water_label_when_window_known(tmp_path):
+    """When launch/recovery metadata is present, summary lines say 'in-water'."""
+    db_path = tmp_path / 'data.db'
+    voltages = [28.0] * 10 + [25.0] * 50
+    ch_1 = [1500] * 10 + [1900] * 50
+    ch_3 = [1500] * 10 + [1900] * 50
+    with _open_extract_db(db_path) as conn:
+        _write_battery(conn, voltages)
+        _write_rcout(conn, {'ch_1': ch_1, 'ch_3': ch_3})
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    summary_text = '\n'.join(result.summary)
+    assert 'voltage in-water:' in summary_text, summary_text
+    assert 'peak current (in-water)' in summary_text, summary_text
+    assert 'peak power (in-water)' in summary_text, summary_text
+    assert 'energy used (in-water)' in summary_text, summary_text
+
+
+def test_power_summary_uses_full_bag_label_when_window_missing(tmp_path):
+    """No launch/recovery metadata → summary says 'full bag', not 'in-water'."""
+    db_path = tmp_path / 'data.db'
+    voltages = [28.0] * 10 + [25.0] * 50
+    ch_1 = [1500] * 10 + [1900] * 50
+    ch_3 = [1500] * 10 + [1900] * 50
+    with _open_extract_db(db_path, include_launch_recovery=False) as conn:
+        _write_battery(conn, voltages)
+        _write_rcout(conn, {'ch_1': ch_1, 'ch_3': ch_3})
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    summary_text = '\n'.join(result.summary)
+    # The fallback path must NOT claim in-water-only stats.
+    assert 'voltage in-water:' not in summary_text, summary_text
+    assert 'peak current (in-water)' not in summary_text, summary_text
+    # Should be labeled as full-bag instead.
+    assert 'voltage full bag:' in summary_text, summary_text
+    assert 'peak current (full bag)' in summary_text, summary_text
+
+
+def test_voltage_only_summary_uses_full_bag_label_when_window_missing(tmp_path):
+    """rcout-absent + no launch/recovery → voltage-only summary says 'full bag'."""
+    db_path = tmp_path / 'data.db'
+    with _open_extract_db(db_path, include_launch_recovery=False) as conn:
+        _write_battery(conn, [28.0] * 60)
+        conn.commit()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    summary_text = '\n'.join(result.summary)
+    assert 'voltage in-water:' not in summary_text, summary_text
+    assert 'voltage full bag:' in summary_text, summary_text
+
+
+def test_power_ignores_rcout_outside_battery_time_range(tmp_path):
+    """rcout that doesn't overlap battery in time must not classify samples as idle.
+
+    Pre-fix, merge_asof(..., direction='nearest') with no tolerance would
+    happily inherit a PWM value from a row arbitrarily far away. With the
+    500 ms tolerance, battery samples that have no rcout within ±500 ms
+    get NaN PWM and are excluded from idle_mask. In this test every
+    battery sample is >90 s from any rcout row, so the fallback path
+    (no-idle-samples) is expected.
+    """
+    db_path = tmp_path / 'data.db'
+    # battery: 60 idle-voltage samples at t = +100..+159 s.
+    # No launch/recovery metadata so the full bag is used, putting battery
+    # and rcout into the same DataFrames without in-water filtering.
+    voltages = [28.0] * 60
+    conn = _open_extract_db(db_path, include_launch_recovery=False)
+    conn.execute('CREATE TABLE t_bizzy_mavros_battery (t_ns INTEGER, voltage REAL)')
+    bat_rows = [
+        (_START_NS + (100 + i) * 1_000_000_000, v)
+        for i, v in enumerate(voltages)
+    ]
+    conn.executemany(
+        'INSERT INTO t_bizzy_mavros_battery VALUES (?, ?)', bat_rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/battery', 't_bizzy_mavros_battery',
+         'sensor_msgs/msg/BatteryState', len(bat_rows)),
+    )
+    # rcout: 6 samples at t = 0..5 s — entirely before any battery sample.
+    # PWM values alternate inside the idle band [1480, 1520] to give each
+    # channel std > 5 so _thruster_channels picks them up; otherwise the
+    # 'no-thruster-channels' fallback fires before merge_asof is reached.
+    conn.execute('CREATE TABLE t_bizzy_mavros_rc_out (t_ns INTEGER, ch_1 INTEGER, ch_3 INTEGER)')
+    rcout_rows = [
+        (_START_NS + i * 1_000_000_000, 1490 if i % 2 else 1510,
+         1490 if i % 2 else 1510)
+        for i in range(6)
+    ]
+    conn.executemany(
+        'INSERT INTO t_bizzy_mavros_rc_out VALUES (?, ?, ?)', rcout_rows,
+    )
+    conn.execute(
+        'INSERT INTO _topic_index VALUES (?, ?, ?, ?)',
+        ('/bizzy/mavros/rc/out', 't_bizzy_mavros_rc_out',
+         'mavros_msgs/msg/RCOut', len(rcout_rows)),
+    )
+    conn.commit()
+    conn.close()
+    output_dir = tmp_path / 'report'
+
+    result = generate(db_path, output_dir, namespace='bizzy')
+
+    # The non-overlapping rcout must not satisfy "idle samples found" —
+    # the no-idle fallback warning should fire (not "no thruster channels",
+    # which would mean the test setup didn't reach the merge_asof path).
+    warnings_text = ' | '.join(result.warnings or [])
+    assert 'never sat in idle' in warnings_text.lower(), (
+        f'expected no-idle-samples fallback when rcout is outside battery '
+        f'time range; got warnings: {result.warnings}'
+    )
+
+
+def test_max_v_sag_returns_global_max_of_diff_not_at_v_load_min():
+    """Max sag = max(V_oc - V_load), not (V_oc at V_load argmin) - min(V_load)."""
+    # V_oc drifts down as battery discharges; the worst V-drop is in the
+    # earlier high-V_oc period (diff=6), not at the absolute V_load min
+    # in the later low-V_oc period (diff=5).
+    v_oc = pd.Series([28.0, 28.0, 25.0, 25.0])
+    v_load = pd.Series([23.0, 22.0, 23.0, 20.0])
+    # OLD bug: V_oc.iloc[v_load.idxmin()] - min(v_load) = 25 - 20 = 5.0
+    # CORRECT: max(V_oc - V_load) = max([5, 6, 2, 5]) = 6.0
+    assert _max_v_sag(v_oc, v_load) == 6.0
+
+
+def test_max_v_sag_handles_empty_inputs():
+    """Empty series → 0.0 (don't crash)."""
+    assert _max_v_sag(pd.Series([], dtype=float),
+                      pd.Series([], dtype=float)) == 0.0
+    assert _max_v_sag(pd.Series([25.0]),
+                      pd.Series([], dtype=float)) == 0.0
+
+
+def test_segmented_energy_skips_gaps():
+    """A 2-segment trace with a 60 s gap integrates each segment only."""
+    # Segment 1: t = 0..9 s, power = 100 W constant -> 9 s * 100 W = 900 Ws
+    # GAP: t jumps from 9 to 70 (61 s gap, above 5 s threshold)
+    # Segment 2: t = 70..79 s, power = 200 W constant -> 9 * 200 = 1800 Ws
+    # Total: 2700 Ws / 3600 = 0.75 Wh
+    t_s = np.array(
+        list(range(10)) + [70 + i for i in range(10)], dtype=float,
+    )
+    power = np.array([100.0] * 10 + [200.0] * 10)
+    wh = _segmented_energy_wh(t_s, power)
+    assert abs(wh - 0.75) < 1e-6, f'expected 0.75 Wh, got {wh}'
+
+
+def test_segmented_energy_handles_continuous_data():
+    """No gap above threshold -> behaves like np.trapz / 3600."""
+    t_s = np.linspace(0, 100, 101)  # 100 s, 1 Hz sampling
+    power = np.full(101, 100.0)  # constant 100 W
+    wh = _segmented_energy_wh(t_s, power)
+    # 100 s * 100 W = 10_000 Ws = 10000/3600 ≈ 2.7778 Wh
+    expected = 10_000 / 3600
+    assert abs(wh - expected) < 1e-6
+
+
+def test_segmented_energy_handles_short_inputs():
+    """Single-point series can't be integrated; returns 0 cleanly."""
+    assert _segmented_energy_wh(np.array([0.0]), np.array([100.0])) == 0.0
+    assert _segmented_energy_wh(np.array([]), np.array([])) == 0.0

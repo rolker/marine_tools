@@ -57,20 +57,49 @@ def _render_summary_md(
     index = load_index(db_path)
     start = datetime.fromtimestamp(meta['start_ns'] / 1e9, tz=timezone.utc)
     duration_s = meta['duration_ns'] / 1e9
+    bag_paths: list[str] = meta.get('source_bag_paths', []) or []
+    if not bag_paths and 'source_bag_path' in meta:
+        # Backward compat: pre-multi-bag DBs stored a singular key.
+        bag_paths = [meta['source_bag_path']]
+    bag_count = meta.get('bag_count', 1)
+
+    if bag_count > 1:
+        title = f'Bag analysis report — {bag_count} bags'
+    elif bag_paths:
+        title = f'Bag analysis report — {Path(bag_paths[0]).name}'
+    else:
+        title = 'Bag analysis report'
 
     lines: list[str] = [
-        f'# Bag analysis report — {Path(meta["source_bag_path"]).name}',
+        f'# {title}',
         '',
         '## Bag header',
         '',
-        f'- **Source**: `{meta["source_bag_path"]}`',
+    ]
+    if bag_count > 1:
+        lines.append(f'- **Bags**: {bag_count}')
+        for p in bag_paths:
+            lines.append(f'  - `{p}`')
+    elif bag_paths:
+        lines.append(f'- **Source**: `{bag_paths[0]}`')
+    lines += [
         f'- **Start (UTC)**: {start.isoformat()}',
         f'- **Duration**: {duration_s:.1f} s ({duration_s / 60:.1f} min)',
         f'- **Topics**: {len(index)}',
         f'- **Total messages**: {meta["total_messages"]}',
         f'- **Robot namespace** (for plots): `{namespace}`',
-        '',
     ]
+    launch_t_ns = meta.get('launch_t_ns')
+    recovery_t_ns = meta.get('recovery_t_ns')
+    if launch_t_ns is not None and recovery_t_ns is not None:
+        in_water_min = (recovery_t_ns - launch_t_ns) / 1e9 / 60
+        launch_dt = datetime.fromtimestamp(launch_t_ns / 1e9, tz=timezone.utc)
+        recovery_dt = datetime.fromtimestamp(recovery_t_ns / 1e9, tz=timezone.utc)
+        lines += [
+            f'- **In-water window**: {launch_dt.isoformat()} → '
+            f'{recovery_dt.isoformat()} ({in_water_min:.1f} min)',
+        ]
+    lines.append('')
 
     for r in results:
         lines.append(f'## {r.title}')
