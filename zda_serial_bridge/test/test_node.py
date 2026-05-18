@@ -301,6 +301,28 @@ def test_diagnostic_regate_after_emit_is_warn(mock_serial_cls):
 
 
 @patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_msg_stale_during_gating_surfaces_as_warn(mock_serial_cls):
+    """Slow upstream msgs during gating surface as WARN, not OK 'output gated'."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        # Receive a single suppressed message so gate is gated but
+        # _last_emit_ns stays None (gate never opened).
+        node._on_utc_time(_make_msg(clock_utc_status=1))
+        assert node._gate_state == 'suppressed_status'
+        assert node._last_emit_ns is None
+
+        # Rewind _last_msg_ns past stale_warn but not stale_error.
+        elapsed = int((node._stale_warn + 0.5) * 1e9)
+        node._last_msg_ns -= elapsed
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.WARN, (level, msg_text)
+        assert 'SbgUtcTime stale' in msg_text, msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
 def test_diagnostic_regate_escalates_to_error_past_stale_error(mock_serial_cls):
     """Prolonged re-gating (past stale_age_error) escalates to ERROR."""
     mock_serial_cls.return_value = MagicMock()

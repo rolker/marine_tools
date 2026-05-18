@@ -388,11 +388,22 @@ class ZdaSerialBridgeNode(Node):
         elif last_msg_age > self._stale_error:
             level = DiagnosticStatus.ERROR
             msg_text = f'No SbgUtcTime for {last_msg_age:.1f}s'
+        elif last_msg_age > self._stale_warn:
+            # Slowing upstream message rate is operationally relevant
+            # regardless of the gate state — surface it BEFORE the
+            # gated/re-gated branches below so a degrading SBG during
+            # cold-start gating (or during re-gating) doesn't get
+            # masked under an OK "output gated" or WARN "re-gated"
+            # message. The gate state remains visible via the
+            # ``gate_state`` KeyValue.
+            level = DiagnosticStatus.WARN
+            msg_text = f'SbgUtcTime stale: {last_msg_age:.1f}s'
         elif last_emit_ns is None:
-            # Messages are arriving but no emit has happened yet.
-            # gate_state is the source of truth (not a string-match on
-            # last_status_text). 'suppressed_*' is intentional gating
-            # (OK); anything else is transitional warmup.
+            # Messages are arriving at full rate but no emit has
+            # happened yet. gate_state is the source of truth (not a
+            # string-match on last_status_text). 'suppressed_*' is
+            # intentional gating (OK); anything else is transitional
+            # warmup.
             if gate_state in ('suppressed_status', 'suppressed_sync'):
                 level = DiagnosticStatus.OK
                 msg_text = f'output gated: {last_status_text}'
@@ -420,9 +431,6 @@ class ZdaSerialBridgeNode(Node):
             level = DiagnosticStatus.ERROR
             msg_text = (f'No ZDA emitted for {last_emit_age:.1f}s '
                         f'(last status: {last_status_text})')
-        elif last_msg_age > self._stale_warn:
-            level = DiagnosticStatus.WARN
-            msg_text = f'SbgUtcTime stale: {last_msg_age:.1f}s'
         elif last_emit_age > self._stale_warn:
             level = DiagnosticStatus.WARN
             msg_text = (f'ZDA stale: {last_emit_age:.1f}s '
