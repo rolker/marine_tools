@@ -120,9 +120,11 @@ def test_emitted_payload_is_valid_zda(mock_serial_cls):
 )
 def test_rejects_invalid_talker_id(bad_talker_id):
     """validate_talker_id rejects non-ASCII, non-alpha, and wrong-length input."""
-    # Test the validator directly — no rclpy context manipulation needed,
-    # so this doesn't interact with the autouse _ros_context fixture and
-    # leaves the global rclpy state untouched for the rest of the suite.
+    # The autouse ``_ros_context`` fixture still runs around this test
+    # (and the other pure-validator tests below), but the test itself
+    # exercises the module-level validator directly and doesn't touch
+    # rclpy state — so the rclpy.init/shutdown bracketing is harmless
+    # overhead, not a dependency.
     with pytest.raises(ValueError, match='ASCII'):
         validate_talker_id(bad_talker_id)
 
