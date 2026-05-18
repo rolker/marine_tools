@@ -223,6 +223,20 @@ class ZdaSerialBridgeNode(Node):
             return
 
         with self._lock:
+            # Re-check under the lock: under MultiThreadedExecutor
+            # another callback may have raced through _open_serial
+            # while we were blocked in serial.Serial(...). The
+            # rate-limit normally prevents this (the second caller
+            # bails on _last_open_attempt_ns), but a _close_serial
+            # call interleaved with our open would also land here.
+            # Drop the freshly opened port rather than overwrite the
+            # other thread's state, so the FD doesn't leak.
+            if self._serial is not None:
+                try:
+                    new_serial.close()
+                except (serial.SerialException, OSError):
+                    pass
+                return
             self._serial = new_serial
         self.get_logger().info(
             f'Opened serial {self._device} @ {self._baud}')
