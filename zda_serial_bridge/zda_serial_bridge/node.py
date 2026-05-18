@@ -189,6 +189,11 @@ class ZdaSerialBridgeNode(Node):
             f'require_utc_sync={self._require_utc_sync}')
 
     def _open_serial(self) -> None:
+        # The rate-limit check + last-attempt update happen under the
+        # lock; the blocking ``serial.Serial(...)`` call deliberately
+        # does not. A hanging open on a wedged USB-serial device must
+        # not stall the diagnostic publisher or the ``_on_utc_time``
+        # callback, both of which can also acquire ``self._lock``.
         with self._lock:
             if self._serial is not None:
                 return
@@ -198,50 +203,68 @@ class ZdaSerialBridgeNode(Node):
                     < self._reconnect_delay):
                 return
             self._last_open_attempt_ns = now_ns
-            try:
-                self._serial = serial.Serial(
-                    self._device, self._baud, timeout=1.0, write_timeout=1.0)
-                self.get_logger().info(
-                    f'Opened serial {self._device} @ {self._baud}')
-            except (serial.SerialException, OSError) as exc:
-                self._serial = None
+
+        try:
+            new_serial = serial.Serial(
+                self._device, self._baud, timeout=1.0, write_timeout=1.0)
+        except (serial.SerialException, OSError) as exc:
+            with self._lock:
                 self._serial_error_count += 1
-                self.get_logger().error(
-                    f'Serial open {self._device} failed: {exc}; '
-                    f'retry in {self._reconnect_delay:.1f}s')
+            self.get_logger().error(
+                f'Serial open {self._device} failed: {exc}; '
+                f'retry in {self._reconnect_delay:.1f}s')
+            return
+
+        with self._lock:
+            self._serial = new_serial
+        self.get_logger().info(
+            f'Opened serial {self._device} @ {self._baud}')
 
     def _close_serial(self) -> None:
+        # Same pattern as _open_serial: detach the port reference under
+        # the lock, then call the potentially-blocking .close() outside.
         with self._lock:
-            if self._serial is not None:
-                try:
-                    self._serial.close()
-                except (serial.SerialException, OSError):
-                    pass
-                self._serial = None
+            port = self._serial
+            self._serial = None
+        if port is None:
+            return
+        try:
+            port.close()
+        except (serial.SerialException, OSError):
+            pass
 
     def _on_utc_time(self, msg: SbgUtcTime) -> None:
         now_ns = self.get_clock().now().nanoseconds
-        self._last_msg_ns = now_ns
-        self._last_clock_utc_status = int(msg.clock_status.clock_utc_status)
-        self._last_clock_utc_sync = bool(msg.clock_status.clock_utc_sync)
+        clock_utc_status = int(msg.clock_status.clock_utc_status)
+        clock_utc_sync = bool(msg.clock_status.clock_utc_sync)
 
-        if self._last_clock_utc_status < self._min_utc_status:
-            self._suppressed_count += 1
-            self._gate_state = 'suppressed_status'
-            self._last_status_text = (
-                f'suppressed: clock_utc_status={self._last_clock_utc_status} '
-                f'< {self._min_utc_status}')
-            return
-        if self._require_utc_sync and not self._last_clock_utc_sync:
-            self._suppressed_count += 1
-            self._gate_state = 'suppressed_sync'
-            self._last_status_text = 'suppressed: clock_utc_sync=False'
-            return
-        # Gate is open: clock_utc_status meets the minimum and (if
-        # required) sync is asserted. Mark even before the write
-        # attempt — a transport failure further down is reported via
-        # _serial_error_count / level=ERROR, not by reverting the gate.
-        self._gate_state = 'open'
+        # Gate evaluation + state updates happen under the lock so the
+        # diagnostic snapshot sees a consistent view. The blocking
+        # serial write below is deliberately outside the lock.
+        with self._lock:
+            self._last_msg_ns = now_ns
+            self._last_clock_utc_status = clock_utc_status
+            self._last_clock_utc_sync = clock_utc_sync
+
+            if clock_utc_status < self._min_utc_status:
+                self._suppressed_count += 1
+                self._gate_state = 'suppressed_status'
+                self._last_status_text = (
+                    f'suppressed: clock_utc_status={clock_utc_status} '
+                    f'< {self._min_utc_status}')
+                return
+            if self._require_utc_sync and not clock_utc_sync:
+                self._suppressed_count += 1
+                self._gate_state = 'suppressed_sync'
+                self._last_status_text = 'suppressed: clock_utc_sync=False'
+                return
+            # Gate is open: clock_utc_status meets the minimum and (if
+            # required) sync is asserted. Mark even before the write
+            # attempt — a transport failure further down is reported
+            # via _serial_error_count / level=ERROR, not by reverting
+            # the gate.
+            self._gate_state = 'open'
+            serial_ref = self._serial
 
         sentence = format_zda(
             int(msg.year), int(msg.month), int(msg.day),
@@ -250,26 +273,33 @@ class ZdaSerialBridgeNode(Node):
         )
         payload = sentence.encode('ascii')
 
-        if self._serial is None:
+        if serial_ref is None:
             self._open_serial()
-        if self._serial is None:
-            self._last_status_text = f'serial closed ({self._device})'
+            with self._lock:
+                serial_ref = self._serial
+        if serial_ref is None:
+            with self._lock:
+                self._last_status_text = f'serial closed ({self._device})'
             return
 
+        # Blocking write outside the lock. ``write_timeout=1.0`` on a
+        # stalled port could otherwise block the diagnostic publisher
+        # for a full second every cycle.
         try:
-            with self._lock:
-                if self._serial is None:
-                    return
-                self._serial.write(payload)
-                self._write_count += 1
-                self._last_emit_ns = now_ns
-                self._last_status_text = 'OK'
+            serial_ref.write(payload)
         except (serial.SerialException, OSError) as exc:
-            self._serial_error_count += 1
-            self._last_status_text = f'write error: {exc}'
+            with self._lock:
+                self._serial_error_count += 1
+                self._last_status_text = f'write error: {exc}'
             self.get_logger().error(
                 f'Serial write {self._device} failed: {exc}; reopening')
             self._close_serial()
+            return
+
+        with self._lock:
+            self._write_count += 1
+            self._last_emit_ns = now_ns
+            self._last_status_text = 'OK'
 
     def _publish_diagnostics(self) -> None:
         # Reconnect on every diagnostic tick so port recovery doesn't
@@ -279,13 +309,13 @@ class ZdaSerialBridgeNode(Node):
         if self._serial is None:
             self._open_serial()
 
-        # Snapshot state under the lock so a write-then-close racing
-        # with the diagnostic publisher can't observe a half-mutated
-        # view. The diagnostic publisher only reads, but the fields
-        # below are written under _lock elsewhere; holding the lock
-        # while we copy them is the simplest contention-bounded
-        # invariant. (Lock is also obtained in _open_serial /
-        # _close_serial / _on_utc_time so the contention is small.)
+        # Snapshot state under the lock. Every writer in
+        # _on_utc_time / _open_serial / _close_serial brackets its
+        # state updates with ``with self._lock:`` and the blocking
+        # serial I/O happens outside the lock, so this snapshot
+        # observes a consistent view of (serial_open, last_emit_ns,
+        # last_msg_ns, gate_state, counters) even under
+        # MultiThreadedExecutor.
         with self._lock:
             serial_open = self._serial is not None
             last_emit_ns = self._last_emit_ns
