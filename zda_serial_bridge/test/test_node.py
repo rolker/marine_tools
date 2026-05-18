@@ -269,6 +269,58 @@ def test_diagnostic_recovers_to_ok_after_first_emit(mock_serial_cls):
         node.destroy_node()
 
 
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_regate_after_emit_is_warn(mock_serial_cls):
+    """Re-gate after successful emit (clock degraded) → WARN, not 'stale'."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        # Open the gate and emit once.
+        node._on_utc_time(_make_msg(clock_utc_status=2))
+        assert node._last_emit_ns is not None
+
+        # Clock degrades back to status 1 → gate suppresses.
+        node._on_utc_time(_make_msg(clock_utc_status=1))
+        assert node._gate_state == 'suppressed_status'
+
+        # Push _last_emit_ns past stale_warn but not stale_error so the
+        # bug-fix branch (re-gated WARN) is the one under test rather
+        # than the OK pre-stale branch.
+        elapsed = int((node._stale_warn + 0.5) * 1e9)
+        node._last_emit_ns -= elapsed
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.WARN, (level, msg_text)
+        assert 're-gated' in msg_text, msg_text
+        # Must NOT report as 'stale' — that wording belongs to
+        # transport-failure cases.
+        assert 'stale' not in msg_text.lower(), msg_text
+    finally:
+        node.destroy_node()
+
+
+@patch('zda_serial_bridge.node.serial.Serial')
+def test_diagnostic_regate_escalates_to_error_past_stale_error(mock_serial_cls):
+    """Prolonged re-gating (past stale_age_error) escalates to ERROR."""
+    mock_serial_cls.return_value = MagicMock()
+    node = ZdaSerialBridgeNode()
+    try:
+        # Open + emit, then re-gate via require_utc_sync drop.
+        node._on_utc_time(_make_msg(clock_utc_status=2, clock_utc_sync=True))
+        node._require_utc_sync = True
+        node._on_utc_time(_make_msg(clock_utc_status=2, clock_utc_sync=False))
+        assert node._gate_state == 'suppressed_sync'
+
+        # Push _last_emit_ns past stale_error.
+        elapsed = int((node._stale_error + 1.0) * 1e9)
+        node._last_emit_ns -= elapsed
+        level, msg_text = _capture_diag(node)
+        assert level == DiagnosticStatus.ERROR, (level, msg_text)
+        assert 're-gated for' in msg_text, msg_text
+        assert 'clock_utc_sync=False' in msg_text, msg_text
+    finally:
+        node.destroy_node()
+
+
 # --------------------------------------------------------------- reconnect
 
 

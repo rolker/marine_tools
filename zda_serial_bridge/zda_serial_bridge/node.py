@@ -379,6 +379,22 @@ class ZdaSerialBridgeNode(Node):
                 level = DiagnosticStatus.WARN
                 msg_text = (f'no ZDA emitted yet '
                             f'(last status: {last_status_text})')
+        elif gate_state in ('suppressed_status', 'suppressed_sync'):
+            # Re-gated after previously emitting: clock_utc_status
+            # dropped back below min, or PPS sync was lost
+            # mid-mission. The bridge is working as designed, but
+            # downstream consumers have stopped receiving ZDA — that
+            # is operationally relevant. Surface WARN for short
+            # outages, ERROR once the re-gating persists past
+            # stale_age_error (matches the transport-error escalation
+            # on the next branch).
+            if last_emit_age > self._stale_error:
+                level = DiagnosticStatus.ERROR
+                msg_text = (f're-gated for {last_emit_age:.1f}s '
+                            f'({last_status_text})')
+            else:
+                level = DiagnosticStatus.WARN
+                msg_text = f're-gated: {last_status_text}'
         elif last_emit_age > self._stale_error:
             level = DiagnosticStatus.ERROR
             msg_text = (f'No ZDA emitted for {last_emit_age:.1f}s '
