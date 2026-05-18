@@ -423,10 +423,10 @@ class ZdaSerialBridgeNode(Node):
         diag_msg.status = [status]
         self._diag_pub.publish(diag_msg)
 
-    def destroy_node(self) -> bool:
+    def destroy_node(self) -> None:
         """Close the serial port before shutdown."""
         self._close_serial()
-        return super().destroy_node()
+        super().destroy_node()
 
 
 def main(args=None) -> None:
