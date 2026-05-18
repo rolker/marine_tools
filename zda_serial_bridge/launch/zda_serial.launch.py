@@ -13,6 +13,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -49,13 +50,28 @@ def generate_launch_description() -> LaunchDescription:
             executable='zda_serial_bridge',
             name='zda_serial_bridge',
             output='screen',
+            # Wrap non-string LaunchConfiguration values in
+            # ParameterValue with an explicit value_type. Bare
+            # substitutions reach rclpy as strings; on Jazzy they
+            # currently coerce via YAML (so the launch works today),
+            # but YAML coercion has surprising edges (e.g. ``on`` /
+            # ``off`` become bool) and stricter rclpy versions will
+            # raise InvalidParameterTypeException. ``device`` and
+            # ``talker_id`` are genuinely strings and don't need a
+            # wrapper.
             parameters=[{
                 'device': LaunchConfiguration('device'),
-                'baud': LaunchConfiguration('baud'),
+                'baud': ParameterValue(
+                    LaunchConfiguration('baud'), value_type=int),
                 'talker_id': LaunchConfiguration('talker_id'),
-                'min_utc_status': LaunchConfiguration('min_utc_status'),
-                'require_utc_sync': LaunchConfiguration('require_utc_sync'),
-                'startup_grace_sec': LaunchConfiguration('startup_grace_sec'),
+                'min_utc_status': ParameterValue(
+                    LaunchConfiguration('min_utc_status'), value_type=int),
+                'require_utc_sync': ParameterValue(
+                    LaunchConfiguration('require_utc_sync'),
+                    value_type=bool),
+                'startup_grace_sec': ParameterValue(
+                    LaunchConfiguration('startup_grace_sec'),
+                    value_type=float),
             }],
             remappings=[
                 ('utc_time', LaunchConfiguration('utc_time_topic')),
