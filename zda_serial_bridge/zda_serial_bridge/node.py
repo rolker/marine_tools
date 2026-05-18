@@ -210,9 +210,16 @@ class ZdaSerialBridgeNode(Node):
         except (serial.SerialException, OSError) as exc:
             with self._lock:
                 self._serial_error_count += 1
+            # Throttle the per-attempt error log: when the device is
+            # permanently absent, the 1 Hz diagnostic tick (rate-limited
+            # to ``reconnect_delay_sec``) would otherwise flood rosout
+            # with identical lines over a long deployment. The ERROR
+            # diagnostic and ``_serial_error_count`` KeyValue continue
+            # to surface the state on every tick.
             self.get_logger().error(
                 f'Serial open {self._device} failed: {exc}; '
-                f'retry in {self._reconnect_delay:.1f}s')
+                f'retry in {self._reconnect_delay:.1f}s',
+                throttle_duration_sec=30.0)
             return
 
         with self._lock:
