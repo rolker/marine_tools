@@ -36,27 +36,20 @@ class KongsbergEmBridge(Node):
         self.declare_parameter('bind_address', '0.0.0.0')
         self.declare_parameter('bind_port', 20002)
         self.declare_parameter('frame_id', 'm3')
-        # 'datagram' uses the sonar clock (M3 is 1PPS-synced); 'receive' uses
-        # wall-clock arrival time as a fallback.
-        self.declare_parameter('time_source', 'datagram')
-        # Sign of the across-track (rx) angle relative to the SonarDetections
-        # convention (+ to starboard). Verify swath handedness in rviz / against
-        # QINSy and flip to -1.0 if the swath is mirrored.
+        # TEMPORARY calibration knobs: sign of the rx (across-track) and tx
+        # (along-track) angles relative to the SonarDetections convention
+        # (+rx to starboard, +tx forward). To be removed and hard-coded once a
+        # patch test confirms the M3's handedness (see marine_tools#14).
         self.declare_parameter('rx_angle_sign', 1.0)
         self.declare_parameter('tx_angle_sign', 1.0)
-        # Optional override of the per-ping centre frequency (Hz). <=0 => use
-        # the value reported in the datagram (M3: 500 kHz).
-        self.declare_parameter('frequency_override', 0.0)
         # Drop beams the sonar flagged invalid. Required: the CUBE error model
         # iterates every element of two_way_travel_times and does NOT consult
         # flags, so invalid (twtt=0) beams would otherwise become z=0 points.
         self.declare_parameter('skip_invalid_beams', True)
 
         self.frame_id = self.get_parameter('frame_id').value
-        self.time_source = self.get_parameter('time_source').value
         self.rx_sign = float(self.get_parameter('rx_angle_sign').value)
         self.tx_sign = float(self.get_parameter('tx_angle_sign').value)
-        self.freq_override = float(self.get_parameter('frequency_override').value)
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
 
         self.publisher = self.create_publisher(
@@ -104,10 +97,16 @@ class KongsbergEmBridge(Node):
                     f'datagram decode error: {exc}', throttle_duration_sec=10.0)
 
     def _stamp(self, parsed) -> TimeMsg:
+        # Use the sonar's (1PPS-disciplined) ping time. Band-aid: if the
+        # datagram time is missing or implausible, fall back to arrival time so
+        # downstream still has a usable, monotonic-ish stamp -- no knob to get
+        # this wrong.
         unix = parsed.get('unix_time')
-        if self.time_source == 'receive' or unix is None:
-            now = self.get_clock().now()
-            return now.to_msg()
+        if unix is None:
+            self.get_logger().warning(
+                'datagram time unavailable; stamping with receive time',
+                throttle_duration_sec=10.0)
+            return self.get_clock().now().to_msg()
         msg = TimeMsg()
         msg.sec = int(unix)
         msg.nanosec = int(round((unix - msg.sec) * 1e9))
@@ -119,9 +118,8 @@ class KongsbergEmBridge(Node):
         msg.header.frame_id = self.frame_id
 
         info = PingInfo()
-        info.frequency = (self.freq_override if self.freq_override > 0.0
-                          else float(parsed['sectors'][0]['centre_frequency']
-                                     if parsed['sectors'] else 0.0))
+        info.frequency = float(parsed['sectors'][0]['centre_frequency']
+                               if parsed['sectors'] else 0.0)
         info.sound_speed = float(parsed['sound_speed'])
         # tx/rx_beamwidths left empty on purpose: the CUBE error model treats
         # those array values as DEGREES (PingInfo.msg says radians) and falls
