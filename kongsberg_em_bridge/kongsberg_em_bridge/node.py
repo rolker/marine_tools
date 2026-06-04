@@ -36,20 +36,12 @@ class KongsbergEmBridge(Node):
         self.declare_parameter('bind_address', '0.0.0.0')
         self.declare_parameter('bind_port', 20002)
         self.declare_parameter('frame_id', 'm3')
-        # TEMPORARY calibration knobs: sign of the rx (across-track) and tx
-        # (along-track) angles relative to the SonarDetections convention
-        # (+rx to starboard, +tx forward). To be removed and hard-coded once a
-        # patch test confirms the M3's handedness (see marine_tools#14).
-        self.declare_parameter('rx_angle_sign', 1.0)
-        self.declare_parameter('tx_angle_sign', 1.0)
         # Drop beams the sonar flagged invalid. Required: the CUBE error model
         # iterates every element of two_way_travel_times and does NOT consult
         # flags, so invalid (twtt=0) beams would otherwise become z=0 points.
         self.declare_parameter('skip_invalid_beams', True)
 
         self.frame_id = self.get_parameter('frame_id').value
-        self.rx_sign = float(self.get_parameter('rx_angle_sign').value)
-        self.tx_sign = float(self.get_parameter('tx_angle_sign').value)
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
 
         self.publisher = self.create_publisher(
@@ -140,8 +132,16 @@ class KongsbergEmBridge(Node):
             msg.two_way_travel_times.append(float(beam['twtt']))
             msg.tx_delays.append(float(sector['tx_delay']))
             msg.intensities.append(float(beam['reflectivity_db']))
-            msg.tx_angles.append(self.tx_sign * math.radians(sector['tilt_deg']))
-            msg.rx_angles.append(self.rx_sign * math.radians(beam['pointing_angle_deg']))
+            # Deterministic convention mapping (no tuning knobs):
+            #   Kongsberg .all (EM Datagram Formats 850-160692, Note 1):
+            #     beam pointing angle +ve to PORT, transmit tilt +ve FORWARD.
+            #   marine_acoustic_msgs/SonarDetections:
+            #     rx_angles +ve to STARBOARD, tx_angles +ve FORWARD.
+            # So negate the rx (pointing) angle; tx (tilt) carries through.
+            # Any physical mount orientation belongs in the URDF base_link->frame
+            # transform (a normally-mounted downward M3 is roll=pi), not here.
+            msg.tx_angles.append(math.radians(sector['tilt_deg']))
+            msg.rx_angles.append(-math.radians(beam['pointing_angle_deg']))
 
         self.publisher.publish(msg)
         self._ping_count += 1
