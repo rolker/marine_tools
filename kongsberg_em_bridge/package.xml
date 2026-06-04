@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>kongsberg_em_bridge</name>
+  <version>0.0.1</version>
+  <description>Decode a Kongsberg .all UDP stream (Raw Range and Angle 78) from an M3 multibeam and publish marine_acoustic_msgs/SonarDetections for the cube_bathymetry pipeline.</description>
+  <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <depend>rclpy</depend>
+  <depend>marine_acoustic_msgs</depend>
+  <depend>builtin_interfaces</depend>
+
+  <!-- launch / launch_ros are imported by the launch file and must be present
+       at runtime on a minimal install that only pulls this package. -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
