@@ -42,3 +42,20 @@ issue: 1
 ### False positives
 - (Copilot R2) node.py "rx/tx_angle_sign documented but not declared" — params removed by design for the deterministic Kongsberg→SonarDetections convention mapping (commit a2be7fe); current PR body documents the lean set. Reviewed against stale state.
 - (Copilot R1) em_datagrams.py "siglen unused will fail ament_flake8 (F841)" — pyflakes exempts tuple-unpack targets; colcon flake8 passes. (siglen was genuinely unused; dropped it anyway.)
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-04 21:41 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #14 at `792f2e0`
+**Sources**: 1 (Copilot R4 @ `5f14e27`)
+**Cross-source confirmations**: 0
+**CI**: copilot-pull-request-reviewer success
+
+### Findings
+- [x] (valid, Copilot R4) parse_n78 didn't validate the ETX trailer byte after the length check — now asserts p[expected-3]==ETX — `kongsberg_em_bridge/em_datagrams.py`
+- [x] (valid, Copilot R4) parse_xyz88 same ETX gap — now validated — `em_datagrams.py`
+
+### Decisions
+- Full checksum validation deliberately out of scope: ETX + exact-length framing rejects misaligned/corrupt frames; a single bad ping on a local 500 kHz UDP link is harmless (one dropped sounding, handled by CUBE outlier rejection). Pre-empts a likely next-round checksum suggestion.
