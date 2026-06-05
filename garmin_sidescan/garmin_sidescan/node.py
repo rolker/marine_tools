@@ -252,8 +252,11 @@ class GarminSidescanNode(Node):
                 'startup: could not assert transmit OFF (GCV unreachable?); '
                 'assuming sonar may be pinging - watchdog will retry')
         if range_m > 0:
-            self._send(build_range_cmd(range_m))
-            self.get_logger().info(f'startup: range set to {range_m} m')
+            if self._send(build_range_cmd(range_m)):
+                self._controls['range'] = f'{range_m:.1f}'
+                self.get_logger().info(f'startup: range set to {range_m} m')
+            else:
+                self.get_logger().error(f'startup: range command ({range_m} m) failed to send')
         if want_on:
             ok, msg = self._guard_transmit_on()
             if ok:
@@ -397,18 +400,24 @@ class GarminSidescanNode(Node):
                 self.get_logger().warn(f'bad range control value: {value!r}')
                 return
             meters = max(self._range_min, min(self._range_max, meters))
-            self._send(build_range_cmd(meters))
-            self._controls['range'] = f'{meters:.1f}'
-            self.get_logger().info(f'range set to {meters} m (control)')
+            # Only mirror/log success if the command actually sent; otherwise
+            # CAMP would show a range the GCV never received.
+            if self._send(build_range_cmd(meters)):
+                self._controls['range'] = f'{meters:.1f}'
+                self.get_logger().info(f'range set to {meters} m (control)')
+            else:
+                self.get_logger().error(f'range command ({meters} m) failed to send')
         elif key in ('tvg', 'interference') and self._expose_gcv10:
             if value not in LOW_MED_HIGH:
                 self.get_logger().warn(f'bad {key} control value: {value!r}')
                 return
             level = LOW_MED_HIGH.index(value)
             builder = build_tvg_cmd if key == 'tvg' else build_interference_cmd
-            self._send(builder(level))
-            self._controls[key] = value
-            self.get_logger().info(f'{key} set to {value} (control)')
+            if self._send(builder(level)):
+                self._controls[key] = value
+                self.get_logger().info(f'{key} set to {value} (control)')
+            else:
+                self.get_logger().error(f'{key} command ({value}) failed to send')
         else:
             self.get_logger().warn(f'unknown control key: {key!r}')
             return
@@ -574,7 +583,12 @@ class GarminSidescanNode(Node):
     def _on_param_set(self, params):
         for p in params:
             if p.name == 'range_m' and p.value and p.value > 0:
-                self._send(build_range_cmd(float(p.value)))
+                # Reject the parameter set if the command can't be sent, so the
+                # ROS parameter and UI never claim a range the GCV didn't apply.
+                if not self._send(build_range_cmd(float(p.value))):
+                    self.get_logger().error(f'range command ({p.value} m) failed to send')
+                    return SetParametersResult(
+                        successful=False, reason='range command failed to send')
                 self._controls['range'] = f'{float(p.value):.1f}'
                 self._publish_control_set()
                 self.get_logger().info(f'range set to {p.value} m')
