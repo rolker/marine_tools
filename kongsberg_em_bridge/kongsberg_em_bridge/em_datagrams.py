@@ -80,6 +80,8 @@ def parse_n78(p: bytes) -> dict:
     if len(p) < expected:
         raise ValueError(
             f'N/78 truncated: len={len(p)} need={expected} (ntx={ntx} nrx={nrx})')
+    if p[expected - 3] != ETX:  # ETX sits before the 2-byte checksum
+        raise ValueError(f'N/78 bad ETX at offset {expected - 3}')
 
     sectors = []
     off = 32
@@ -145,6 +147,8 @@ def parse_xyz88(p: bytes) -> dict:
     if len(p) < expected:
         raise ValueError(
             f'XYZ88 truncated: len={len(p)} need={expected} (nbeams={nbeams})')
+    if p[expected - 3] != ETX:  # ETX sits before the 2-byte checksum
+        raise ValueError(f'XYZ88 bad ETX at offset {expected - 3}')
     beams = []
     for n in range(nbeams):
         base = 36 + 20 * n

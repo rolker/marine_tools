@@ -107,6 +107,16 @@ def test_truncated_datagrams_raise():
         pass
 
 
+def test_bad_etx_raises():
+    n78 = bytearray(_build_n78([(0.0, 0x00, 0.0125, -25.0)]))
+    n78[-3] = 0x00  # corrupt the ETX byte (right length, wrong trailer)
+    try:
+        em.parse_n78(bytes(n78))
+        assert False, 'expected ValueError on bad N/78 ETX'
+    except ValueError:
+        pass
+
+
 def _build_xyz88(beams):
     """
     Construct a synthetic XYZ88 datagram.
