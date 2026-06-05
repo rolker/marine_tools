@@ -88,3 +88,42 @@ def test_em_time_to_unix():
     assert em.em_time_to_unix(0, 0) is None
     t = em.em_time_to_unix(20260604, 1000)
     assert t is not None and t > 1.7e9
+
+
+def _build_xyz88(beams):
+    """
+    Construct a synthetic XYZ88 datagram.
+
+    ``beams`` is a list of (z, y, x, quality, det_info). Per-beam block is
+    20 B: z/y/x float32 [0:12], quality at 14, IBA at 15, detection info at 16.
+    """
+    nb = len(beams)
+    header = bytearray(36)
+    header[0] = em.STX
+    header[1] = em.DG_XYZ88
+    struct.pack_into('<II', header, 4, 20260604, 1000)  # date, time_ms
+    struct.pack_into('<H', header, 12, 7)               # ping
+    struct.pack_into('<HH', header, 24, nb, nb)         # nbeams, nvalid
+    body = b''
+    for z, y, x, qf, det in beams:
+        b = bytearray(20)
+        struct.pack_into('<fff', b, 0, z, y, x)
+        b[14] = qf          # quality
+        b[15] = 7           # IBA (must NOT be read as det_info)
+        b[16] = det         # detection info (bit 7 => invalid)
+        body += bytes(b)
+    return bytes(header) + body + struct.pack('<BBH', 0, em.ETX, 0)
+
+
+def test_parse_xyz88_validity_and_offset():
+    dg = _build_xyz88([
+        (12.5, -3.0, 0.1, 30, 0x00),   # valid
+        (13.0, 3.0, 0.1, 28, 0x80),    # bit 7 set => invalid
+    ])
+    out = em.parse_xyz88(dg)
+    assert out['nbeams'] == 2
+    b0, b1 = out['beams']
+    assert abs(b0['z'] - 12.5) < 1e-4 and abs(b0['y'] - (-3.0)) < 1e-4
+    # det_info must be read at offset 16, not 15 (IBA=7 there would read valid).
+    assert b0['valid'] is True
+    assert b1['valid'] is False

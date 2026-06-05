@@ -80,13 +80,23 @@ class KongsbergEmBridge(Node):
                 continue
             except OSError:
                 break
+            if len(data) <= 1 or data[0] != em.STX or \
+                    data[1] != em.DG_RAW_RANGE_ANGLE_78:
+                continue
             try:
-                if len(data) > 1 and data[0] == em.STX and \
-                        data[1] == em.DG_RAW_RANGE_ANGLE_78:
-                    self._publish(em.parse_n78(data))
+                parsed = em.parse_n78(data)
             except (ValueError, struct.error) as exc:
                 self.get_logger().warning(
                     f'datagram decode error: {exc}', throttle_duration_sec=10.0)
+                continue
+            # Publish is guarded separately and broadly: a publish-time error
+            # (e.g. rclpy context mid-shutdown) must never kill this daemon
+            # recv thread and leave the node silently deaf.
+            try:
+                self._publish(parsed)
+            except Exception as exc:  # noqa: B902 - intentional: keep thread alive
+                self.get_logger().warning(
+                    f'publish failed: {exc}', throttle_duration_sec=10.0)
 
     def _stamp(self, parsed) -> TimeMsg:
         # Use the sonar's (1PPS-disciplined) ping time. Band-aid: if the
@@ -100,8 +110,13 @@ class KongsbergEmBridge(Node):
                 throttle_duration_sec=10.0)
             return self.get_clock().now().to_msg()
         msg = TimeMsg()
-        msg.sec = int(unix)
-        msg.nanosec = int(round((unix - msg.sec) * 1e9))
+        sec = int(unix)
+        nsec = int(round((unix - sec) * 1e9))
+        if nsec >= 1_000_000_000:  # rounding can carry; keep nanosec < 1e9
+            sec += 1
+            nsec -= 1_000_000_000
+        msg.sec = sec
+        msg.nanosec = nsec
         return msg
 
     def _publish(self, parsed):

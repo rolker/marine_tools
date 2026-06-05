@@ -142,9 +142,12 @@ def parse_xyz88(p: bytes) -> dict:
         if base + 17 > len(p):
             break
         z, y, x = struct.unpack_from('<fff', p, base)
-        qf, det_info = struct.unpack_from('<BB', p, base + 14)
+        # XYZ88 per-beam (20 B): ... window[12:14], quality[14], IBA[15],
+        # detection info[16], cleaning[17], reflectivity[18:20].
+        qf = p[base + 14]
+        det_info = p[base + 16]
         beams.append({'x': x, 'y': y, 'z': z, 'quality': qf,
-                      'valid': det_info < 16})
+                      'valid': (det_info & 0x80) == 0})
     return {'type': DG_XYZ88, 'date': date, 'time_ms': time_ms,
             'unix_time': em_time_to_unix(date, time_ms), 'ping': ping,
             'nbeams': nbeams, 'nvalid': nvalid, 'beams': beams}
