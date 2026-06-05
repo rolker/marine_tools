@@ -68,3 +68,21 @@ issue: 15
 
 ### False positives
 - none — all five valid; same correctness class as R1 _request_transmit, generalized to all remaining send sites
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-05
+**By**: Claude Code Agent (Claude Opus 4.8)
+
+**PR**: #17 at `d2c5c78`
+**Sources**: Copilot R3 @ `d2c5c78` + prior Integrated Reviews
+**Cross-source confirmations**: 0
+**CI**: no build/test CI on repo; local colcon test gate
+
+### Findings
+- [ ] (must-fix, Copilot R3) _rx_loop drops socket on OSError without closing → fd leak — `node.py:_rx_loop`
+- [ ] (must-fix, Copilot R3) range_m param send bypasses range_min..range_max bounds; out-of-range sent + reported success — `node.py:_on_param_set`
+- [ ] (must-fix, Copilot R3) watchdog returns early with no sv_topic; transmitting + require_sv + no SV source never stops — `node.py:_watchdog`
+
+### False positives
+- (Copilot R3) launch.py frame_id passed as list "becomes a list not a string" — launch_ros concatenates a substitution list into a single string parameter (documented frame-prefix idiom); production bizzyboat_project11/launch/sound_speed_launch.py:66 uses the identical pattern. rclpy receives a string.
