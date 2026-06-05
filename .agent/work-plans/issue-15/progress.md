@@ -30,3 +30,21 @@ issue: 15
 - Static analysis: ament flake8 + pep257 clean (colcon test).
 - Tests: 12 pass (real-data decode, command-frame equivalence, transmit-state safety rule).
 - Residual: cross-thread reads of `_safety_latched`/`_last_valid_sv_t` are GIL-atomic single ops; executor callbacks are single-threaded. Acceptable.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-05
+**By**: Claude Code Agent (Claude Opus 4.8)
+
+**PR**: #17 at `39e9bec`
+**Sources**: 2 (Copilot R1 @ `39e9bec`, Local Review @ `bd646d4`)
+**Cross-source confirmations**: 0 at same head (1 thematic link to Local Review #1)
+**CI**: no build/test CI on repo; local colcon test = 14 pass
+
+### Findings
+- [ ] (must-fix, Copilot) `_request_transmit` reports success/state regardless of TCP send result — sibling of Local Review #1 at the API boundary, reintroduced by the control-interface refactor — `node.py:_request_transmit`
+- [ ] (must-fix, Copilot) missing `setup.cfg` (install_scripts) — entry point may install to bin/, launch_ros may not find executable — `setup.py`/`setup.cfg`
+- [ ] (suggestion, Copilot) waterfall `buf += row` → `b''.join(rows)` (cleaner/linear) — `node.py:_publish_waterfalls`
+
+### False positives
+- none — all three Copilot findings valid
