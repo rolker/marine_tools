@@ -86,8 +86,25 @@ def test_dispatch_and_iter_framing():
 
 def test_em_time_to_unix():
     assert em.em_time_to_unix(0, 0) is None
+    assert em.em_time_to_unix(20260604, 86_400_000) is None  # time_ms out of range
+    assert em.em_time_to_unix(20260604, -1) is None
     t = em.em_time_to_unix(20260604, 1000)
     assert t is not None and t > 1.7e9
+
+
+def test_truncated_datagrams_raise():
+    n78 = _build_n78([(0.0, 0x00, 0.0125, -25.0)])
+    try:
+        em.parse_n78(n78[:-4])  # drop the spare/ETX/checksum trailer
+        assert False, 'expected ValueError on truncated N/78'
+    except ValueError:
+        pass
+    xyz = _build_xyz88([(10.0, 0.0, 0.0, 30, 0x00)])
+    try:
+        em.parse_xyz88(xyz[:-4])
+        assert False, 'expected ValueError on truncated XYZ88'
+    except ValueError:
+        pass
 
 
 def _build_xyz88(beams):

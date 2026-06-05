@@ -10,8 +10,10 @@ Feeds a sample captured by the dev tool (4-byte big-endian length + payload per
 datagram) back out as UDP so ``kongsberg_em_bridge`` can be exercised offline,
 with no sonar attached. Sends only the N/78 datagrams by default.
 
+This is an argparse CLI (not an rclpy node), so pass plain flags, not ROS args.
+
 Usage:
-    ros2 run kongsberg_em_bridge replay --ros-args -p file:=/path/m3_sample.bin
+    ros2 run kongsberg_em_bridge replay --file /path/m3_sample.bin
     # or standalone:
     python3 -m kongsberg_em_bridge.replay --file m3_sample.bin --port 20002
 """
@@ -26,7 +28,8 @@ from kongsberg_em_bridge import em_datagrams as em
 
 def replay(path, host, port, rate_hz, only_n78, loop):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data = open(path, 'rb').read()
+    with open(path, 'rb') as f:
+        data = f.read()
     period = 0.0 if rate_hz <= 0 else 1.0 / rate_hz
     sent = 0
     while True:

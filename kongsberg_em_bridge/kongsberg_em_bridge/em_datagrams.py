@@ -46,6 +46,8 @@ def em_time_to_unix(date: int, time_ms: int) -> Optional[float]:
     """
     if date < 19700101 or date > 30000101:
         return None
+    if not 0 <= time_ms < 86_400_000:  # ms since midnight; reject corrupt values
+        return None
     year, md = divmod(date, 10000)
     month, day = divmod(md, 100)
     try:
@@ -72,16 +74,19 @@ def parse_n78(p: bytes) -> dict:
     ntx, nrx, nvalid = struct.unpack_from('<HHH', p, 18)
     (samp_freq,) = struct.unpack_from('<f', p, 24)
 
-    expected = 32 + 24 * ntx + 16 * nrx + 4  # + spare/ETX/checksum
-    if len(p) < expected - 4:
+    # header + sectors + beams + trailer (spare/ETX/checksum). Require the full
+    # datagram so a truncated one is rejected, not silently parsed as complete.
+    expected = 32 + 24 * ntx + 16 * nrx + 4
+    if len(p) < expected:
         raise ValueError(
-            f'N/78 too short: len={len(p)} ntx={ntx} nrx={nrx}')
+            f'N/78 truncated: len={len(p)} need={expected} (ntx={ntx} nrx={nrx})')
 
     sectors = []
     off = 32
     for _ in range(ntx):
         (tilt_raw,) = struct.unpack_from('<h', p, off)        # 0.01 deg
-        siglen, tx_delay, ctr_freq = struct.unpack_from('<fff', p, off + 4)
+        # sector: siglen[off+4], tx_delay[off+8], centre_freq[off+12] (float32)
+        tx_delay, ctr_freq = struct.unpack_from('<ff', p, off + 8)
         sectors.append({
             'tilt_deg': tilt_raw * 0.01,
             'tx_delay': tx_delay,
@@ -136,11 +141,13 @@ def parse_xyz88(p: bytes) -> dict:
     date, time_ms = struct.unpack_from('<II', p, 4)
     (ping,) = struct.unpack_from('<H', p, 12)
     nbeams, nvalid = struct.unpack_from('<HH', p, 24)
+    expected = 36 + 20 * nbeams + 4  # header + beams + trailer
+    if len(p) < expected:
+        raise ValueError(
+            f'XYZ88 truncated: len={len(p)} need={expected} (nbeams={nbeams})')
     beams = []
     for n in range(nbeams):
         base = 36 + 20 * n
-        if base + 17 > len(p):
-            break
         z, y, x = struct.unpack_from('<fff', p, base)
         # XYZ88 per-beam (20 B): ... window[12:14], quality[14], IBA[15],
         # detection info[16], cleaning[17], reflectivity[18:20].
