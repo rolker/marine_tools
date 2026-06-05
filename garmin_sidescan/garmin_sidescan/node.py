@@ -301,16 +301,26 @@ class GarminSidescanNode(Node):
         self._publish_control_set()
 
     def _request_transmit(self, on):
-        """Guarded transmit request shared by the service and control set."""
+        """
+        Guarded transmit request shared by the service and control set.
+
+        The return reflects the actual resulting transmit state, not merely
+        that a command was attempted: a failed ON send reports failure, and a
+        failed OFF send reports that the sonar may still be transmitting.
+        """
         if on:
             ok, msg = self._guard_transmit_on()
             if not ok:
                 self.get_logger().warn(f'transmit ON refused: {msg}')
                 return False, msg
             self._set_transmit(True, 'request')
-            return True, 'transmitting'
+            if self._transmitting:
+                return True, 'transmitting'
+            return False, 'transmit ON command failed to send'
         self._safety_latched = False    # explicit operator off: no auto-resume
         self._set_transmit(False, 'request')
+        if self._transmitting:
+            return False, 'transmit OFF command failed to send; sonar may still be pinging'
         return True, 'transmit off'
 
     # ----- transmit guard ----------------------------------------------------
@@ -538,9 +548,6 @@ class GarminSidescanNode(Node):
                 width = self._width.get(side)
             if not rows or not width:
                 continue
-            buf = bytearray()
-            for row in rows:
-                buf += row
             img = Image()
             img.header.stamp = stamp
             img.header.frame_id = self._frame_id
@@ -549,7 +556,7 @@ class GarminSidescanNode(Node):
             img.encoding = 'mono8'
             img.is_bigendian = 0
             img.step = width
-            img.data = bytes(buf)
+            img.data = b''.join(rows)
             self._pub_wf[side].publish(img)
 
     def _publish_status(self):
