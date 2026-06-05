@@ -41,8 +41,9 @@ def _build_n78(beams, *, ntx_tilt_deg=0.0, ctr_freq=500000.0, tx_delay=0.001,
             10, 0,                                    # quality, dcorr
             twtt,
             round(refl_db * 10), 0, 0)                # refl, rt clean, spare
-    trailer = struct.pack('<BBH', 0, em.ETX, 0)       # spare, ETX, checksum
-    return header + sector + body + trailer
+    frame = header + sector + body + b'\x00'           # ... + spare byte
+    cksum = sum(frame[1:]) & 0xFFFF                     # sum between STX and ETX
+    return frame + bytes([em.ETX]) + struct.pack('<H', cksum)
 
 
 def test_parse_n78_basic():
@@ -117,6 +118,16 @@ def test_bad_etx_raises():
         pass
 
 
+def test_bad_checksum_raises():
+    n78 = bytearray(_build_n78([(10.0, 0x00, 0.0125, -25.0)]))
+    n78[-4] ^= 0xFF  # corrupt the spare byte (in checksum range, not structural)
+    try:
+        em.parse_n78(bytes(n78))
+        assert False, 'expected ValueError on N/78 checksum mismatch'
+    except ValueError:
+        pass
+
+
 def _build_xyz88(beams):
     """
     Construct a synthetic XYZ88 datagram.
@@ -139,7 +150,9 @@ def _build_xyz88(beams):
         b[15] = 7           # IBA (must NOT be read as det_info)
         b[16] = det         # detection info (bit 7 => invalid)
         body += bytes(b)
-    return bytes(header) + body + struct.pack('<BBH', 0, em.ETX, 0)
+    frame = bytes(header) + body + b'\x00'              # ... + spare byte
+    cksum = sum(frame[1:]) & 0xFFFF
+    return frame + bytes([em.ETX]) + struct.pack('<H', cksum)
 
 
 def test_parse_xyz88_validity_and_offset():

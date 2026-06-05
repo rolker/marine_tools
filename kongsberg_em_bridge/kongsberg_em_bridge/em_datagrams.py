@@ -57,6 +57,23 @@ def em_time_to_unix(date: int, time_ms: int) -> Optional[float]:
     return midnight.timestamp() + time_ms / 1000.0
 
 
+def _verify_trailer(p: bytes, expected: int, name: str) -> None:
+    """
+    Validate a length-``expected`` .all datagram's ETX byte and checksum.
+
+    Trailer is spare[expected-4], ETX[expected-3], checksum[expected-2:]. The
+    checksum is the 16-bit modular sum of the bytes between STX and ETX
+    (exclusive). The M3's datagrams were confirmed spec-correct, so this rejects
+    only genuinely corrupt frames (and complements UDP's own transport checksum).
+    """
+    if p[expected - 3] != ETX:
+        raise ValueError(f'{name} bad ETX at offset {expected - 3}')
+    stored = struct.unpack_from('<H', p, expected - 2)[0]
+    calc = sum(p[1:expected - 3]) & 0xFFFF
+    if calc != stored:
+        raise ValueError(f'{name} checksum mismatch: calc={calc} stored={stored}')
+
+
 def parse_n78(p: bytes) -> dict:
     """
     Decode a Raw Range and Angle 78 ('N') datagram (payload starts at STX).
@@ -80,8 +97,7 @@ def parse_n78(p: bytes) -> dict:
     if len(p) < expected:
         raise ValueError(
             f'N/78 truncated: len={len(p)} need={expected} (ntx={ntx} nrx={nrx})')
-    if p[expected - 3] != ETX:  # ETX sits before the 2-byte checksum
-        raise ValueError(f'N/78 bad ETX at offset {expected - 3}')
+    _verify_trailer(p, expected, 'N/78')
 
     sectors = []
     off = 32
@@ -147,8 +163,7 @@ def parse_xyz88(p: bytes) -> dict:
     if len(p) < expected:
         raise ValueError(
             f'XYZ88 truncated: len={len(p)} need={expected} (nbeams={nbeams})')
-    if p[expected - 3] != ETX:  # ETX sits before the 2-byte checksum
-        raise ValueError(f'XYZ88 bad ETX at offset {expected - 3}')
+    _verify_trailer(p, expected, 'XYZ88')
     beams = []
     for n in range(nbeams):
         base = 36 + 20 * n
