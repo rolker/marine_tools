@@ -80,9 +80,17 @@ issue: 15
 **CI**: no build/test CI on repo; local colcon test gate
 
 ### Findings
-- [ ] (must-fix, Copilot R3) _rx_loop drops socket on OSError without closing → fd leak — `node.py:_rx_loop`
-- [ ] (must-fix, Copilot R3) range_m param send bypasses range_min..range_max bounds; out-of-range sent + reported success — `node.py:_on_param_set`
-- [ ] (must-fix, Copilot R3) watchdog returns early with no sv_topic; transmitting + require_sv + no SV source never stops — `node.py:_watchdog`
+- [x] (must-fix, Copilot R3) _rx_loop drops socket on OSError without closing → fd leak — `node.py:_rx_loop` (fixed: `sock.close()` before dropping the reference on the recvfrom OSError path; releases fd + multicast membership on rejoin)
+- [x] (must-fix, Copilot R3) range_m param send bypasses range_min..range_max bounds; out-of-range sent + reported success — `node.py:_on_param_set` (fixed: reject out-of-range param set via `range_in_bounds()` with `successful=False` — doesn't silently clamp, so the param store can't hold a value the GCV never got; mirrors the control-set guard)
+- [x] (must-fix, Copilot R3) watchdog returns early with no sv_topic; transmitting + require_sv + no SV source never stops — `node.py:_watchdog` (fixed: decision extracted to pure `watchdog_action()`; with no sv_topic it now mirrors `_guard_transmit_on` — stops transmit when `require_sv` is set, leaves it untouched for bench testing with `require_sound_speed:=false`)
+
+### Resolution (fixes applied)
+**When**: 2026-06-05 · **By**: Claude Code Agent (Claude Opus 4.8)
+- All three R3 must-fixes addressed. Watchdog and range-bounds logic extracted
+  to pure predicates (`watchdog_action`, `range_in_bounds`) following the
+  existing `transmit_state_after` pattern, with 10 new unit tests in
+  `test_safety.py` (no rclpy needed).
+- Tests: 24 pass (was 14). ament_flake8 + ament_pep257 clean.
 
 ### False positives
 - (Copilot R3) launch.py frame_id passed as list "becomes a list not a string" — launch_ros concatenates a substitution list into a single string parameter (documented frame-prefix idiom); production bizzyboat_project11/launch/sound_speed_launch.py:66 uses the identical pattern. rclpy receives a string.

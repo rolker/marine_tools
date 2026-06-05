@@ -55,6 +55,39 @@ def transmit_state_after(commanded_on, send_ok):
     return send_ok if commanded_on else (not send_ok)
 
 
+def watchdog_action(*, safety_enabled, transmitting, has_sv_topic,
+                    require_sv, sv_age, sv_timeout):
+    """
+    Decide whether the sound-speed watchdog must stop transmit.
+
+    Returns ``(stop, kind)`` where ``stop`` is a bool and ``kind`` is
+    ``''`` (no action), ``'no_source'`` (require_sound_speed set but no
+    sound-speed source configured), or ``'stale'`` (no valid reading within
+    ``sv_timeout``).
+
+    The watchdog runs independently of *require_sound_speed*: that flag governs
+    whether a fresh reading is required *before* transmitting, while the
+    watchdog must stop a dry transducer whenever it is (or may be) transmitting.
+    With no sound-speed source it mirrors ``_guard_transmit_on``: under
+    require_sv it must stop (the guard refuses to *start* here, so a
+    maybe-transmitting state reached without a guard must not be left pinging);
+    without require_sv (bench testing) there is nothing to evaluate, so it
+    leaves transmit untouched.
+    """
+    if not safety_enabled or not transmitting:
+        return False, ''
+    if not has_sv_topic:
+        return (True, 'no_source') if require_sv else (False, '')
+    if sv_age is None or sv_age > sv_timeout:
+        return True, 'stale'
+    return False, ''
+
+
+def range_in_bounds(meters, range_min, range_max):
+    """Return whether a requested range (m) is within the configured limits."""
+    return range_min <= meters <= range_max
+
+
 class GarminSidescanNode(Node):
     """Driver node: GCV imagery in, RawSonarImage out, transmit under safety."""
 
@@ -458,20 +491,25 @@ class GarminSidescanNode(Node):
             self._valid_streak = 0
 
     def _watchdog(self):
-        # Independent of require_sound_speed: that flag governs whether a fresh
-        # reading is required *before* transmitting; the watchdog must still
-        # stop a dry transducer whenever safety is on and we are (or may be)
-        # transmitting and a sound-speed source is configured.
-        if not self._safety_enabled or not self._transmitting or not self._sv_topic:
-            return
         age = self._sv_age()
-        if age is None or age > self._sv_timeout:
+        stop, kind = watchdog_action(
+            safety_enabled=self._safety_enabled,
+            transmitting=self._transmitting,
+            has_sv_topic=bool(self._sv_topic),
+            require_sv=self._require_sv,
+            sv_age=age,
+            sv_timeout=self._sv_timeout)
+        if not stop:
+            return
+        self._safety_latched = True
+        if kind == 'no_source':
+            reason = ('SAFETY: require_sound_speed set but no sound-speed source '
+                      'configured; stopping ping to protect transducer')
+        else:
             shown = 'never' if age is None else f'{age:.1f}s ago'
-            self._safety_latched = True
-            self._set_transmit(
-                False,
-                f'SAFETY: sound speed invalid/stale (last valid {shown}, '
-                f'value={self._last_sv_value}); stopping ping to protect transducer')
+            reason = (f'SAFETY: sound speed invalid/stale (last valid {shown}, '
+                      f'value={self._last_sv_value}); stopping ping to protect transducer')
+        self._set_transmit(False, reason)
 
     # ----- imagery receive + decode -----------------------------------------
     def _open_mcast(self):
@@ -504,6 +542,10 @@ class GarminSidescanNode(Node):
             except socket.timeout:
                 continue
             except OSError:
+                # Close before dropping the reference so the fd (and the
+                # multicast membership) is released rather than leaked on a
+                # rejoin loop.
+                sock.close()
                 sock = None
                 continue
             if self._filter_src and addr[0] != self._gcv_ip:
@@ -583,15 +625,27 @@ class GarminSidescanNode(Node):
     def _on_param_set(self, params):
         for p in params:
             if p.name == 'range_m' and p.value and p.value > 0:
+                meters = float(p.value)
+                # Reject (don't silently clamp) an out-of-range request: the
+                # parameter store would otherwise hold a value the GCV never
+                # got. Mirrors the range_min..range_max guard on the control set.
+                if not range_in_bounds(meters, self._range_min, self._range_max):
+                    self.get_logger().warn(
+                        f'range_m {meters} m outside '
+                        f'{self._range_min}-{self._range_max} m; rejected')
+                    return SetParametersResult(
+                        successful=False,
+                        reason=(f'range {meters} m outside '
+                                f'{self._range_min}-{self._range_max} m'))
                 # Reject the parameter set if the command can't be sent, so the
                 # ROS parameter and UI never claim a range the GCV didn't apply.
-                if not self._send(build_range_cmd(float(p.value))):
-                    self.get_logger().error(f'range command ({p.value} m) failed to send')
+                if not self._send(build_range_cmd(meters)):
+                    self.get_logger().error(f'range command ({meters} m) failed to send')
                     return SetParametersResult(
                         successful=False, reason='range command failed to send')
-                self._controls['range'] = f'{float(p.value):.1f}'
+                self._controls['range'] = f'{meters:.1f}'
                 self._publish_control_set()
-                self.get_logger().info(f'range set to {p.value} m')
+                self.get_logger().info(f'range set to {meters} m')
             elif p.name == 'sound_speed_safety_enabled':
                 self._safety_enabled = bool(p.value)
                 if self._safety_enabled:
