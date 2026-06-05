@@ -48,3 +48,23 @@ issue: 15
 
 ### False positives
 - none — all three Copilot findings valid
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-05
+**By**: Claude Code Agent (Claude Opus 4.8)
+
+**PR**: #17 at `94cd1a2`
+**Sources**: 2 (Copilot R2 @ `94cd1a2`, prior Integrated Review @ `39e9bec`)
+**Cross-source confirmations**: theme continued from R1 (ignored send results)
+**CI**: no build/test CI on repo; local colcon test gate
+
+### Findings
+- [ ] (must-fix, Copilot R2) package.xml missing runtime deps rosidl_runtime_py / launch / launch_ros — `package.xml`
+- [ ] (must-fix, Copilot R2) startup range send result ignored, logs success on failure — `node.py:_startup_transmit_state`
+- [ ] (must-fix, Copilot R2) range control updates mirror+logs success without checking send — `node.py:_on_control_value`
+- [ ] (must-fix, Copilot R2) tvg/interference control updates mirror+logs success without checking send — `node.py:_on_control_value`
+- [ ] (must-fix, Copilot R2) range_m param callback reports success ignoring send result — `node.py:_on_param_set`
+
+### False positives
+- none — all five valid; same correctness class as R1 _request_transmit, generalized to all remaining send sites
