@@ -21,10 +21,32 @@ Published (relative to the node namespace):
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
 
-Subscribed: the sound-speed topic (default
-`/bizzy/sensors/sound_speed/sound_speed`, `marine_interfaces/SoundSpeed`).
+| `state` | `marine_radar_control_msgs/RadarControlSet` | latched operator-control set (CAMP renders it) |
+
+Subscribed:
+- the sound-speed topic (default `/bizzy/sensors/sound_speed/sound_speed`,
+  `marine_interfaces/SoundSpeed`).
+- `change_state` (`marine_radar_control_msgs/RadarControlValue`) — operator
+  control changes (`key`/`value`), same contract as the radar driver.
 
 Service: `set_transmit` (`std_srvs/SetBool`) — turn transmit on/off.
+
+## Operator controls (radar-style)
+
+Mirrors the `unh_marine_radar` pattern so CAMP can render the controls
+dynamically: the node publishes a `RadarControlSet` on `state` and accepts
+`RadarControlValue` (`key`, `value`) on `change_state`.
+
+| Control | Type | Values | Notes |
+|---------|------|--------|-------|
+| `status` | enum | `standby` / `transmit` | routed through the safety guard; reflects watchdog-driven changes |
+| `range` | float | `range_min_m`..`range_max_m` (m) | verified on GCV-20 |
+| `tvg` | enum | `off`/`low`/`medium`/`high` | GCV-10-derived; **unverified on GCV-20** (TVG is display-side there) |
+| `interference` | enum | `off`/`low`/`medium`/`high` | GCV-10-derived; **unverified on GCV-20** |
+
+`tvg` / `interference` are gated by `expose_gcv10_controls` (default true).
+`status=transmit` cannot bypass the sound-speed interlock — it goes through the
+same guard as the service.
 
 ## Safety
 
@@ -71,6 +93,8 @@ imagery stream because they are not reliably present there:
 | `sv_timeout` | `12.0` | seconds of bad/missing SV before auto-stop |
 | `auto_resume` | `true` | resume transmit when valid in-water SV returns |
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
+| `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
+| `expose_gcv10_controls` | `true` | include TVG / interference controls |
 | `waterfall_height` | `600` | rolling waterfall rows |
 
 ## Run

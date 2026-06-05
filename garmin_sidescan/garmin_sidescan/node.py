@@ -21,6 +21,7 @@ import threading
 import time
 
 from marine_acoustic_msgs.msg import RawSonarImage, SonarImageData
+from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
 from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.node import Node
@@ -30,7 +31,14 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool
 
-from .commands import build_range_cmd, TRANSMIT_OFF, TRANSMIT_ON
+from .commands import (
+    build_interference_cmd,
+    build_range_cmd,
+    build_tvg_cmd,
+    LOW_MED_HIGH,
+    TRANSMIT_OFF,
+    TRANSMIT_ON,
+)
 from .decode import PingAssembler
 
 SIDES = ('port', 'stbd', 'clearvu')
@@ -84,6 +92,13 @@ class GarminSidescanNode(Node):
         self.declare_parameter('transmit_on_startup', False)
         self.declare_parameter('startup_off_repeats', 3)
         self.declare_parameter('range_m', 0.0)
+
+        # operator control set (radar-style; rendered by CAMP)
+        self.declare_parameter('range_min_m', 1.0)
+        self.declare_parameter('range_max_m', 60.0)
+        # TVG / interference frames are GCV-10-derived and unverified on the
+        # GCV-20 (TVG is display-side there); expose them but allow opting out.
+        self.declare_parameter('expose_gcv10_controls', True)
 
         # sound-speed watchdog
         self.declare_parameter('sound_speed_safety_enabled', True)
@@ -141,6 +156,17 @@ class GarminSidescanNode(Node):
         self._last_sv_value = float('nan')
         self._valid_streak = 0
         self._ping_count = {s: 0 for s in SIDES}
+        self._range_min = float(self._p('range_min_m'))
+        self._range_max = float(self._p('range_max_m'))
+        self._expose_gcv10 = bool(self._p('expose_gcv10_controls'))
+        # current operator-control values (strings, radar-control convention)
+        start_range = float(self._p('range_m'))
+        self._controls = {
+            'status': 'standby',
+            'range': f'{start_range:.1f}',
+            'tvg': 'off',
+            'interference': 'off',
+        }
         self._assembler = PingAssembler()
         self._wf = {'port': deque(maxlen=self._wf_h), 'stbd': deque(maxlen=self._wf_h)}
         self._wf_lock = threading.Lock()
@@ -162,8 +188,11 @@ class GarminSidescanNode(Node):
         }
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
+        self._pub_state = self.create_publisher(RadarControlSet, '~/state', latched)
 
         self.create_service(SetBool, '~/set_transmit', self._on_set_transmit)
+        self.create_subscription(RadarControlValue, '~/change_state',
+                                 self._on_control_value, 10)
 
         if self._sv_topic:
             try:
@@ -267,6 +296,22 @@ class GarminSidescanNode(Node):
 
     def _publish_tx_state(self):
         self._pub_tx.publish(Bool(data=bool(self._transmitting)))
+        # keep the operator-control mirror in sync (incl. watchdog-driven changes)
+        self._controls['status'] = 'transmit' if self._transmitting else 'standby'
+        self._publish_control_set()
+
+    def _request_transmit(self, on):
+        """Guarded transmit request shared by the service and control set."""
+        if on:
+            ok, msg = self._guard_transmit_on()
+            if not ok:
+                self.get_logger().warn(f'transmit ON refused: {msg}')
+                return False, msg
+            self._set_transmit(True, 'request')
+            return True, 'transmitting'
+        self._safety_latched = False    # explicit operator off: no auto-resume
+        self._set_transmit(False, 'request')
+        return True, 'transmit off'
 
     # ----- transmit guard ----------------------------------------------------
     def _sv_age(self):
@@ -296,22 +341,68 @@ class GarminSidescanNode(Node):
         return True, ''
 
     def _on_set_transmit(self, req, resp):
-        if req.data:
-            ok, msg = self._guard_transmit_on()
-            if not ok:
-                resp.success = False
-                resp.message = msg
-                self.get_logger().warn(f'transmit ON refused: {msg}')
-                return resp
-            self._set_transmit(True, 'set_transmit service')
-            resp.success = True
-            resp.message = 'transmitting'
-        else:
-            self._safety_latched = False    # explicit operator off: no auto-resume
-            self._set_transmit(False, 'set_transmit service')
-            resp.success = True
-            resp.message = 'transmit off'
+        resp.success, resp.message = self._request_transmit(bool(req.data))
         return resp
+
+    # ----- operator control set (radar-style) -------------------------------
+    def _publish_control_set(self):
+        rcs = RadarControlSet()
+        status = RadarControlItem()
+        status.name = 'status'
+        status.label = 'Status'
+        status.type = RadarControlItem.CONTROL_TYPE_ENUM
+        status.value = self._controls['status']
+        status.enums = ['standby', 'transmit']
+        rcs.items.append(status)
+
+        rng = RadarControlItem()
+        rng.name = 'range'
+        rng.label = 'Range (m)'
+        rng.type = RadarControlItem.CONTROL_TYPE_FLOAT
+        rng.value = self._controls['range']
+        rng.min_value = self._range_min
+        rng.max_value = self._range_max
+        rcs.items.append(rng)
+
+        if self._expose_gcv10:
+            for name, label in (('tvg', 'TVG'), ('interference', 'Interference')):
+                item = RadarControlItem()
+                item.name = name
+                item.label = label
+                item.type = RadarControlItem.CONTROL_TYPE_ENUM
+                item.value = self._controls[name]
+                item.enums = list(LOW_MED_HIGH)
+                rcs.items.append(item)
+        self._pub_state.publish(rcs)
+
+    def _on_control_value(self, msg):
+        key, value = msg.key, msg.value
+        if key == 'status':
+            self._request_transmit(value == 'transmit')
+            return                       # _request_transmit republishes the set
+        elif key == 'range':
+            try:
+                meters = float(value)
+            except ValueError:
+                self.get_logger().warn(f'bad range control value: {value!r}')
+                return
+            meters = max(self._range_min, min(self._range_max, meters))
+            self._send(build_range_cmd(meters))
+            self._controls['range'] = f'{meters:.1f}'
+            self.get_logger().info(f'range set to {meters} m (control)')
+        elif key in ('tvg', 'interference') and self._expose_gcv10:
+            if value not in LOW_MED_HIGH:
+                self.get_logger().warn(f'bad {key} control value: {value!r}')
+                return
+            level = LOW_MED_HIGH.index(value)
+            builder = build_tvg_cmd if key == 'tvg' else build_interference_cmd
+            self._send(builder(level))
+            self._controls[key] = value
+            self.get_logger().info(f'{key} set to {value} (control)')
+        else:
+            self.get_logger().warn(f'unknown control key: {key!r}')
+            return
+        self._publish_control_set()
 
     # ----- sound-speed watchdog ---------------------------------------------
     def _extract_field(self, msg):
@@ -477,6 +568,8 @@ class GarminSidescanNode(Node):
         for p in params:
             if p.name == 'range_m' and p.value and p.value > 0:
                 self._send(build_range_cmd(float(p.value)))
+                self._controls['range'] = f'{float(p.value):.1f}'
+                self._publish_control_set()
                 self.get_logger().info(f'range set to {p.value} m')
             elif p.name == 'sound_speed_safety_enabled':
                 self._safety_enabled = bool(p.value)

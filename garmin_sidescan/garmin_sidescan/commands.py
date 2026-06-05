@@ -30,6 +30,26 @@ TRANSMIT_OFF = bytes.fromhex(TRANSMIT_OFF_HEX)
 
 RANGE_UNIT_M = 0.0005           # range field is in 0.5 mm units
 
+# Enum order for the TVG / interference level controls (index = wire value).
+LOW_MED_HIGH = ('off', 'low', 'medium', 'high')
+
+
+def _frame(payload):
+    """Wrap a command payload in the d2 07 ef be + LE-length envelope."""
+    return b'\xd2\x07\xef\xbe' + struct.pack('<I', len(payload)) + payload
+
+
+def build_tvg_cmd(level):
+    """Build a TVG command frame for level 0..3 (off/low/medium/high)."""
+    level = max(0, min(3, int(level)))
+    return _frame(bytes([0x01, 0x07, 0x07, 0x01, 0x02, 0x01, 0x00, 0x89, 0x01, level]))
+
+
+def build_interference_cmd(level):
+    """Build an interference-rejection frame for level 0..3."""
+    level = max(0, min(3, int(level)))
+    return _frame(bytes([0x01, 0x07, 0x07, 0x01, 0x02, 0x01, 0x00, 0xa1, 0x01, level]))
+
 
 def encode_leb128(value):
     """Encode a non-negative int as an unsigned base-128 varint (LE groups)."""
