@@ -59,3 +59,14 @@ issue: 1
 
 ### Decisions
 - Full checksum validation deliberately out of scope: ETX + exact-length framing rejects misaligned/corrupt frames; a single bad ping on a local 500 kHz UDP link is harmless (one dropped sounding, handled by CUBE outlier rejection). Pre-empts a likely next-round checksum suggestion.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-04 21:57 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #14 at `d776385`
+**Sources**: 1 (user follow-up question on the round-2 checksum non-goal)
+
+### Decisions
+- REVERSES the round-2 "checksum out of scope" call. On closer look the cost argument was wrong (a 16-bit sum is free), and validation is verified safe — all 3006 live N/78 datagrams have spec-correct checksums (0 false rejects). UDP's transport checksum makes it largely redundant, but it closes the residual gap (UDP checksums disabled, or source-side corruption). Per the quality standard, validate. Added `_verify_trailer` (ETX + checksum) used by both parsers + a checksum-mismatch test. Done in d776385.
