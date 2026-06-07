@@ -20,6 +20,7 @@ import socket
 import threading
 import time
 
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_acoustic_msgs.msg import RawSonarImage, SonarImageData
 from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
 from rcl_interfaces.msg import SetParametersResult
@@ -40,7 +41,29 @@ from .commands import (
 )
 from .decode import (
     CHANNEL_OFFSET, dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET,
-    is_water_column, MIN_DATA_LEN, PingAssembler)
+    is_water_column, MIN_DATA_LEN, PingAssembler, status_transmitting)
+
+# Auxiliary GCV multicast streams the driver can listen to. The imagery group
+# is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
+STATUS_GROUP, STATUS_PORT = '239.254.2.2', 50050    # 8e03 status (tx flag + depth)
+CONFIG_GROUP, CONFIG_PORT = '239.254.2.11', 51000   # chartplotter CDP config (debug-capture only)
+
+
+def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
+    """
+    Return (level, message) for the imagery-stream diagnostic.
+
+    Staleness only matters while transmitting -- in standby no pings are
+    expected, so that is OK/idle, not an error.
+    """
+    if not transmitting:
+        return DiagnosticStatus.OK, 'standby (no imagery expected)'
+    if ping_age is None:
+        return DiagnosticStatus.ERROR, 'transmitting but no imagery received'
+    if ping_age > stale_after:
+        return DiagnosticStatus.ERROR, f'transmitting but imagery stale ({ping_age:.1f}s)'
+    return DiagnosticStatus.OK, f'receiving (last ping {ping_age:.1f}s ago)'
+
 
 SIDES = ('port', 'stbd', 'down')
 # Per-channel TF frame suffix (matches the topic names). Each transducer is a
@@ -234,6 +257,10 @@ class GarminSidescanNode(Node):
         self._sonar_dtype = SonarImageData.DTYPE_UINT8
         self._bytes_per_sample = 1
         self._running = True
+        # diagnostics state
+        self._last_ping_t = None          # monotonic time of last emitted ping
+        self._device_transmitting = None  # tx flag from the :50050 status frame
+        self._last_status_t = None        # monotonic time of last status frame
 
         # publishers
         img_qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -244,8 +271,14 @@ class GarminSidescanNode(Node):
             'stbd': self.create_publisher(RawSonarImage, '~/sonar_image_starboard', img_qos),
             'down': self.create_publisher(RawSonarImage, '~/sonar_image_down', img_qos),
         }
-        # Raw-payload debug capture (only published when debug_raw is true).
-        self._pub_raw = self.create_publisher(UInt8MultiArray, '~/debug/raw', img_qos)
+        # Raw-payload debug capture (only published when debug_raw is true) --
+        # one topic per GCV multicast stream so a single bag is fully
+        # re-decodable offline (imagery + status/depth + chartplotter config).
+        u8 = UInt8MultiArray
+        self._pub_raw = self.create_publisher(u8, '~/debug/raw', img_qos)
+        self._pub_raw_status = self.create_publisher(u8, '~/debug/raw_status', img_qos)
+        self._pub_raw_config = self.create_publisher(u8, '~/debug/raw_config', img_qos)
+        self._pub_diag = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
         self._pub_state = self.create_publisher(RadarControlSet, '~/state', latched)
@@ -276,8 +309,17 @@ class GarminSidescanNode(Node):
 
         self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
         self._rx_thread.start()
+        # Auxiliary listeners: status feeds diagnostics (device tx flag) and is
+        # captured under debug_raw; config is debug-capture only.
+        threading.Thread(
+            target=self._aux_loop, name='gcv_status', daemon=True,
+            args=(STATUS_GROUP, STATUS_PORT, self._pub_raw_status, self._on_status)).start()
+        threading.Thread(
+            target=self._aux_loop, name='gcv_config', daemon=True,
+            args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)).start()
         self.create_timer(0.5, self._watchdog)
         self.create_timer(2.0, self._publish_status)
+        self.create_timer(1.0, self._publish_diagnostics)
 
         self._publish_tx_state()
         threading.Thread(
@@ -538,23 +580,60 @@ class GarminSidescanNode(Node):
         self._set_transmit(False, reason)
 
     # ----- imagery receive + decode -----------------------------------------
-    def _open_mcast(self):
+    def _open_mcast(self, group, port):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('', self._mport))
+        sock.bind(('', port))
         iface = socket.inet_aton(self._iface_ip) if self._iface_ip \
             else socket.inet_aton('0.0.0.0')
-        mreq = socket.inet_aton(self._group) + iface
+        mreq = socket.inet_aton(group) + iface
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         sock.settimeout(1.0)
         return sock
+
+    def _aux_loop(self, group, port, raw_pub, on_payload):
+        """
+        Listen to an auxiliary GCV multicast stream (status / config).
+
+        Parses each payload via ``on_payload`` (status tx flag), and republishes
+        the raw bytes on ``raw_pub`` when ``debug_raw`` is set so the stream is
+        captured for offline decode. Mirrors ``_rx_loop``'s reconnect handling.
+        """
+        sock = None
+        while self._running:
+            if sock is None:
+                try:
+                    sock = self._open_mcast(group, port)
+                except OSError:
+                    time.sleep(2.0)
+                    continue
+            try:
+                payload, _addr = sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except OSError:
+                sock.close()
+                sock = None
+                continue
+            if on_payload is not None:
+                on_payload(payload)
+            if self._debug_raw:
+                raw_pub.publish(UInt8MultiArray(data=payload))
+        if sock is not None:
+            sock.close()
+
+    def _on_status(self, payload):
+        tx = status_transmitting(payload)
+        if tx is not None:
+            self._device_transmitting = tx
+            self._last_status_t = time.monotonic()
 
     def _rx_loop(self):
         sock = None
         while self._running:
             if sock is None:
                 try:
-                    sock = self._open_mcast()
+                    sock = self._open_mcast(self._group, self._mport)
                     self.get_logger().info(
                         f'joined {self._group}:{self._mport}'
                         + (f' on {self._iface_ip}' if self._iface_ip else ''))
@@ -668,6 +747,7 @@ class GarminSidescanNode(Node):
         if side is None or not samples:
             return
         self._ping_count[side] += 1
+        self._last_ping_t = time.monotonic()
         self._pub_sonar[side].publish(self._make_sonar_msg(side, samples, stamp))
 
     def _make_sonar_msg(self, side, samples, stamp):
@@ -704,6 +784,59 @@ class GarminSidescanNode(Node):
         msg.image.beam_count = 1
         msg.image.data = bytes(samples)
         return msg
+
+    def _publish_diagnostics(self):
+        now = time.monotonic()
+        ping_age = None if self._last_ping_t is None else now - self._last_ping_t
+        sv_age = self._sv_age()
+
+        # Imagery stream
+        lvl, msg = imagery_diag_level(self._transmitting, ping_age)
+        imagery = DiagnosticStatus(
+            name='garmin_sidescan: imagery', hardware_id=self._gcv_ip,
+            level=lvl, message=msg, values=[
+                KeyValue(key='device', value=self._detected_gen or 'detecting'),
+                KeyValue(key='dtype_bits', value=str(8 * self._bytes_per_sample)),
+                KeyValue(key='last_ping_age_s',
+                         value='n/a' if ping_age is None else f'{ping_age:.1f}'),
+                KeyValue(key='pings_port_stbd_down',
+                         value=f"{self._ping_count['port']}/{self._ping_count['stbd']}/"
+                               f"{self._ping_count['down']}"),
+            ])
+
+        # Transmit + sound-speed safety. WARN if the device-reported transmit
+        # state (from the :50050 status frame) disagrees with what we commanded,
+        # or if we are (maybe) transmitting on a stale/absent sound speed.
+        dev_tx = self._device_transmitting
+        mismatch = dev_tx is not None and dev_tx != self._transmitting
+        sv_stale = self._transmitting and self._safety_enabled and (
+            sv_age is None or sv_age > self._sv_timeout)
+        tx_lvl = DiagnosticStatus.OK
+        tx_msg = 'transmitting' if self._transmitting else 'standby'
+        if mismatch:
+            tx_lvl = DiagnosticStatus.WARN
+            tx_msg = f'commanded {self._transmitting} but device reports {dev_tx}'
+        elif sv_stale:
+            tx_lvl = DiagnosticStatus.WARN
+            tx_msg = 'transmitting without a fresh sound speed'
+        transmit = DiagnosticStatus(
+            name='garmin_sidescan: transmit/safety', hardware_id=self._gcv_ip,
+            level=tx_lvl, message=tx_msg, values=[
+                KeyValue(key='commanded_transmitting', value=str(self._transmitting)),
+                KeyValue(key='device_transmitting',
+                         value='unknown' if dev_tx is None else str(dev_tx)),
+                KeyValue(key='safety_enabled', value=str(self._safety_enabled)),
+                KeyValue(key='require_sound_speed', value=str(self._require_sv)),
+                KeyValue(key='safety_latched', value=str(self._safety_latched)),
+                KeyValue(key='sound_speed_mps', value=f'{self._last_sv_value:.1f}'),
+                KeyValue(key='sound_speed_age_s',
+                         value='n/a' if sv_age is None else f'{sv_age:.1f}'),
+            ])
+
+        arr = DiagnosticArray()
+        arr.header.stamp = self.get_clock().now().to_msg()
+        arr.status = [imagery, transmit]
+        self._pub_diag.publish(arr)
 
     def _publish_status(self):
         age = self._sv_age()

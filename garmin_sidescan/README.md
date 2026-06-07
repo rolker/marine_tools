@@ -8,6 +8,47 @@ on a sound-speed watchdog so a dry transducer cannot overheat.
 The chartplotter is required only to power up / wake the Marine Network; it is
 otherwise inaccessible, so **this node performs all sonar control.**
 
+## Network & data streams
+
+Garmin Marine Network: a flat `172.16.0.0/16` LAN; devices self-assign IPs (last
+two IP octets mirror the MAC). Every frame is `<2-byte magic> 00 00` +
+LE-length(4) + payload. The GCV **will not run without a Garmin chartplotter**
+present — the master asserts a hardware enable (not Wake-on-LAN) and a ~1 Hz
+keepalive that sustains pinging.
+
+```
+                         Garmin Marine Network (172.16/16)
+  ┌────────────────────┐                                   ┌─────────────────────┐
+  │  GCV sonar          │   multicast (we listen)           │ GPSMAP chartplotter │
+  │  172.16.3.0 (GCV20) │ ───────────────────────────────► │ 172.16.6.64 (master)│
+  │  .3.196 (GCV10)     │  239.254.2.1:50220  eb07 imagery  │ • HW wake/enable    │
+  │                     │                     d807 markers  │ • 1 Hz keepalive    │
+  │                     │  239.254.2.2:50050  8e03 status   │   (d107 → :50220)   │
+  │                     │     (tx flag + depth)             │ • CDP config (owns  │
+  │                     │ ◄──── 239.254.2.11:51000 ───────  │   range/freq/sched, │
+  │                     │       e5/e7 08 CDP config         │   239.254.2.11:51000)│
+  │   TCP :50227  ◄─────┼───────────────────────────────────────────┐           │
+  └────────────────────┘   d2 07 ef be  command frames              │           │
+                           (transmit / range / TVG …)               │           │
+                                                          ┌─────────┴──────────┐ │
+                                                          │  THIS driver (host)│ │
+                                                          │ • join :50220 imagery (decode → RawSonarImage)
+                                                          │ • TCP :50227 control (transmit/range)
+                                                          │ • debug_raw: also capture :50050 + :51000
+                                                          │ • relies on chartplotter for wake+keepalive
+                                                          └────────────────────┘
+```
+
+**Streams from the sonar (multicast, listen-only):** imagery `239.254.2.1:50220`
+(`eb07` data + `d807` markers, ~540 pkt/s, 3 channels), status
+`239.254.2.2:50050` (`8e03`: transmit flag + depth). **Config** the chartplotter
+broadcasts on `239.254.2.11:51000` (`e5/e7 08` named key/value "CDP" — owns
+range/freq/schedule). **Control to the sonar:** unicast TCP `172.16.3.0:50227`
+(`d2 07 ef be` frames — transmit/range/TVG; works on both generations) — the
+path this driver uses, sidestepping CDP. With `debug_raw` on, the driver also
+captures the `:50050` and `:51000` streams so a wet run is fully re-decodable
+offline (e.g. to pin the depth-field encoding).
+
 ## Topics
 
 Published (relative to the node namespace):

@@ -7,12 +7,23 @@ could keep pinging while everything reports OFF.
 """
 import types
 
+from diagnostic_msgs.msg import DiagnosticStatus
+
 from garmin_sidescan.node import (
     GarminSidescanNode,
+    imagery_diag_level,
     range_in_bounds,
     transmit_state_after,
     watchdog_action,
 )
+
+
+def test_imagery_diag_level():
+    ok, err = DiagnosticStatus.OK, DiagnosticStatus.ERROR
+    assert imagery_diag_level(False, None)[0] == ok      # standby: no pings expected
+    assert imagery_diag_level(True, None)[0] == err      # transmitting, never received
+    assert imagery_diag_level(True, 10.0)[0] == err      # transmitting, stale
+    assert imagery_diag_level(True, 0.5)[0] == ok        # transmitting, fresh
 
 
 def test_successful_on_is_transmitting():

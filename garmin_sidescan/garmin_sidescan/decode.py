@@ -31,6 +31,22 @@ with their receive time (see node.py).
 
 EB07 = b'\xeb\x07'
 D807 = b'\xd8\x07'
+STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
+STATUS_TX_OFFSET = 9             # byte[9]: 0x00 transmitting, 0x01 off
+
+
+def status_transmitting(payload):
+    """
+    Return transmit state from a GCV ``8e03`` status frame, or None if not one.
+
+    ``byte[9]`` is ``0x00`` while the sonar is transmitting and ``0x01`` when
+    off. (The same frame carries a depth field whose encoding is not yet
+    verified -- see the driver's debug capture.)
+    """
+    if payload[:2] != STATUS_MAGIC or len(payload) <= STATUS_TX_OFFSET:
+        return None
+    return payload[STATUS_TX_OFFSET] == 0x00
+
 
 # Render-layer header signatures (little-endian sample pairs).
 FH = bytes([218, 4, 216, 4])    # da 04 d8 04  full-packet first-layer header

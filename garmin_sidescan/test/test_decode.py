@@ -11,7 +11,7 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, is_water_column,
-    PingAssembler, SH)
+    PingAssembler, SH, status_transmitting)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 
@@ -128,6 +128,15 @@ def test_is_water_column_by_layer_byte():
     assert is_water_column(_img_with_layer(0x0d)) is True    # down-look
     assert is_water_column(_img_with_layer(0x0e)) is False   # side-scan (GCV-20)
     assert is_water_column(_img_with_layer(0x0f)) is False   # side-scan (GCV-10)
+
+
+def test_status_transmitting():
+    def frame(b9):       # 8e03 status frame with byte[9] = transmit flag
+        return bytes([0x8e, 0x03, 0, 0]) + bytes(5) + bytes([b9]) + bytes(24)
+    assert status_transmitting(frame(0x00)) is True       # 0x00 = transmitting
+    assert status_transmitting(frame(0x01)) is False      # 0x01 = off
+    assert status_transmitting(bytes([0xeb, 0x07]) + bytes(40)) is None  # not status
+    assert status_transmitting(bytes([0x8e, 0x03])) is None              # too short
     assert is_water_column(b'\xeb\x07') is False             # too short, safe
 
 
