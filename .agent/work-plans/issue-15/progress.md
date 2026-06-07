@@ -204,3 +204,43 @@ NEXT STEPS (not a quick patch — this is a decode RE problem):
 Did NOT patch the driver: two hypotheses (16-bit; layer0-even) already failed
 empirical/visual checks — shipping a guessed decode would just produce a
 different wrong image.
+
+### C1 RE session (2026-06-07) — decode reverse-engineering, partial
+Assets confirmed available for offline RE (no boat needed):
+- `~/garmin_sidescan/captures/` 8 pcapng from 2026-06-05: gcv20_{passive,rangesweep,
+  settings,nogpsmap,commands,toggles,bringup}, gcv10. rangesweep/settings are the
+  controlled-variable captures. Bags `~/data/logs/bizzy_sidescan/*` are decoded
+  (broken) output, less useful than the pcaps.
+- Colleague tooling: `gcv_decode.py` (v1), `gcv_decode2.py` (v2), `gcv_ros_node.py`,
+  `gcv20_{multi,state}_diff.py`.
+
+Findings:
+- `gcv_ros_node.py` imports v2 `dark_layer` — the colleague's ROS node uses the SAME
+  washed-out decode. No better reference exists; the marine_tools driver is a faithful
+  port of a decode that was never actually correct.
+- GCV-20 eb07 packet = 20B header, then FH(`da04d804`)@~27, then layer0 (~613B,
+  variable), then SH(`ae02ac02`), then layer1 (~304B, fixed). 6 full + 1 short per
+  channel run.
+  - layer1 (what the driver/v2 take) = washed-out (mean ~211, 97% >127, flat) — a
+    low-res/AGC DISPLAY layer, NOT the echo.
+  - layer0 = larger, has full 0-255 dynamic range, byte-paired structure
+    (even-idx values 0-255, odd-idx bounded <=179), variable per-packet length.
+- Encodings RULED OUT for layer0 (each tested, failed): (a) 16-bit LE samples;
+  (b) 2-byte even/odd interleave — renders to noise (per-packet phase drift, layer0
+  length parity flips 613/614); (c) (value,count) RLE — expands to ~114k/line and
+  non-constant, wrong.
+- rangesweep: full-run layer sizes are CONSTANT across range (layer0=3683, layer1=1824,
+  6 pkts) — range is metadata, not bin count, so it doesn't isolate the echo by size.
+
+Status: faulty component = driver decode (DEFINITIVE). Correct layer0 sample encoding
+= NOT cracked after multiple principled attempts. This is a real proprietary-format RE
+task, not a triage fix.
+
+Recommended path (stop guessing encodings):
+1. Get pixel-level GROUND TRUTH — the Garmin chartplotter's own sidescan rendering for a
+   scene captured in a pcap — and reverse the encoding by matching decoded output to it.
+2. Or involve the original capturer / any Garmin GCV format notes.
+3. settings-diff (compare imagery bytes when display gain/palette changed) to confirm
+   layer1 = display layer — supports the diagnosis but won't reveal layer0's codec.
+Secondary, decode-independent (worth doing now): set a real `sample_rate_hz` default and
+restore the dropped clearvu channel.
