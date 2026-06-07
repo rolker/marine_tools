@@ -126,3 +126,25 @@ proxy; Copilot R4 re-reviewed it.
 - No new unit tests added: `_on_param_set` needs an rclpy Node (the suite is
   deliberately rclpy-free); its validation delegates to `range_in_bounds`
   (already tested in `test_safety.py`) and `math.isfinite`.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-07 11:15 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #17 at `bd6e5cb`
+**Sources**: Copilot R5 @ `bd6e5cb` (live) + 5 stale Copilot rounds (R1-R4) + 4 prior Integrated Reviews + CI
+**Cross-source confirmations**: 0 at head (no Local Review at `bd6e5cb`)
+**CI**: copilot-pull-request-reviewer success; no build/test gate on this PR yet (marine_tools#18/PR#19 unmerged)
+
+Context: comments #1-17 (R1-R4, `39e9bec`..`d1fb24e`) all resolved — verified in
+code (rcl_interfaces declared, struct import gone) and prior Integrated Reviews;
+R5 did not re-raise them. Only R5's two comments are live.
+
+### Findings
+- [ ] (HUMAN, rolker conversation) On-boat test data renders wrong in the rqt plugin; find the faulty component across the garmin->proxy->driver->rqt path (test used a separate-machine proxy). Debugging task, not a one-line fix — bisect: raw GCV frames @ proxy vs post-decode vs RawSonarImage fields vs rqt rendering (decode.py orientation/byteorder/scaling; proxy relay; rqt_sonar_waterfall pairing/scaling, PR #41)
+- [ ] (safety, Copilot R5) `transmit_state_after(True, send_ok=False)` forces `_transmitting=False`: failed safety OFF (stays True) -> SV recovers via ROS topic while control-TCP down -> auto-resume ON send also fails -> watchdog disarms while a dry transducer may still ping — `node.py:322` (fix: on failed ON keep prior `_transmitting`, so failed-ON-after-failed-OFF stays True; add unit test for that sequence)
+- [ ] (should-fix, Copilot R5) `_on_param_set` applies side effects (range `_send`+mirror+publish) during iteration then returns `successful=False` later in the same batch on a startup-static param -> bundled `set_parameters([range_m,sv_min])` commands GCV + updates UI but rclpy rejects the batch -> param store desync — `node.py:626` (fix: validate-all-then-apply)
+
+### False positives
+- none this round (R3 frame_id-as-list FP not re-raised at head)
