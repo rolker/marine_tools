@@ -42,7 +42,12 @@ from .decode import (
     CHANNEL_OFFSET, dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET,
     is_water_column, MIN_DATA_LEN, PingAssembler)
 
-SIDES = ('port', 'stbd', 'clearvu')
+SIDES = ('port', 'stbd', 'down')
+# Per-channel TF frame suffix (matches the topic names). Each transducer is a
+# separate physical beam with its own pose, so it gets its own frame; the
+# URDF/TF tree orients it (side + downward tilt). Mounting -- including a
+# non-traditional/backwards install -- lives entirely in TF, never here.
+FRAME_SUFFIX = {'port': 'port', 'stbd': 'starboard', 'down': 'down'}
 
 
 def transmit_state_after(commanded_on, send_ok, prior):
@@ -110,21 +115,17 @@ class GarminSidescanNode(Node):
         self.declare_parameter('filter_src', True)
         self.declare_parameter('frame_id', 'gcv_sonar')
 
-        # channel map (GCV-20: 0=port 1=stbd 2=clearvu; GCV-10 data: port=[3] stbd=[1])
+        # channel map (GCV-20: 0=port 1=stbd 2=down; GCV-10 data: port=[3] stbd=[1])
         self.declare_parameter('port_channels', [0])
         self.declare_parameter('stbd_channels', [1])
-        self.declare_parameter('clearvu_channels', [2])
+        self.declare_parameter('down_channels', [2])
 
         # frequency is NOT carried in the imagery stream; set per transducer or
         # leave 0.0 = unavailable (RawSonarImage/PingInfo convention).
         self.declare_parameter('freq_port_hz', 0.0)
         self.declare_parameter('freq_stbd_hz', 0.0)
-        self.declare_parameter('freq_clearvu_hz', 0.0)
+        self.declare_parameter('freq_down_hz', 0.0)
         self.declare_parameter('sample_rate_hz', 0.0)
-        # Beam look-angle published in rx_angles/tx_angles so consumers can tell
-        # stream geometry from the message, not just the topic: +angle = port,
-        # -angle = starboard, 0 = ClearVu down-look (water column).
-        self.declare_parameter('beam_angle_deg', 90.0)
 
         # device generation. 'auto' detects by packet geometry (GCV-10 emits
         # >1000-byte imagery packets; GCV-20 never exceeds 953), which picks the
@@ -174,16 +175,15 @@ class GarminSidescanNode(Node):
             self._chan_side[ch] = 'port'
         for ch in self._p('stbd_channels'):
             self._chan_side[ch] = 'stbd'
-        for ch in self._p('clearvu_channels'):
-            self._chan_side[ch] = 'clearvu'
+        for ch in self._p('down_channels'):
+            self._chan_side[ch] = 'down'
         self._freq = {
             'port': float(self._p('freq_port_hz')),
             'stbd': float(self._p('freq_stbd_hz')),
-            'clearvu': float(self._p('freq_clearvu_hz')),
+            'down': float(self._p('freq_down_hz')),
         }
         self._sample_rate = float(self._p('sample_rate_hz'))
-        self._beam_angle = math.radians(float(self._p('beam_angle_deg')))
-        self._chan_beamtype = {}      # ch -> 'sidescan'|'clearvu' from pl[8]
+        self._chan_beamtype = {}      # ch -> 'sidescan'|'down' from pl[8]
         self._device = str(self._p('device')).lower()
         if self._device not in ('auto', 'gcv20', 'gcv10'):
             self.get_logger().warn(
@@ -242,7 +242,7 @@ class GarminSidescanNode(Node):
         self._pub_sonar = {
             'port': self.create_publisher(RawSonarImage, '~/sonar_image_port', img_qos),
             'stbd': self.create_publisher(RawSonarImage, '~/sonar_image_starboard', img_qos),
-            'clearvu': self.create_publisher(RawSonarImage, '~/sonar_image_clearvu', img_qos),
+            'down': self.create_publisher(RawSonarImage, '~/sonar_image_down', img_qos),
         }
         # Raw-payload debug capture (only published when debug_raw is true).
         self._pub_raw = self.create_publisher(UInt8MultiArray, '~/debug/raw', img_qos)
@@ -625,9 +625,9 @@ class GarminSidescanNode(Node):
 
         Keys on the sub-header value-width tag at offset ``GEN_TAG_OFFSET``:
         ``0x11`` (GCV-10) vs ``0x12`` (GCV-20). Verified 100% consistent across
-        thousands of packets on every channel (SideVu + ClearVu) in both
+        thousands of packets on every channel (side-scan + down-look) in both
         captures -- a positive, size-independent signal present on *every*
-        packet, unlike packet-size heuristics which a ClearVu-only or partial
+        packet, unlike packet-size heuristics which a down-look-only or partial
         stream can fool. ``MIN_DATA_LEN`` guarantees the tag byte is in bounds.
         """
         if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
@@ -640,10 +640,10 @@ class GarminSidescanNode(Node):
         """
         Record each channel's beam type and warn on a channel-map mismatch.
 
-        The intrinsic beam type (ClearVu vs SideVu, from the render-layer byte)
+        The intrinsic beam type (down-look vs side-scan, from the render-layer byte)
         of the down-look "water column" beam is identifiable from the stream
         itself; this catches a mis-configured channel map (e.g. a channel
-        routed to a SideVu topic that is actually the ClearVu beam) without
+        routed to a side-scan topic that is actually the down-look beam) without
         relying on the unit-specific channel numbers.
         """
         if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
@@ -651,25 +651,17 @@ class GarminSidescanNode(Node):
         ch = payload[CHANNEL_OFFSET]
         if ch in self._chan_beamtype:
             return
-        observed = 'clearvu' if is_water_column(payload) else 'sidescan'
+        observed = 'down' if is_water_column(payload) else 'sidescan'
         self._chan_beamtype[ch] = observed
         side = self._chan_side.get(ch)
         if side is None:
             return
-        configured = 'clearvu' if side == 'clearvu' else 'sidescan'
+        configured = 'down' if side == 'down' else 'sidescan'
         if observed != configured:
             self.get_logger().warn(
                 f'channel {ch} is mapped to {side} ({configured}) but the '
                 f'stream reports {observed} (render-layer byte); check the '
-                f'port/stbd/clearvu channel map')
-
-    def _beam_angle_for(self, side):
-        # +angle = port, -angle = starboard, 0 = ClearVu down-look.
-        if side == 'port':
-            return self._beam_angle
-        if side == 'stbd':
-            return -self._beam_angle
-        return 0.0
+                f'port/stbd/down channel map')
 
     def _emit_ping(self, ch, samples, stamp):
         side = self._chan_side.get(ch)
@@ -681,7 +673,8 @@ class GarminSidescanNode(Node):
     def _make_sonar_msg(self, side, samples, stamp):
         msg = RawSonarImage()
         msg.header.stamp = stamp.to_msg()
-        msg.header.frame_id = self._frame_id
+        # Per-channel frame so TF orients each transducer (see FRAME_SUFFIX).
+        msg.header.frame_id = f'{self._frame_id}_{FRAME_SUFFIX[side]}'
         msg.ping_info.frequency = self._freq[side]
         sv = self._current_sound_speed()
         msg.ping_info.sound_speed = sv
@@ -698,12 +691,14 @@ class GarminSidescanNode(Node):
             msg.sample_rate = self._sample_rate
         msg.samples_per_beam = bins
         msg.sample0 = 0
-        # Beam look-angle marks the stream geometry in the message itself:
-        # +beam_angle = port, -beam_angle = starboard, 0 = ClearVu down-look.
-        angle = self._beam_angle_for(side)
+        # rx_angles/tx_angles are the *steering* angle applied to the beam
+        # (per the RawSonarImage spec) -- 0 for a fixed, unsteered single-beam
+        # sidescan. The transducer's physical look direction (port out / stbd
+        # out / down-look) is mounting, expressed by the per-channel frame_id +
+        # the TF tree, not baked into these angles.
         msg.tx_delays = [0.0]
-        msg.tx_angles = [angle]
-        msg.rx_angles = [angle]
+        msg.tx_angles = [0.0]
+        msg.rx_angles = [0.0]
         msg.image.is_bigendian = False        # GCV samples are little-endian
         msg.image.dtype = self._sonar_dtype
         msg.image.beam_count = 1
@@ -719,8 +714,8 @@ class GarminSidescanNode(Node):
             f'require_sv={self._require_sv} '
             f'latched={self._safety_latched} '
             f'sv={self._last_sv_value:.1f} sv_age={age_s} '
-            f'pings(port/stbd/cv)={self._ping_count["port"]}/'
-            f'{self._ping_count["stbd"]}/{self._ping_count["clearvu"]}')))
+            f'pings(port/stbd/down)={self._ping_count["port"]}/'
+            f'{self._ping_count["stbd"]}/{self._ping_count["down"]}')))
 
     def _on_param_set(self, params):
         # Validate the whole batch before applying ANY side effect. rclpy

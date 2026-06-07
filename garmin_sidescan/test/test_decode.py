@@ -46,7 +46,7 @@ def test_real_capture_decodes_to_two_channel_scan_lines():
     pings.extend(assembler.flush())
 
     channels = {ch for ch, _samples, _stamp in pings}
-    # GCV-10 survey data streams two SideVu channels (port=3, stbd=1)
+    # GCV-10 survey data streams two side-scan channels (port=3, stbd=1)
     assert channels == {1, 3}
 
     # the two complete runs (7 packets each) form ~2048-bin scan lines
@@ -99,7 +99,7 @@ def test_echo_layer_trims_to_whole_samples():
 
 
 def test_echo_layer_runs_to_end_without_sh():
-    # ClearVu-style: no following SH -> first layer runs to end of packet
+    # down-look-style: no following SH -> first layer runs to end of packet
     pkt = _gcv20_packet(2, bytes([10, 1, 20, 2, 30, 3]))
     assert echo_layer(pkt) == bytes([10, 1, 20, 2, 30, 3])
 
@@ -120,14 +120,14 @@ def test_generation_tag_byte_discriminates():
 
 
 def _img_with_layer(layer):
-    # render-layer byte at offset 8 (0x0d=ClearVu, 0x0e/0x0f=SideVu)
+    # render-layer byte at offset 8 (0x0d=down-look, 0x0e/0x0f=side-scan)
     return bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([layer, 1, 3, 9, 0]) + bytes(20)
 
 
 def test_is_water_column_by_layer_byte():
-    assert is_water_column(_img_with_layer(0x0d)) is True    # ClearVu down-look
-    assert is_water_column(_img_with_layer(0x0e)) is False   # SideVu (GCV-20)
-    assert is_water_column(_img_with_layer(0x0f)) is False   # SideVu (GCV-10)
+    assert is_water_column(_img_with_layer(0x0d)) is True    # down-look
+    assert is_water_column(_img_with_layer(0x0e)) is False   # side-scan (GCV-20)
+    assert is_water_column(_img_with_layer(0x0f)) is False   # side-scan (GCV-10)
     assert is_water_column(b'\xeb\x07') is False             # too short, safe
 
 

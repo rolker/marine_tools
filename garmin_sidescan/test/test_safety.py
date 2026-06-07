@@ -5,7 +5,6 @@ The critical invariant: a transmit-OFF command whose TCP send FAILED must not
 be recorded as OFF, or the watchdog would stop retrying and a dry transducer
 could keep pinging while everything reports OFF.
 """
-import math
 import types
 
 from garmin_sidescan.node import (
@@ -214,15 +213,7 @@ def test_detect_generation_undecided_cases():
     assert node._detected_gen is None                       # still undecided
 
 
-# ----- beam look-angle + intrinsic beam-type classification --------------
-
-def test_beam_angle_by_side():
-    node = types.SimpleNamespace(_beam_angle=math.pi / 2)
-    f = GarminSidescanNode._beam_angle_for
-    assert f(node, 'port') == math.pi / 2       # +angle = port
-    assert f(node, 'stbd') == -math.pi / 2      # -angle = starboard
-    assert f(node, 'clearvu') == 0.0            # 0 = down-look / water column
-
+# ----- intrinsic beam-type classification (down-look vs side-scan) -------
 
 def _img_layer(layer, ch=0):
     return bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([layer, 1, 3, 9, ch]) + bytes(24)
@@ -251,18 +242,18 @@ def _classify_node(chan_side):
     return node, log
 
 
-def test_classify_beam_warns_on_clearvu_mismatch():
-    # channel 0 mapped to 'port' but the stream's layer byte is ClearVu (0x0d)
+def test_classify_beam_warns_on_down_mismatch():
+    # channel 0 mapped to 'port' but the stream's layer byte is down-look (0x0d)
     node, log = _classify_node({0: 'port'})
     GarminSidescanNode._classify_beam(node, _img_layer(0x0d, ch=0))
-    assert node._chan_beamtype[0] == 'clearvu'
+    assert node._chan_beamtype[0] == 'down'
     assert len(log.warns) == 1 and 'channel 0' in log.warns[0]
 
 
 def test_classify_beam_silent_when_consistent():
-    # clearvu channel carrying the ClearVu layer; sidescan channel carrying SideVu
-    node, log = _classify_node({2: 'clearvu', 0: 'port'})
+    # down channel carrying the down-look layer; sidescan channel carrying side-scan
+    node, log = _classify_node({2: 'down', 0: 'port'})
     GarminSidescanNode._classify_beam(node, _img_layer(0x0d, ch=2))
     GarminSidescanNode._classify_beam(node, _img_layer(0x0e, ch=0))
-    assert node._chan_beamtype == {2: 'clearvu', 0: 'sidescan'}
+    assert node._chan_beamtype == {2: 'down', 0: 'sidescan'}
     assert log.warns == []

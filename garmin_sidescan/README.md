@@ -14,9 +14,9 @@ Published (relative to the node namespace):
 
 | Topic | Type | Notes |
 |-------|------|-------|
-| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | SideVü port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10). `rx_angles`/`tx_angles` mark the geometry: **+`beam_angle_deg` = port, −= starboard, 0 = ClearVü down-look** |
-| `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | SideVü starboard |
-| `sonar_image_clearvu` | `marine_acoustic_msgs/RawSonarImage` | ClearVü down-look |
+| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | side-scan port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10). `rx_angles`/`tx_angles` = `0` (a fixed beam has no steering); side/orientation is carried by the per-channel `frame_id` + TF |
+| `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | side-scan starboard |
+| `sonar_image_down` | `marine_acoustic_msgs/RawSonarImage` | down-look (water-column) beam |
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
@@ -28,6 +28,12 @@ Subscribed:
   `marine_interfaces/SoundSpeed`).
 - `change_state` (`marine_radar_control_msgs/RadarControlValue`) — operator
   control changes (`key`/`value`), same contract as the radar driver.
+
+Each channel publishes its own `frame_id` (`<frame_id>_port` / `_starboard` /
+`_down`); the URDF/TF tree orients each transducer (side and downward tilt), so
+mounting — including a non-traditional install — lives entirely in TF, never in
+the driver. A proper sidescan rviz view (slant-range correction, water-column
+skip, draping over terrain or a nadir-depth plane) is a separate effort.
 
 Service: `set_transmit` (`std_srvs/SetBool`) — turn transmit on/off.
 
@@ -69,7 +75,7 @@ Decode is validated against a real GCV-10 survey capture (see
 imagery stream because they are not reliably present there:
 
 - **Frequency** is not encoded in the imagery sub-header, so it cannot be
-  derived from the SideVü/ClearVü mode without baking in a transducer
+  derived from the side-scan/down-look mode without baking in a transducer
   assumption. It is a per-channel parameter (`freq_*_hz`), default `0.0` =
   unavailable. Set it explicitly for a known transducer if a populated
   `ping_info.frequency` is needed.
@@ -83,8 +89,8 @@ imagery stream because they are not reliably present there:
 |-----------|---------|-------|
 | `gcv_ip` | `172.16.3.0` | GCV-20; GCV-10 = `172.16.3.196` |
 | `iface_ip` | `''` | local NIC IP for the multicast join (set on multi-homed hosts) |
-| `port_channels` / `stbd_channels` / `clearvu_channels` | `[0]` / `[1]` / `[2]` | GCV-20 map; GCV-10 survey data used port=`[3]`, stbd=`[1]` |
-| `freq_port_hz` / `freq_stbd_hz` / `freq_clearvu_hz` | `0.0` | set per transducer; 0 = unavailable |
+| `port_channels` / `stbd_channels` / `down_channels` | `[0]` / `[1]` / `[2]` | GCV-20 map; GCV-10 survey data used port=`[3]`, stbd=`[1]` |
+| `freq_port_hz` / `freq_stbd_hz` / `freq_down_hz` | `0.0` | set per transducer; 0 = unavailable |
 | `sample_rate_hz` | `0.0` | 0 = unavailable |
 | `transmit_on_startup` | `false` | safe default |
 | `sound_speed_safety_enabled` | `true` | dynamic master switch |
@@ -96,7 +102,6 @@ imagery stream because they are not reliably present there:
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
 | `expose_gcv10_controls` | `true` | include TVG / interference controls |
 | `device` | `auto` | `auto` detects GCV-10 vs GCV-20 by the sub-header tag byte (picks the echo extractor); `gcv20`/`gcv10` force it |
-| `beam_angle_deg` | `90.0` | side-look angle in `rx_angles`/`tx_angles` (+port / −stbd / 0 ClearVü) |
 | `debug_raw` | `false` | publish raw UDP payloads on `debug/raw` for offline re-decode; settable at runtime |
 
 ## Run
