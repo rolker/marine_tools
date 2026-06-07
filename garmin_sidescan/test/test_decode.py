@@ -9,7 +9,7 @@ genuine bytes with no scapy/numpy runtime dependency.
 import os
 import struct
 
-from garmin_sidescan.decode import dark_layer, PingAssembler
+from garmin_sidescan.decode import dark_layer, echo_layer, FH, PingAssembler, SH
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 
@@ -69,3 +69,41 @@ def test_assembler_stamps_run_with_first_packet_time():
     assert ch == 5
     assert stamp == 100.0                  # first packet's time, not the second
     assert samples == bytes([10, 20, 30]) * 2
+
+
+# ----- GCV-20 echo extraction (echo_layer) -------------------------------
+
+def _gcv20_packet(channel, first_layer, tail=b''):
+    # eb07 0000 + LE len + 12-byte sub-header (channel at offset 12) + FH layer
+    # [+ SH + tail]. echo_layer keys off the FH/SH signatures, not fixed offsets.
+    head = (bytes([0xeb, 0x07, 0, 0]) + bytes(4)
+            + bytes([0x0e, 1, 3, 9, channel, 0, 0, 0]))
+    return head + FH + first_layer + (SH + tail if tail else b'')
+
+
+def test_echo_layer_odd_bytes_of_first_layer():
+    # even bytes = flat companion (discarded); odd bytes = echo
+    pkt = _gcv20_packet(0, bytes([10, 1, 20, 2, 30, 3, 40, 4]), tail=bytes(2))
+    assert echo_layer(pkt) == bytes([1, 2, 3, 4])
+
+
+def test_echo_layer_runs_to_end_without_sh():
+    # ClearVu-style: no following SH -> first layer runs to end of packet
+    pkt = _gcv20_packet(2, bytes([10, 1, 20, 2, 30, 3]))
+    assert echo_layer(pkt) == bytes([1, 2, 3])
+
+
+def test_echo_layer_empty_without_first_header():
+    assert echo_layer(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) == b''
+
+
+def test_assembler_uses_supplied_extractor():
+    # PingAssembler routes per-packet extraction through the supplied callable
+    pkt = _gcv20_packet(7, bytes([10, 1, 20, 2, 30, 3, 40, 4, 50, 5]), tail=bytes(2))
+    assembler = PingAssembler(echo_layer)
+    assert assembler.feed(pkt) == []                # accumulating
+    out = assembler.feed(bytes([0xd8, 0x07]))       # marker flushes
+    assert len(out) == 1
+    ch, samples, _stamp = out[0]
+    assert ch == 7
+    assert samples == bytes([1, 2, 3, 4, 5])

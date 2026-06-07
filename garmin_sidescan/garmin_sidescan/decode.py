@@ -1,20 +1,27 @@
 """
 Garmin GCV-10/20 sidescan imagery decode primitives.
 
-Transport model (validated 2026-06-05 against real survey data and a live
-GCV-20):
-
   eb07 packet = magic ``eb 07`` ``00 00`` + LE-length(4) + 12-byte sub-header
-    + render layers.  Each packet carries three render layers, each prefixed
-    by a header signature.  The high-resolution echo is the LAST ("dark")
-    layer: the bytes after the final ``sh``/``shs`` signature + 4, to the end
-    of the packet (~300 samples per full packet, ~248 from the short final
-    packet).
+    + render layers.  Channel byte is at payload offset 12.
   d807 packet = marker delimiting a channel's run within a ping.
-  One channel scan line = 7 consecutive same-channel packets (6 full + 1
-    short) = ~2048 range bins.
-  Channel byte is at payload offset 12 (GCV-20: 0=port, 1=stbd, 2=ClearVu;
-    GCV-10 survey data used 3=port, 1=stbd).
+  One channel scan line = 7 consecutive same-channel packets (6 full + 1 short).
+
+Per-packet layers are bracketed by header signatures: ``fh``/``fhs`` opens the
+first layer, ``sh``/``shs`` opens later layers.  The high-resolution echo lives
+in a DIFFERENT layer per generation, so the per-packet sample extractor is a
+parameter of :class:`PingAssembler`, chosen by the caller from the device
+generation (see node.py's ``device`` auto-detect):
+
+* **GCV-10** (validated against Dan's survey capture, ``decoded2_sidescan.png``):
+  three layers per packet; the echo is the LAST ("dark") layer -- bytes after
+  the final ``sh``/``shs`` + 4 to end of packet.  Use :func:`dark_layer`.
+* **GCV-20** (bench-validated 2026-06-07 against the GCV-10 bucket reference;
+  pending a wet-capture seafloor confirmation): only two layers per packet (no
+  third "dark" layer); the echo is the **odd-indexed bytes of the first (``fh``)
+  layer**, de-interleaved WITHIN each packet.  The even bytes are a flat
+  companion stream (purpose TBD) and are discarded.  Use :func:`echo_layer`.
+  Taking the last layer here (the GCV-10 rule) yields a washed-out low-res/AGC
+  display layer -- the original "looks wrong in rqt" bug.
 
 Neither a frequency nor a usable per-ping timestamp is carried in the imagery
 sub-header, so the driver takes frequency from configuration and stamps pings
@@ -25,8 +32,10 @@ EB07 = b'\xeb\x07'
 D807 = b'\xd8\x07'
 
 # Render-layer header signatures (little-endian sample pairs).
-SH = bytes([174, 2, 172, 2])    # ae 02 ac 02  full-packet layer header
-SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short final-packet layer header
+FH = bytes([218, 4, 216, 4])    # da 04 d8 04  full-packet first-layer header
+FHS = bytes([242, 3, 240, 3])   # f2 03 f0 03  short-packet first-layer header
+SH = bytes([174, 2, 172, 2])    # ae 02 ac 02  full-packet later-layer header
+SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
 
 CHANNEL_OFFSET = 12
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data
@@ -37,7 +46,7 @@ MAX_SCAN_BYTES = 65536
 
 def dark_layer(payload):
     """
-    Return the dark (high-resolution) render layer from one eb07 payload.
+    Return the dark (high-resolution) render layer from one eb07 payload (GCV-10).
 
     The dark layer is everything after the final layer-header signature plus
     its 4 signature bytes.  Returns an empty bytes object if no signature is
@@ -49,6 +58,30 @@ def dark_layer(payload):
     if i < 0:
         return b''
     return payload[i + 4:]
+
+
+def echo_layer(payload):
+    """
+    Return the GCV-20 high-resolution echo from one eb07 payload.
+
+    The echo is the odd-indexed bytes of the first (``fh``/``fhs``) render
+    layer: the bytes from the first-layer header + 4 up to the next ``sh``/
+    ``shs`` (or end of packet if absent, as on ClearVu), de-interleaved per
+    packet.  De-interleaving must be done per packet, not on the concatenated
+    scan line -- the first layer's length varies packet-to-packet, so a global
+    stride would drift in phase.  Returns ``b''`` if no first-layer header is
+    present.
+    """
+    f = payload.find(FH)
+    sh = SH
+    if f < 0:
+        f = payload.find(FHS)
+        sh = SHS
+    if f < 0:
+        return b''
+    s = payload.find(sh, f + 4)
+    first = payload[f + 4:(s if s >= 0 else len(payload))]
+    return first[1::2]
 
 
 class PingAssembler:
@@ -63,7 +96,10 @@ class PingAssembler:
     any trailing accumulation.
     """
 
-    def __init__(self):
+    def __init__(self, extractor=dark_layer):
+        # Per-packet sample extractor, chosen by device generation:
+        # dark_layer (GCV-10) or echo_layer (GCV-20).
+        self._extract = extractor
         self._cur_ch = None
         self._acc = bytearray()
         self._t0 = 0.0
@@ -85,7 +121,7 @@ class PingAssembler:
                 self._emit(out)
                 self._cur_ch = ch
                 self._t0 = recv_time
-            self._acc.extend(dark_layer(payload))
+            self._acc.extend(self._extract(payload))
             if len(self._acc) > MAX_SCAN_BYTES:
                 # Degenerate stream (no channel change, no marker): drop the
                 # runaway accumulation rather than grow without bound.
