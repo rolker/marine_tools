@@ -81,16 +81,25 @@ def _gcv20_packet(channel, first_layer, tail=b''):
     return head + FH + first_layer + (SH + tail if tail else b'')
 
 
-def test_echo_layer_odd_bytes_of_first_layer():
-    # even bytes = flat companion (discarded); odd bytes = echo
-    pkt = _gcv20_packet(0, bytes([10, 1, 20, 2, 30, 3, 40, 4]), tail=bytes(2))
-    assert echo_layer(pkt) == bytes([1, 2, 3, 4])
+def test_echo_layer_returns_first_layer_uint16_bytes():
+    # First layer returned as-is = uint16-LE samples (low byte then high byte)
+    pkt = _gcv20_packet(0, bytes([0x10, 0x01, 0x20, 0x02]), tail=bytes(2))
+    assert echo_layer(pkt) == bytes([0x10, 0x01, 0x20, 0x02])
+    # interpreted as uint16-LE: 0x0110, 0x0220
+    assert struct.unpack('<2H', echo_layer(pkt)) == (0x0110, 0x0220)
+
+
+def test_echo_layer_trims_to_whole_samples():
+    # odd-length first layer: drop the trailing byte so concatenation can't
+    # straddle a uint16 sample across the packet boundary
+    pkt = _gcv20_packet(0, bytes([10, 1, 20, 2, 99]), tail=bytes(2))
+    assert echo_layer(pkt) == bytes([10, 1, 20, 2])
 
 
 def test_echo_layer_runs_to_end_without_sh():
     # ClearVu-style: no following SH -> first layer runs to end of packet
     pkt = _gcv20_packet(2, bytes([10, 1, 20, 2, 30, 3]))
-    assert echo_layer(pkt) == bytes([1, 2, 3])
+    assert echo_layer(pkt) == bytes([10, 1, 20, 2, 30, 3])
 
 
 def test_echo_layer_empty_without_first_header():
@@ -98,12 +107,13 @@ def test_echo_layer_empty_without_first_header():
 
 
 def test_assembler_uses_supplied_extractor():
-    # PingAssembler routes per-packet extraction through the supplied callable
-    pkt = _gcv20_packet(7, bytes([10, 1, 20, 2, 30, 3, 40, 4, 50, 5]), tail=bytes(2))
+    # PingAssembler routes per-packet extraction through the supplied callable.
+    # First layer is 8 bytes so the packet exceeds MIN_DATA_LEN (32).
+    pkt = _gcv20_packet(7, bytes([10, 1, 20, 2, 30, 3, 40, 4]), tail=bytes(2))
     assembler = PingAssembler(echo_layer)
     assert assembler.feed(pkt) == []                # accumulating
     out = assembler.feed(bytes([0xd8, 0x07]))       # marker flushes
     assert len(out) == 1
     ch, samples, _stamp = out[0]
     assert ch == 7
-    assert samples == bytes([1, 2, 3, 4, 5])
+    assert samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])

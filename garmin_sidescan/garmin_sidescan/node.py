@@ -216,6 +216,11 @@ class GarminSidescanNode(Node):
         self._detected_gen = None
         self._detect_sizes = []
         self._geom_warned = False
+        # Sample format, set when the assembler is built from the generation
+        # (GCV-20 = 16-bit uint16-LE, GCV-10 = 8-bit). Defaults are harmless
+        # until then; no pings are emitted before the assembler exists.
+        self._sonar_dtype = SonarImageData.DTYPE_UINT8
+        self._bytes_per_sample = 1
         self._running = True
 
         # publishers
@@ -585,9 +590,20 @@ class GarminSidescanNode(Node):
             sock.close()
 
     def _make_assembler(self, gen):
-        extractor = echo_layer if gen == 'gcv20' else dark_layer
+        # GCV-20 echo is 16-bit (uint16-LE, 2 bytes/sample); GCV-10's dark layer
+        # is 8-bit. The extractor emits raw bytes; dtype/stride say how to read
+        # them in _make_sonar_msg.
+        if gen == 'gcv20':
+            extractor = echo_layer
+            self._sonar_dtype = SonarImageData.DTYPE_UINT16
+            self._bytes_per_sample = 2
+        else:
+            extractor = dark_layer
+            self._sonar_dtype = SonarImageData.DTYPE_UINT8
+            self._bytes_per_sample = 1
         self.get_logger().info(
-            f'imagery decode: {gen} ({extractor.__name__})')
+            f'imagery decode: {gen} ({extractor.__name__}, '
+            f'{8 * self._bytes_per_sample}-bit)')
         return PingAssembler(extractor)
 
     def _observe_geometry(self, payload):
@@ -629,18 +645,18 @@ class GarminSidescanNode(Node):
         # Only when we actually commanded a range (>0); else leave the manual
         # override (default 0 = "unavailable", per RawSonarImage convention).
         range_m = float(self._controls.get('range') or 0.0)
-        bins = len(samples)
+        bins = len(samples) // self._bytes_per_sample
         if range_m > 0.0 and sv > 0.0 and bins > 0:
             msg.sample_rate = float(sv) * bins / (2.0 * range_m)
         else:
             msg.sample_rate = self._sample_rate
-        msg.samples_per_beam = len(samples)
+        msg.samples_per_beam = bins
         msg.sample0 = 0
         msg.tx_delays = [0.0]
         msg.tx_angles = [0.0]
         msg.rx_angles = [0.0]
-        msg.image.is_bigendian = False
-        msg.image.dtype = SonarImageData.DTYPE_UINT8
+        msg.image.is_bigendian = False        # GCV samples are little-endian
+        msg.image.dtype = self._sonar_dtype
         msg.image.beam_count = 1
         msg.image.data = bytes(samples)
         return msg

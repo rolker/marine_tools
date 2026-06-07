@@ -17,9 +17,10 @@ generation (see node.py's ``device`` auto-detect):
   the final ``sh``/``shs`` + 4 to end of packet.  Use :func:`dark_layer`.
 * **GCV-20** (bench-validated 2026-06-07 against the GCV-10 bucket reference;
   pending a wet-capture seafloor confirmation): only two layers per packet (no
-  third "dark" layer); the echo is the **odd-indexed bytes of the first (``fh``)
-  layer**, de-interleaved WITHIN each packet.  The even bytes are a flat
-  companion stream (purpose TBD) and are discarded.  Use :func:`echo_layer`.
+  third "dark" layer); the echo is the **first (``fh``) layer, an array of
+  little-endian uint16 samples** (the high byte is the smooth echo MSB, the low
+  byte its LSB -- a per-byte view looks like a decaying "odd" stream interleaved
+  with a uniform "even" one).  Use :func:`echo_layer` and publish ``UINT16``.
   Taking the last layer here (the GCV-10 rule) yields a washed-out low-res/AGC
   display layer -- the original "looks wrong in rqt" bug.
 
@@ -62,15 +63,18 @@ def dark_layer(payload):
 
 def echo_layer(payload):
     """
-    Return the GCV-20 high-resolution echo from one eb07 payload.
+    Return the GCV-20 16-bit echo from one eb07 payload as raw uint16-LE bytes.
 
-    The echo is the odd-indexed bytes of the first (``fh``/``fhs``) render
-    layer: the bytes from the first-layer header + 4 up to the next ``sh``/
-    ``shs`` (or end of packet if absent, as on ClearVu), de-interleaved per
-    packet.  De-interleaving must be done per packet, not on the concatenated
-    scan line -- the first layer's length varies packet-to-packet, so a global
-    stride would drift in phase.  Returns ``b''`` if no first-layer header is
-    present.
+    The first (``fh``/``fhs``) render layer -- the bytes from the first-layer
+    header + 4 up to the next ``sh``/``shs`` (or end of packet if absent, as on
+    ClearVu) -- is an array of little-endian uint16 samples: the smooth high
+    byte is the echo MSB, the noisy low byte its LSB (so a per-byte view shows a
+    decaying odd stream interleaved with a uniform even stream).  Returned as-is
+    so the caller can publish ``DTYPE_UINT16``; trimmed to a whole number of
+    samples so the per-packet concatenation can't straddle a sample across the
+    packet boundary (the layer length varies, sometimes odd).  Taking only the
+    high byte would be a correct but 8-bit-truncated view.  Returns ``b''`` if
+    no first-layer header is present.
     """
     f = payload.find(FH)
     sh = SH
@@ -81,7 +85,7 @@ def echo_layer(payload):
         return b''
     s = payload.find(sh, f + 4)
     first = payload[f + 4:(s if s >= 0 else len(payload))]
-    return first[1::2]
+    return first[:len(first) // 2 * 2]
 
 
 class PingAssembler:

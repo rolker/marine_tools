@@ -14,7 +14,7 @@ Published (relative to the node namespace):
 
 | Topic | Type | Notes |
 |-------|------|-------|
-| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | SideVü port, single beam, `DTYPE_UINT8` |
+| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | SideVü port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10) |
 | `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | SideVü starboard |
 | `sonar_image_clearvu` | `marine_acoustic_msgs/RawSonarImage` | ClearVü down-look |
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
