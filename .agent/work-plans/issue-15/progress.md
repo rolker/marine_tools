@@ -328,3 +328,9 @@ Corrects the earlier (wrong) rx_angle approach after reading the message spec + 
 - **Orientation via per-channel `frame_id` + TF**: each channel publishes `<frame_id>_port`/`_starboard`/`_down`; the URDF/TF tree orients each transducer (side + tilt). Non-traditional/backwards mounting = pure TF edit, never code/param. Likely what the EdgeTech field fix (never committed) added.
 - **De-trademarked**: down-look topic/param/side `clearvu` → generic `down` (`sonar_image_down`, `down_channels`, `freq_down_hz`); prose ClearVü→down-look, SideVü→side-scan. Kept the `pl[8]` down-look auto-classify (`is_water_column`, `_classify_beam`).
 - Proper sidescan rviz (slant-range correction, water-column skip, terrain/nadir-plane draping; down-look + GCV depth report as the altitude feed) = separate effort/issue. 40 tests pass, lint clean.
+
+### Network diagram, full-stream debug capture, /diagnostics (2026-06-07) — `514036d`
+- README gained an ASCII network diagram (GCV ↔ chartplotter ↔ host; multicast imagery/:50220 + status/:50050 + CDP config/:51000; TCP control/:50227; what the driver touches).
+- **Debug capture extended to all GCV streams**: `debug_raw` now also publishes `~/debug/raw_status` (:50050) and `~/debug/raw_config` (:51000) beside `~/debug/raw` (imagery), via a shared `_aux_loop` (same reconnect handling). A single wet-run bag is now fully re-decodable offline — including the depth field (still unverified, captured for later decode).
+- **`/diagnostics`** (`DiagnosticArray`, 1 Hz): imagery health (`imagery_diag_level` — OK in standby, ERROR if transmitting-but-stale; device gen/dtype/last-ping age/per-channel counts) + transmit/safety (WARNs on commanded-vs-device-reported tx mismatch — the device flag is parsed from the :50050 `8e03` frame, `byte[9]`, via `status_transmitting()` — or transmitting on stale SV).
+- package.xml: +`diagnostic_msgs`, −`sensor_msgs` (stale after self-waterfall removal). 42 tests pass, lint clean.
