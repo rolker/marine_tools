@@ -315,3 +315,9 @@ capture settles it; uint16 captures it faithfully either way.
 - [x] (suggestion) `echo_layer` accepts either SH/SHS as first-layer terminator (not coupled to opener)
 - [x] (suggestion) `device` param validated at startup (warn + fall back to auto on unknown value)
 - Tests: 37 pass (3 new tag-detection tests, decode + node-method); lint clean. Integration-verified on both pcaps incl. ClearVu-only packets.
+
+### Stream-type indicators in the message + ClearVu auto-classify (2026-06-07) — `7f460b3`
+Two related improvements (from Roland's stream-type question):
+- **Message-level geometry**: `rx_angles`/`tx_angles` were all `[0.0]` — streams were distinguishable only by topic name. Now set per side: **+`beam_angle_deg` (port), −(starboard), 0 (ClearVu down-look / water column)**; default 90°, param `beam_angle_deg`. A consumer can now read stream geometry from the message (the ±90° sidescan convention Roland recalled).
+- **Intrinsic ClearVu auto-classify**: render-layer byte at offset 8 = `0x0d` for the ClearVu down-look beam on BOTH generations (SideVu = 0x0e/0x0f) — `decode.is_water_column()`. `node._classify_beam()` records each channel's beam type and warns once on a channel-map mismatch (a channel routed to a SideVu topic but carrying the ClearVu beam), independent of the unit-specific channel numbers. Note: distinguishes beam *type* (sidescan vs water-column), NOT port vs stbd — both SideVu sides share the layer byte, so port/stbd still comes from the channel map.
+- Verified on both captures (GCV-10 ch5 / GCV-20 ch2 = water column). 41 tests pass, lint clean.
