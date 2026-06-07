@@ -152,4 +152,20 @@ R5 did not re-raise them. Only R5's two comments are live.
 ### Resolution (fixes applied)
 - Both R5 code findings fixed in `6335f57`; `colcon test garmin_sidescan` = 29 tests, 0 failures (flake8/pep257 green).
 - Added `_on_param_set` unit tests via a lightweight fake-node (calling the unbound method against a stub `self`) — supersedes the R4 note that the rclpy-free suite couldn't cover it: batch-rejects-static-without-sending-range, order-independent, send-failure-doesn't-mirror.
-- C1 (human: on-boat data looks wrong in rqt) remains open — debugging task, next.
+- C1 (human: on-boat data looks wrong in rqt) — offline investigation done; see below.
+
+### C1 investigation: on-boat data renders wrong in rqt (via separate-machine proxy)
+Ruled OUT (offline, against the real-capture fixture `test/fixtures/gcv_real_pings.bin` + code read):
+- **Sample bit depth.** Tested the hypothesis that dark-layer samples are 16-bit LE (the layer-header sig `ae 02 ac 02` looked like LE pairs). Refuted empirically: even/odd byte means are identical (72.4/72.8), adjacent bytes are *more* correlated than every-other (13.2 < 20.0 — opposite of a 16-bit interleave), and a scan line reads as saturated nadir (255s) decaying with range. Data is genuinely 8-bit; the driver's `dtype=UINT8` is correct.
+- **Proxy mangling datagrams.** `garmin_marine_network_proxy.py` imagery relay is 1:1 `recvfrom(65535)`→`sendto(payload)` — datagram boundaries preserved; it doesn't coalesce/split.
+- **rqt decode/orientation.** `decode_samples` handles UINT8; `combine_rows` reverses port so nadir sits at center (standard sidescan). Correct on clean input — the known-good fixture reassembles to clean 2048-bin lines.
+- **RX behind proxy.** driver binds `('',50220)` (INADDR_ANY) + joins mcast; receives the proxy's relayed unicast — consistent with data being produced.
+
+Leading hypotheses (ranked):
+1. **UDP loss/reorder over the troubled relay path.** `PingAssembler` has NO sequence/loss handling — the GCV imagery sub-header carries no seq# or per-ping stamp (decode.py), so a dropped packet silently shortens a scan line and a reorder scrambles within-run order / merges runs → "data but wrong". Roland cited "network issues" + a relay; decode is proven correct on COMPLETE input, so the boat delta is transport integrity. Prime suspect.
+2. **`sample_rate_hz` defaults to 0.0** → rqt `range_max` gated on `sample_rate>0` is never computed → no range scaling/axis. Display looks off (scale/labels), not garbled. Easy config fix.
+3. Channel-map mismatch (GCV-10 [3,1] vs GCV-20 [0,1,2]) — low prob (boat GCV-20 @172.16.3.0 matches defaults), worth a one-line config check.
+4. rqt auto-range/gain compressing 8-bit dynamic range (saturated nadir + low backscatter) — tuning, recognizable.
+
+Bisection plan (needs boat/capture): compare proxy in/out `pkts` + tcpdump both NICs; add per-scan-line length sanity warn in the driver to quantify short/ragged lines; `ros2 topic echo --once ~/sonar_image_port` and compare `image.data` length+profile to the fixture line; A/B a brief direct-connect (no-proxy) run.
+Recommended (low-risk, can implement on request): scan-line length sanity logging (turns "looks wrong" into a measurable drop rate) + a real `sample_rate_hz` default/doc. Did NOT implement a "fix" — cause needs confirmation with a capture (the bit-depth refutation shows why testing-first matters).
