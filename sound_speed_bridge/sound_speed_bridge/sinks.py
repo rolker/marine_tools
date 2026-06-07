@@ -111,7 +111,8 @@ def format_template(
 
 
 def decode_template(format_name: str, template: str) -> str:
-    """Decode backslash escapes in a user-supplied template string at startup.
+    r"""
+    Decode backslash escapes in a user-supplied template string at startup.
 
     Validated once at config time so a malformed escape (e.g. ``\\xZZ``) or
     a non-ASCII character raises a clear configuration error instead of

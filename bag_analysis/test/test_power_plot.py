@@ -233,7 +233,8 @@ def test_voltage_only_summary_uses_full_bag_label_when_window_missing(tmp_path):
 
 
 def test_power_ignores_rcout_outside_battery_time_range(tmp_path):
-    """rcout that doesn't overlap battery in time must not classify samples as idle.
+    """
+    Reject rcout that doesn't overlap battery in time from idle classification.
 
     Pre-fix, merge_asof(..., direction='nearest') with no tolerance would
     happily inherit a PWM value from a row arbitrarily far away. With the

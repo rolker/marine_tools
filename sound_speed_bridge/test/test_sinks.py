@@ -89,7 +89,8 @@ def test_passthrough_skips_when_raw_bytes_empty():
 
 
 def test_template_basic_format_with_int_mm_s():
-    r"""Bit-exact int mm/s flows through {value_int_mm_s} unchanged.
+    r"""
+    Bit-exact int mm/s flows through {value_int_mm_s} unchanged.
 
     Templates arrive at the formatter already decoded by the node.
     """
