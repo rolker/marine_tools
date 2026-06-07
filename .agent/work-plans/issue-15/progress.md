@@ -161,11 +161,46 @@ Ruled OUT (offline, against the real-capture fixture `test/fixtures/gcv_real_pin
 - **rqt decode/orientation.** `decode_samples` handles UINT8; `combine_rows` reverses port so nadir sits at center (standard sidescan). Correct on clean input — the known-good fixture reassembles to clean 2048-bin lines.
 - **RX behind proxy.** driver binds `('',50220)` (INADDR_ANY) + joins mcast; receives the proxy's relayed unicast — consistent with data being produced.
 
-Leading hypotheses (ranked):
-1. **UDP loss/reorder over the troubled relay path.** `PingAssembler` has NO sequence/loss handling — the GCV imagery sub-header carries no seq# or per-ping stamp (decode.py), so a dropped packet silently shortens a scan line and a reorder scrambles within-run order / merges runs → "data but wrong". Roland cited "network issues" + a relay; decode is proven correct on COMPLETE input, so the boat delta is transport integrity. Prime suspect.
-2. **`sample_rate_hz` defaults to 0.0** → rqt `range_max` gated on `sample_rate>0` is never computed → no range scaling/axis. Display looks off (scale/labels), not garbled. Easy config fix.
-3. Channel-map mismatch (GCV-10 [3,1] vs GCV-20 [0,1,2]) — low prob (boat GCV-20 @172.16.3.0 matches defaults), worth a one-line config check.
-4. rqt auto-range/gain compressing 8-bit dynamic range (saturated nadir + low backscatter) — tuning, recognizable.
+DECISIVE EVIDENCE (the bag `~/data/logs/bizzy_sidescan/bag_2026-06-05T14.03.53_sidescan`
++ the day's GCV-20 pcap `~/garmin_sidescan/captures/gcv20_passive_*.pcap`):
+- Recorded `sonar_image_port`: 398/400 pings are exactly 2076 B (only 2 short),
+  dtype=UINT8, mean **214**, **98% of samples >127**, FLAT profile (no range
+  decay), clearvu topic = **0 msgs**. Not backscatter — washed out.
+- My earlier "UDP loss/reorder" hypothesis is **REFUTED**: lines are consistent
+  length, so transport is fine.
+- Running the driver's OWN `dark_layer` model over the raw GCV-20 pcap reproduces
+  the bag exactly (2076 B, mean 211, 97% >127, clearvu dropped). **So the fault
+  is the driver decode, not transport/proxy/rqt.**
 
-Bisection plan (needs boat/capture): compare proxy in/out `pkts` + tcpdump both NICs; add per-scan-line length sanity warn in the driver to quantify short/ragged lines; `ros2 topic echo --once ~/sonar_image_port` and compare `image.data` length+profile to the fixture line; A/B a brief direct-connect (no-proxy) run.
-Recommended (low-risk, can implement on request): scan-line length sanity logging (turns "looks wrong" into a measurable drop rate) + a real `sample_rate_hz` default/doc. Did NOT implement a "fix" — cause needs confirmation with a capture (the bit-depth refutation shows why testing-first matters).
+ROOT CAUSE (definitive): **driver decode `dark_layer()` (`decode.py`/`PingAssembler`).**
+The driver ported the colleague's `gcv_decode2.py` v2 model ("high-res echo = bytes
+after the LAST sh/shs signature"). On the GCV-20 each eb07 packet has TWO layers:
+`fh(da04d804)@28 .. sh(ae02ac02) .. end`. The driver takes the *last* layer (~300 B
+/packet → 2076/line) = a low-res/AGC "display" layer → washed out. It also drops
+clearvu (no sh sig → empty). **Both reference decoders are wrong**: v2 (=driver) =
+washed-out last layer; v1 (`pl[20:]`) = the first layer but with a `50,179`
+two-byte interleave ("blocky banding", per v2's own changelog).
+
+DECODE IS UNSOLVED. Explored further: the first layer (FH→SH) is a 2-byte
+interleave; its **even** stream `[0::2]` has a real nadir→far DECAY profile
+(98→43) + full 0-255 range (promising!), but rendered to PNG it's mostly noise
+with per-packet vertical seams — so even-stream-of-layer0 across packet
+boundaries is still not the clean echo (per-packet phase drift and/or far-range
+noise floor). Needs more reverse-engineering than a triage pass should guess.
+
+Secondary (real, easy): `sample_rate_hz` defaults to 0.0 → rqt `range_max`
+(gated on sample_rate>0) never computed → no range axis. And clearvu is silently
+dropped by the signature decode.
+
+NEXT STEPS (not a quick patch — this is a decode RE problem):
+- Loop in the colleague who captured the GCV-20 / their latest decoder; the
+  protocol layer+interleave structure isn't cracked.
+- Systematic RE with VISUAL validation (render PNG per hypothesis — offline from
+  the pcaps in `~/garmin_sidescan/captures/`) against a known target / the GCV's
+  own chartplotter rendering. Resolve: which layer, de-interleave phase per
+  packet, what the odd stream is.
+- Meanwhile (low-risk, independent of the decode fix): set a real `sample_rate_hz`
+  default + restore clearvu.
+Did NOT patch the driver: two hypotheses (16-bit; layer0-even) already failed
+empirical/visual checks — shipping a guessed decode would just produce a
+different wrong image.
