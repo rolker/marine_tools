@@ -36,7 +36,6 @@ driver (see ../README.md).
 """
 import argparse
 import socket
-import struct
 import threading
 import time
 
@@ -190,7 +189,7 @@ def main():
     parser.add_argument('--imagery-port', type=int, default=50220)
     parser.add_argument('--listen-ip', default='192.168.20.8',
                         help='local NIC IP facing the ROS host; set the driver '
-                             "gcv_ip to this")
+                             'gcv_ip to this')
     parser.add_argument('--relay-to', nargs='+', default=['192.168.20.5'],
                         help='ROS host IP(s) to forward imagery to')
     parser.add_argument('--re-multicast', action='store_true',

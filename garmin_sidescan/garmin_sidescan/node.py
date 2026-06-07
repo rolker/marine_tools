@@ -624,18 +624,21 @@ class GarminSidescanNode(Node):
 
     def _on_param_set(self, params):
         for p in params:
-            if p.name == 'range_m' and p.value and p.value > 0:
+            if p.name == 'range_m':
                 meters = float(p.value)
-                # Reject (don't silently clamp) an out-of-range request: the
-                # parameter store would otherwise hold a value the GCV never
-                # got. Mirrors the range_min..range_max guard on the control set.
-                if not range_in_bounds(meters, self._range_min, self._range_max):
+                # Reject (don't silently accept) a non-finite or out-of-range
+                # request - including <=0 and NaN, which previously slipped
+                # through the truthiness guard and were reported successful while
+                # the node ignored them. The parameter store must never hold a
+                # value the GCV never got. Mirrors the control-set range guard.
+                if not math.isfinite(meters) or not range_in_bounds(
+                        meters, self._range_min, self._range_max):
                     self.get_logger().warn(
-                        f'range_m {meters} m outside '
+                        f'range_m {meters} m invalid or outside '
                         f'{self._range_min}-{self._range_max} m; rejected')
                     return SetParametersResult(
                         successful=False,
-                        reason=(f'range {meters} m outside '
+                        reason=(f'range {meters} m invalid or outside '
                                 f'{self._range_min}-{self._range_max} m'))
                 # Reject the parameter set if the command can't be sent, so the
                 # ROS parameter and UI never claim a range the GCV didn't apply.
@@ -654,6 +657,19 @@ class GarminSidescanNode(Node):
                     self.get_logger().warn(
                         'sound-speed safety mechanism DISABLED (watchdog auto-stop and '
                         'transmit guard off - dry-transducer protection is not active)')
+            elif p.name != 'use_sim_time' and self.has_parameter(p.name):
+                # Every other declared parameter is read once at startup. Silently
+                # accepting a runtime set would report success while the node keeps
+                # the cached value, so an operator/UI would believe a setting took
+                # effect that didn't. Reject it explicitly. (use_sim_time is an
+                # rclpy built-in left to default handling; undeclared names, which
+                # has_parameter rejects, fall through.)
+                self.get_logger().warn(
+                    f'{p.name} is a startup parameter; runtime updates are not '
+                    f'applied - rejected')
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{p.name} is set at launch, not at runtime')
         return SetParametersResult(successful=True)
 
     def destroy_node(self):
