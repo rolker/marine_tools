@@ -181,29 +181,15 @@ clearvu (no sh sig → empty). **Both reference decoders are wrong**: v2 (=drive
 washed-out last layer; v1 (`pl[20:]`) = the first layer but with a `50,179`
 two-byte interleave ("blocky banding", per v2's own changelog).
 
-DECODE IS UNSOLVED. Explored further: the first layer (FH→SH) is a 2-byte
-interleave; its **even** stream `[0::2]` has a real nadir→far DECAY profile
-(98→43) + full 0-255 range (promising!), but rendered to PNG it's mostly noise
-with per-packet vertical seams — so even-stream-of-layer0 across packet
-boundaries is still not the clean echo (per-packet phase drift and/or far-range
-noise floor). Needs more reverse-engineering than a triage pass should guess.
-
 Secondary (real, easy): `sample_rate_hz` defaults to 0.0 → rqt `range_max`
 (gated on sample_rate>0) never computed → no range axis. And clearvu is silently
 dropped by the signature decode.
 
-NEXT STEPS (not a quick patch — this is a decode RE problem):
-- Loop in the colleague who captured the GCV-20 / their latest decoder; the
-  protocol layer+interleave structure isn't cracked.
-- Systematic RE with VISUAL validation (render PNG per hypothesis — offline from
-  the pcaps in `~/garmin_sidescan/captures/`) against a known target / the GCV's
-  own chartplotter rendering. Resolve: which layer, de-interleave phase per
-  packet, what the odd stream is.
-- Meanwhile (low-risk, independent of the decode fix): set a real `sample_rate_hz`
-  default + restore clearvu.
-Did NOT patch the driver: two hypotheses (16-bit; layer0-even) already failed
-empirical/visual checks — shipping a guessed decode would just produce a
-different wrong image.
+> **SUPERSEDED 2026-06-07** — an interim note here called the layer0 encoding
+> "unsolved" after the 16-bit / even-interleave / RLE guesses failed. That was
+> wrong: the failures were method bugs (notably de-interleaving the *concatenated*
+> line instead of *per packet*). The decode was subsequently CRACKED — see
+> "★★ DECODE CRACKED" at the end of this entry.
 
 ### C1 RE session (2026-06-07) — decode reverse-engineering, partial
 Assets confirmed available for offline RE (no boat needed):
@@ -225,22 +211,56 @@ Findings:
     low-res/AGC DISPLAY layer, NOT the echo.
   - layer0 = larger, has full 0-255 dynamic range, byte-paired structure
     (even-idx values 0-255, odd-idx bounded <=179), variable per-packet length.
-- Encodings RULED OUT for layer0 (each tested, failed): (a) 16-bit LE samples;
-  (b) 2-byte even/odd interleave — renders to noise (per-packet phase drift, layer0
-  length parity flips 613/614); (c) (value,count) RLE — expands to ~114k/line and
-  non-constant, wrong.
+- Interim encoding guesses (16-bit LE; (value,count) RLE) were wrong; the even/odd
+  interleave guess was right in spirit but failed because it was applied to the
+  concatenated line, not per packet.
 - rangesweep: full-run layer sizes are CONSTANT across range (layer0=3683, layer1=1824,
-  6 pkts) — range is metadata, not bin count, so it doesn't isolate the echo by size.
+  6 pkts) — range is metadata, not bin count (range = ping timing, set via command).
 
-Status: faulty component = driver decode (DEFINITIVE). Correct layer0 sample encoding
-= NOT cracked after multiple principled attempts. This is a real proprietary-format RE
-task, not a triage fix.
+## ★★ DECODE CRACKED (2026-06-07) — GCV-20 echo = layer0 odd bytes, per-packet
 
-Recommended path (stop guessing encodings):
-1. Get pixel-level GROUND TRUTH — the Garmin chartplotter's own sidescan rendering for a
-   scene captured in a pcap — and reverse the encoding by matching decoded output to it.
-2. Or involve the original capturer / any Garmin GCV format notes.
-3. settings-diff (compare imagery bytes when display gain/palette changed) to confirm
-   layer1 = display layer — supports the diagnosis but won't reveal layer0's codec.
-Secondary, decode-independent (worth doing now): set a real `sample_rate_hz` default and
-restore the dropped clearvu channel.
+Method: decoded the GCV-10 BUCKET capture (`captures/gcv10_*.pcap`) with the known-good
+`gcv_decode2.py` dark-layer path → reference signature = clean near→far DECAY
+(ch0 profile 212→0; bright nadir, nothing past the bucket). Then searched GCV-20 bench
+extractions for one that reproduces that decay. (Working-image reference for "what real
+looks like": `gcv_decode2.py` on Dan's GCV-10 survey `extracted/.../dumpcap_file.pcap`
+→ `decoded2_sidescan.png`.)
+
+Result — for the GCV-20 (`gcv20_passive`/`gcv20_settings`, ch0):
+| extraction | profile near→far | verdict |
+|---|---|---|
+| last/dark layer (driver) | flat ~211 | washed-out display layer — WRONG |
+| layer0 even bytes | flat ~125 | flat companion stream (purpose TBD) |
+| **layer0 odd bytes, per-packet** | **decays (119→41)** | matches GCV-10 ref ✓ |
+
+So **GCV-20 sidescan echo = the ODD-indexed bytes of layer0 (FH→SH), de-interleaved
+WITHIN each packet, then concatenated**. The earlier "noise" was from de-interleaving
+the concatenated line (layer0 per-packet length flips 613/614 → phase scramble);
+per-packet de-interleave fixes it. Rendered PNG shows the reference's near→far decay
+(`.agent/scratchpad/gcv20_passive_ch0_layer0odd.png`).
+
+GCV-20 ping grammar (from `gcv20_passive`): `ch2(ClearVu,7pkts) M ch1(stbd,7) M
+ch0(port,7) M M` per ping; sidescan pkts 6×953+1×797, clearvu 6×648+1×544. Port/stbd
+are SYMMETRIC (both 7 pkts/run, same sizes) → ~2089 echo bins/ping each (the earlier
+"ch0 1841 vs ch1 920" was a render min-width-truncation artifact, NOT real).
+
+Generation difference: GCV-20 packets carry GCV-10's first two layers but NOT GCV-10's
+third "dark" layer — so on GCV-20 the echo is interleaved in layer0, while the driver
+(ported from the GCV-10 path) wrongly takes the last layer.
+
+Boat install check (from the washed-layer bag, render `.agent/scratchpad/boat_sidescan_v2.png`):
+gross geometry looks CORRECT — straight centered nadir, port/stbd symmetric, stable over
+~1770 pings. So the on-boat "looked wrong" was the DECODE (wrong layer), not the mount.
+
+Boat data is UNRECOVERABLE for re-decode: `dark_layer` discarded layer0 before writing
+the bag; both bags hold only the 2076-B last layer (lossy). Final SEAFLOOR validation of
+the layer0-odd decode needs a fresh wet capture: `tcpdump -i <marine-net-iface> -w
+gcv20_water.pcap 'udp port 50220'` (GPSMAP master present, over real bottom).
+
+`sample_rate` fix (decode-independent): derive from the COMMANDED range, not a constant —
+`sample_rate = sound_speed * samples_per_beam / (2 * range_m)` (driver owns range_m,
+sound_speed from SV topic, bins from len(samples)). Also restore the dropped clearvu channel.
+
+Status: GCV-20 decode = bench-validated (decay signature vs GCV-10 ref); pending seafloor
+confirmation on a wet capture. Driver patch deferred to a discuss-then-implement step
+(output/params review with Roland first).
