@@ -308,3 +308,10 @@ capture settles it; uint16 captures it faithfully either way.
 
 ### Verified clean (both adversarial passes)
 - cross-thread state (_assembler/_detected_gen/_sonar_dtype/_bytes_per_sample all rx-thread-only; _debug_raw/_controls GIL-atomic), uint16 alignment + is_bigendian, sample_rate divide-by-zero/NaN guards, _detect_sizes bounded, empty/short-payload handling.
+
+### Pre-push review findings resolved (2026-06-07) — `069ec71`
+- [x] (must-fix, cross-confirmed) device auto-detect from packet-size absence → replaced with positive sub-header **tag-byte** signal (offset 13: 0x11=GCV-10, 0x12=GCV-20; verified 100% across both captures, every channel). Decides on the first eb07 packet; ClearVu-only stream now identifies correctly (644/647B → right gen). Dropped the size heuristic + `_detect_sizes`. `node.py:_detect_generation`, `decode.py:GEN_BY_TAG`
+- [x] (suggestion) `echo_layer` `find(FH)` now starts at CHANNEL_OFFSET (coincidental header pattern can't shift the start)
+- [x] (suggestion) `echo_layer` accepts either SH/SHS as first-layer terminator (not coupled to opener)
+- [x] (suggestion) `device` param validated at startup (warn + fall back to auto on unknown value)
+- Tests: 37 pass (3 new tag-detection tests, decode + node-method); lint clean. Integration-verified on both pcaps incl. ClearVu-only packets.
