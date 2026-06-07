@@ -110,10 +110,19 @@ Head `d1fb24e` is the /import-field-changes fast-forward adding the Marine Netwo
 proxy; Copilot R4 re-reviewed it.
 
 ### Findings
-- [ ] (must-fix, Copilot R4) unused `import struct` fails ament_flake8 (test/test_flake8.py lints tools/) — `garmin_sidescan/tools/garmin_marine_network_proxy.py:39`
-- [ ] (should-fix, Copilot R4; recurring from stale `5192cab`) `package.xml` missing `rcl_interfaces` exec_depend (node.py:25 imports SetParametersResult) — `garmin_sidescan/package.xml`
-- [ ] (should-fix, Copilot R4) `range_m` param: negative/NaN fall through `p.value > 0` guard to successful=True — silently accepted, never applied — `garmin_sidescan/garmin_sidescan/node.py:627`
-- [ ] (should-fix, Copilot R4) `_on_param_set` returns successful=True for unhandled names; startup-static params (sv_min/sv_max/auto_resume/channel maps) report success with no effect — reject known-static explicitly, not blanket — `garmin_sidescan/garmin_sidescan/node.py:657`
+- [x] (must-fix, Copilot R4) unused `import struct` fails ament_flake8 (test/test_flake8.py lints tools/) — `garmin_sidescan/tools/garmin_marine_network_proxy.py:39` (fixed: removed import. Re-run surfaced a second latent lint in the field-imported proxy — `Q000` double-quotes at `:192` — also fixed)
+- [x] (should-fix, Copilot R4; recurring from stale `5192cab`) `package.xml` missing `rcl_interfaces` exec_depend (node.py:25 imports SetParametersResult) — `garmin_sidescan/package.xml` (fixed: added `<exec_depend>rcl_interfaces</exec_depend>`)
+- [x] (should-fix, Copilot R4) `range_m` param: negative/NaN fall through `p.value > 0` guard to successful=True — silently accepted, never applied — `garmin_sidescan/garmin_sidescan/node.py:627` (fixed: branch now entered for any `range_m`; rejects non-finite via `math.isfinite` + out-of-range via `range_in_bounds` with `successful=False`)
+- [x] (should-fix, Copilot R4) `_on_param_set` returns successful=True for unhandled names; startup-static params (sv_min/sv_max/auto_resume/channel maps) report success with no effect — reject known-static explicitly, not blanket — `garmin_sidescan/garmin_sidescan/node.py:657` (fixed: declared-but-static params rejected with `successful=False`; `use_sim_time` + undeclared names left to default handling, so rclpy internals aren't rejected)
 
 ### False positives
 - none this round (prior frame_id-as-list FP from R3 not re-raised at head)
+
+### Resolution (fixes applied)
+**When**: 2026-06-07 10:00 -04:00 · **By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+- All 4 R4 findings addressed (callback registered after declarations, so
+  rejecting `range_m=0.0` at runtime can't break startup; verified at node.py:248).
+- `colcon test garmin_sidescan`: **24 tests, 0 failures** (ament_flake8/pep257 green).
+- No new unit tests added: `_on_param_set` needs an rclpy Node (the suite is
+  deliberately rclpy-free); its validation delegates to `range_in_bounds`
+  (already tested in `test_safety.py`) and `math.isfinite`.
