@@ -39,6 +39,12 @@ SH = bytes([174, 2, 172, 2])    # ae 02 ac 02  full-packet later-layer header
 SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
 
 CHANNEL_OFFSET = 12
+# Sub-header value-width tag at payload offset 13 distinguishes the device
+# generation: 0x11 (GCV-10, 1-byte value) vs 0x12 (GCV-20, 2-byte value).
+# Verified 100% consistent across both captures, every channel -- a positive,
+# size-independent signal on every packet (unlike packet-size heuristics).
+GEN_TAG_OFFSET = 13
+GEN_BY_TAG = {0x11: 'gcv10', 0x12: 'gcv20'}
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data
 # A real scan line is ~2048 bins; cap the accumulator so a degenerate stream
 # (one channel forever, no markers) can't grow it without bound.
@@ -76,15 +82,19 @@ def echo_layer(payload):
     high byte would be a correct but 8-bit-truncated view.  Returns ``b''`` if
     no first-layer header is present.
     """
-    f = payload.find(FH)
-    sh = SH
+    # Search past the fixed prefix/sub-header so a coincidental signature byte
+    # pattern in the eb07 magic / length / sub-header can't shift the start.
+    f = payload.find(FH, CHANNEL_OFFSET)
     if f < 0:
-        f = payload.find(FHS)
-        sh = SHS
+        f = payload.find(FHS, CHANNEL_OFFSET)
     if f < 0:
         return b''
-    s = payload.find(sh, f + 4)
-    first = payload[f + 4:(s if s >= 0 else len(payload))]
+    # The first layer ends at the next layer header of EITHER form -- a full
+    # first layer can be followed by a short later header (and vice versa), so
+    # don't couple the terminator to the opener type.
+    ends = [p for p in (payload.find(SH, f + 4), payload.find(SHS, f + 4)) if p >= 0]
+    s = min(ends) if ends else len(payload)
+    first = payload[f + 4:s]
     return first[:len(first) // 2 * 2]
 
 

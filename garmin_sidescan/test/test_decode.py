@@ -9,7 +9,8 @@ genuine bytes with no scapy/numpy runtime dependency.
 import os
 import struct
 
-from garmin_sidescan.decode import dark_layer, echo_layer, FH, PingAssembler, SH
+from garmin_sidescan.decode import (
+    dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, PingAssembler, SH)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 
@@ -104,6 +105,17 @@ def test_echo_layer_runs_to_end_without_sh():
 
 def test_echo_layer_empty_without_first_header():
     assert echo_layer(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) == b''
+
+
+def test_generation_tag_byte_discriminates():
+    # sub-header value-width tag at offset 13: 0x11=GCV-10, 0x12=GCV-20
+    g10 = _gcv20_packet(0, bytes(8))
+    g20 = _gcv20_packet(0, bytes(8))
+    g10 = g10[:GEN_TAG_OFFSET] + bytes([0x11]) + g10[GEN_TAG_OFFSET + 1:]
+    g20 = g20[:GEN_TAG_OFFSET] + bytes([0x12]) + g20[GEN_TAG_OFFSET + 1:]
+    assert GEN_BY_TAG.get(g10[GEN_TAG_OFFSET]) == 'gcv10'
+    assert GEN_BY_TAG.get(g20[GEN_TAG_OFFSET]) == 'gcv20'
+    assert GEN_BY_TAG.get(0x99) is None          # unknown tag -> undecided
 
 
 def test_assembler_uses_supplied_extractor():

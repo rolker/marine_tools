@@ -38,7 +38,8 @@ from .commands import (
     TRANSMIT_OFF,
     TRANSMIT_ON,
 )
-from .decode import dark_layer, EB07, echo_layer, MIN_DATA_LEN, PingAssembler
+from .decode import (
+    dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET, MIN_DATA_LEN, PingAssembler)
 
 SIDES = ('port', 'stbd', 'clearvu')
 
@@ -177,6 +178,11 @@ class GarminSidescanNode(Node):
         }
         self._sample_rate = float(self._p('sample_rate_hz'))
         self._device = str(self._p('device')).lower()
+        if self._device not in ('auto', 'gcv20', 'gcv10'):
+            self.get_logger().warn(
+                f"device='{self._device}' is not auto/gcv20/gcv10; "
+                'falling back to auto-detect')
+            self._device = 'auto'
         self._debug_raw = bool(self._p('debug_raw'))
         self._sv_topic = self._p('sound_speed_topic')
         self._sv_field = self._p('sound_speed_field')
@@ -214,7 +220,6 @@ class GarminSidescanNode(Node):
         # for an explicit device; after geometry detection for 'auto').
         self._assembler = None
         self._detected_gen = None
-        self._detect_sizes = []
         self._geom_warned = False
         # Sample format, set when the assembler is built from the generation
         # (GCV-20 = 16-bit uint16-LE, GCV-10 = 8-bit). Defaults are harmless
@@ -568,7 +573,7 @@ class GarminSidescanNode(Node):
                 # Full UDP payload (magic + channel + all layers) so the bag is
                 # re-decodable offline. Published as-is; bag timestamps give timing.
                 self._pub_raw.publish(UInt8MultiArray(data=payload))
-            detected = self._observe_geometry(payload)
+            detected = self._detect_generation(payload)
             if self._assembler is None:
                 gen = self._device if self._device in ('gcv20', 'gcv10') else detected
                 if gen is None:
@@ -606,23 +611,21 @@ class GarminSidescanNode(Node):
             f'{8 * self._bytes_per_sample}-bit)')
         return PingAssembler(extractor)
 
-    def _observe_geometry(self, payload):
+    def _detect_generation(self, payload):
         """
-        Track imagery packet sizes; return the detected generation or None.
+        Return the device generation from one imagery payload, or None.
 
-        GCV-10 emits >1000-byte sidescan packets; GCV-20 never exceeds 953.
-        Decide GCV-10 on the first big packet, GCV-20 after enough small-only
-        packets (~6 pings). ClearVu packets are small on both, so detection
-        keys on the maximum size seen, not any single packet.
+        Keys on the sub-header value-width tag at offset ``GEN_TAG_OFFSET``:
+        ``0x11`` (GCV-10) vs ``0x12`` (GCV-20). Verified 100% consistent across
+        thousands of packets on every channel (SideVu + ClearVu) in both
+        captures -- a positive, size-independent signal present on *every*
+        packet, unlike packet-size heuristics which a ClearVu-only or partial
+        stream can fool. ``MIN_DATA_LEN`` guarantees the tag byte is in bounds.
         """
         if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
             return self._detected_gen
         if self._detected_gen is None:
-            self._detect_sizes.append(len(payload))
-            if max(self._detect_sizes) > 1000:
-                self._detected_gen = 'gcv10'
-            elif len(self._detect_sizes) >= 40:
-                self._detected_gen = 'gcv20'
+            self._detected_gen = GEN_BY_TAG.get(payload[GEN_TAG_OFFSET])
         return self._detected_gen
 
     def _emit_ping(self, ch, samples, stamp):

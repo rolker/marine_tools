@@ -183,3 +183,31 @@ def test_range_send_failure_rejects_without_mirroring():
     assert result.successful is False
     assert len(node.sends) == 1          # attempted
     assert 'range' not in node._controls  # but not mirrored on failure
+
+
+# ----- device auto-detect by sub-header tag byte -------------------------
+
+def _img_packet(tag, length=40):
+    # eb07 + 4-byte len + sub-header (value-width tag at offset 13), padded
+    head = bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([0x0e, 1, 3, 9, 0, tag])
+    return head + bytes(max(0, length - len(head)))
+
+
+def _detect(node, payload):
+    return GarminSidescanNode._detect_generation(node, payload)
+
+
+def test_detect_generation_by_tag_byte():
+    node = types.SimpleNamespace(_detected_gen=None)
+    assert _detect(node, _img_packet(0x12)) == 'gcv20'
+    assert _detect(node, _img_packet(0x11)) == 'gcv20'   # decide-once: stays gcv20
+    node = types.SimpleNamespace(_detected_gen=None)
+    assert _detect(node, _img_packet(0x11)) == 'gcv10'
+
+
+def test_detect_generation_undecided_cases():
+    node = types.SimpleNamespace(_detected_gen=None)
+    assert _detect(node, _img_packet(0x99)) is None        # unknown tag
+    assert _detect(node, b'\xeb\x07' + bytes(8)) is None    # too short for tag
+    assert _detect(node, b'\xd8\x07' + bytes(40)) is None   # not an eb07 packet
+    assert node._detected_gen is None                       # still undecided
