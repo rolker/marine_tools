@@ -94,3 +94,26 @@ issue: 15
 
 ### False positives
 - (Copilot R3) launch.py frame_id passed as list "becomes a list not a string" — launch_ros concatenates a substitution list into a single string parameter (documented frame-prefix idiom); production bizzyboat_project11/launch/sound_speed_launch.py:66 uses the identical pattern. rclpy receives a string.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-07 09:53 -04:00
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #17 at `d1fb24e`
+**Sources**: 1 at head (Copilot R4 @ `d1fb24e`) + prior Integrated Reviews (R1 `39e9bec`, R2 `94cd1a2`, R3 `d2c5c78`)
+**Cross-source confirmations**: 0 at `d1fb24e` (no Local Review run against the field-imported head)
+**CI**: no build/test CI on repo; local colcon test (ament_flake8/pep257) is the gate — finding 1 fails it
+
+Context: R1–R3 are stale and resolved (confirmed in code + rolker's PR comments).
+Head `d1fb24e` is the /import-field-changes fast-forward adding the Marine Network
+proxy; Copilot R4 re-reviewed it.
+
+### Findings
+- [ ] (must-fix, Copilot R4) unused `import struct` fails ament_flake8 (test/test_flake8.py lints tools/) — `garmin_sidescan/tools/garmin_marine_network_proxy.py:39`
+- [ ] (should-fix, Copilot R4; recurring from stale `5192cab`) `package.xml` missing `rcl_interfaces` exec_depend (node.py:25 imports SetParametersResult) — `garmin_sidescan/package.xml`
+- [ ] (should-fix, Copilot R4) `range_m` param: negative/NaN fall through `p.value > 0` guard to successful=True — silently accepted, never applied — `garmin_sidescan/garmin_sidescan/node.py:627`
+- [ ] (should-fix, Copilot R4) `_on_param_set` returns successful=True for unhandled names; startup-static params (sv_min/sv_max/auto_resume/channel maps) report success with no effect — reject known-static explicitly, not blanket — `garmin_sidescan/garmin_sidescan/node.py:657`
+
+### False positives
+- none this round (prior frame_id-as-list FP from R3 not re-raised at head)
