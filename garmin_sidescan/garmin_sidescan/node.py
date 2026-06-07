@@ -4,9 +4,10 @@ Garmin GCV-10/20 sidescan sonar driver node.
 Receives the GCV imagery multicast, decodes per-ping sidescan scan lines (see
 :mod:`garmin_sidescan.decode`) and publishes them as
 ``marine_acoustic_msgs/RawSonarImage`` (one publisher per channel, single
-beam), plus an optional rolling-waterfall ``sensor_msgs/Image`` for operator
-viewing.  Controls transmit on/off and range over the GCV TCP command port
-(see :mod:`garmin_sidescan.commands`).
+beam).  Controls transmit on/off and range over the GCV TCP command port
+(see :mod:`garmin_sidescan.commands`).  Rendering is left to downstream tools
+(``rqt_sonar_waterfall``); a ``debug_raw`` parameter can publish the raw UDP
+payloads on ``~/debug/raw`` for offline re-decode.
 
 Safety: the node asserts transmit OFF at startup and never pings without an
 explicit command.  While transmitting, a sound-speed watchdog stops the sonar
@@ -14,7 +15,6 @@ if the sound speed reads NaN / 0 / out-of-water for ``sv_timeout`` seconds, so
 a dry transducer cannot overheat.  The whole mechanism has a dynamic master
 switch (``sound_speed_safety_enabled``).
 """
-from collections import deque
 import math
 import socket
 import threading
@@ -27,8 +27,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
-from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import SetBool
 
 from .commands import (
@@ -39,7 +38,7 @@ from .commands import (
     TRANSMIT_OFF,
     TRANSMIT_ON,
 )
-from .decode import PingAssembler
+from .decode import dark_layer, EB07, echo_layer, MIN_DATA_LEN, PingAssembler
 
 SIDES = ('port', 'stbd', 'clearvu')
 
@@ -121,11 +120,16 @@ class GarminSidescanNode(Node):
         self.declare_parameter('freq_clearvu_hz', 0.0)
         self.declare_parameter('sample_rate_hz', 0.0)
 
-        # imagery rendering
-        self.declare_parameter('range_bins', 0)                # 0 = lock from first ping
-        self.declare_parameter('waterfall_height', 600)
-        self.declare_parameter('waterfall_rate_hz', 4.0)
-        self.declare_parameter('publish_waterfall', True)
+        # device generation. 'auto' detects by packet geometry (GCV-10 emits
+        # >1000-byte imagery packets; GCV-20 never exceeds 953), which picks the
+        # right per-packet echo extractor. 'gcv20'/'gcv10' force it. A wrong
+        # choice silently yields a wrong-layer (gibberish) image -- no crash --
+        # so auto-detect is the default and a mismatch is warned.
+        self.declare_parameter('device', 'auto')
+        # Debug: when true, publish every raw UDP payload on ~/debug/raw
+        # (std_msgs/UInt8MultiArray) so `ros2 bag record` captures fully
+        # re-decodable pings. Dynamically settable at runtime.
+        self.declare_parameter('debug_raw', False)
 
         # transmit / safety
         self.declare_parameter('transmit_on_startup', False)
@@ -172,9 +176,8 @@ class GarminSidescanNode(Node):
             'clearvu': float(self._p('freq_clearvu_hz')),
         }
         self._sample_rate = float(self._p('sample_rate_hz'))
-        self._range_bins = int(self._p('range_bins'))
-        self._wf_h = int(self._p('waterfall_height'))
-        self._publish_wf = bool(self._p('publish_waterfall'))
+        self._device = str(self._p('device')).lower()
+        self._debug_raw = bool(self._p('debug_raw'))
         self._sv_topic = self._p('sound_speed_topic')
         self._sv_field = self._p('sound_speed_field')
         self._sv_min = float(self._p('sv_min'))
@@ -206,10 +209,13 @@ class GarminSidescanNode(Node):
             'tvg': 'off',
             'interference': 'off',
         }
-        self._assembler = PingAssembler()
-        self._wf = {'port': deque(maxlen=self._wf_h), 'stbd': deque(maxlen=self._wf_h)}
-        self._wf_lock = threading.Lock()
-        self._width = {}
+        # The per-packet sample extractor depends on the device generation, so
+        # the assembler is built lazily once the generation is known (immediately
+        # for an explicit device; after geometry detection for 'auto').
+        self._assembler = None
+        self._detected_gen = None
+        self._detect_sizes = []
+        self._geom_warned = False
         self._running = True
 
         # publishers
@@ -221,10 +227,8 @@ class GarminSidescanNode(Node):
             'stbd': self.create_publisher(RawSonarImage, '~/sonar_image_starboard', img_qos),
             'clearvu': self.create_publisher(RawSonarImage, '~/sonar_image_clearvu', img_qos),
         }
-        self._pub_wf = {
-            'port': self.create_publisher(Image, '~/waterfall_port', img_qos),
-            'stbd': self.create_publisher(Image, '~/waterfall_starboard', img_qos),
-        }
+        # Raw-payload debug capture (only published when debug_raw is true).
+        self._pub_raw = self.create_publisher(UInt8MultiArray, '~/debug/raw', img_qos)
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
         self._pub_state = self.create_publisher(RadarControlSet, '~/state', latched)
@@ -256,9 +260,6 @@ class GarminSidescanNode(Node):
         self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
         self._rx_thread.start()
         self.create_timer(0.5, self._watchdog)
-        if self._publish_wf:
-            rate = max(0.5, float(self._p('waterfall_rate_hz')))
-            self.create_timer(1.0 / rate, self._publish_waterfalls)
         self.create_timer(2.0, self._publish_status)
 
         self._publish_tx_state()
@@ -558,13 +559,55 @@ class GarminSidescanNode(Node):
                 continue
             if self._filter_src and addr[0] != self._gcv_ip:
                 continue
+            if self._debug_raw:
+                # Full UDP payload (magic + channel + all layers) so the bag is
+                # re-decodable offline. Published as-is; bag timestamps give timing.
+                self._pub_raw.publish(UInt8MultiArray(data=payload))
+            detected = self._observe_geometry(payload)
+            if self._assembler is None:
+                gen = self._device if self._device in ('gcv20', 'gcv10') else detected
+                if gen is None:
+                    continue                       # auto: not enough packets yet
+                self._assembler = self._make_assembler(gen)
+            elif (self._device in ('gcv20', 'gcv10') and detected
+                  and detected != self._device and not self._geom_warned):
+                self._geom_warned = True
+                self.get_logger().warn(
+                    f'device={self._device} but packet geometry looks like '
+                    f'{detected}; imagery decode is likely wrong')
             now = self.get_clock().now()
             for ch, samples, stamp in self._assembler.feed(payload, now):
                 self._emit_ping(ch, samples, stamp)
-        for ch, samples, stamp in self._assembler.flush():
-            self._emit_ping(ch, samples, stamp)
+        if self._assembler is not None:
+            for ch, samples, stamp in self._assembler.flush():
+                self._emit_ping(ch, samples, stamp)
         if sock is not None:
             sock.close()
+
+    def _make_assembler(self, gen):
+        extractor = echo_layer if gen == 'gcv20' else dark_layer
+        self.get_logger().info(
+            f'imagery decode: {gen} ({extractor.__name__})')
+        return PingAssembler(extractor)
+
+    def _observe_geometry(self, payload):
+        """
+        Track imagery packet sizes; return the detected generation or None.
+
+        GCV-10 emits >1000-byte sidescan packets; GCV-20 never exceeds 953.
+        Decide GCV-10 on the first big packet, GCV-20 after enough small-only
+        packets (~6 pings). ClearVu packets are small on both, so detection
+        keys on the maximum size seen, not any single packet.
+        """
+        if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
+            return self._detected_gen
+        if self._detected_gen is None:
+            self._detect_sizes.append(len(payload))
+            if max(self._detect_sizes) > 1000:
+                self._detected_gen = 'gcv10'
+            elif len(self._detect_sizes) >= 40:
+                self._detected_gen = 'gcv20'
+        return self._detected_gen
 
     def _emit_ping(self, ch, samples, stamp):
         side = self._chan_side.get(ch)
@@ -572,22 +615,25 @@ class GarminSidescanNode(Node):
             return
         self._ping_count[side] += 1
         self._pub_sonar[side].publish(self._make_sonar_msg(side, samples, stamp))
-        if self._publish_wf and side in self._wf:
-            width = self._width.get(side)
-            if width is None:
-                width = self._range_bins if self._range_bins > 0 else len(samples)
-                self._width[side] = width
-            row = samples[:width] + bytes(max(0, width - len(samples)))
-            with self._wf_lock:
-                self._wf[side].append(row)
 
     def _make_sonar_msg(self, side, samples, stamp):
         msg = RawSonarImage()
         msg.header.stamp = stamp.to_msg()
         msg.header.frame_id = self._frame_id
         msg.ping_info.frequency = self._freq[side]
-        msg.ping_info.sound_speed = self._current_sound_speed()
-        msg.sample_rate = self._sample_rate
+        sv = self._current_sound_speed()
+        msg.ping_info.sound_speed = sv
+        # Derive sample_rate so a consumer recovers range_max = sv*bins/(2*rate)
+        # = the commanded range. The GCV carries no rate/range in the payload,
+        # but the driver knows the range it commanded (mirrored in _controls).
+        # Only when we actually commanded a range (>0); else leave the manual
+        # override (default 0 = "unavailable", per RawSonarImage convention).
+        range_m = float(self._controls.get('range') or 0.0)
+        bins = len(samples)
+        if range_m > 0.0 and sv > 0.0 and bins > 0:
+            msg.sample_rate = float(sv) * bins / (2.0 * range_m)
+        else:
+            msg.sample_rate = self._sample_rate
         msg.samples_per_beam = len(samples)
         msg.sample0 = 0
         msg.tx_delays = [0.0]
@@ -598,25 +644,6 @@ class GarminSidescanNode(Node):
         msg.image.beam_count = 1
         msg.image.data = bytes(samples)
         return msg
-
-    def _publish_waterfalls(self):
-        stamp = self.get_clock().now().to_msg()
-        for side in ('port', 'stbd'):
-            with self._wf_lock:
-                rows = list(self._wf[side])
-                width = self._width.get(side)
-            if not rows or not width:
-                continue
-            img = Image()
-            img.header.stamp = stamp
-            img.header.frame_id = self._frame_id
-            img.height = len(rows)
-            img.width = width
-            img.encoding = 'mono8'
-            img.is_bigendian = 0
-            img.step = width
-            img.data = b''.join(rows)
-            self._pub_wf[side].publish(img)
 
     def _publish_status(self):
         age = self._sv_age()
@@ -655,7 +682,7 @@ class GarminSidescanNode(Node):
                         reason=(f'range {meters} m invalid or outside '
                                 f'{self._range_min}-{self._range_max} m'))
                 range_request = meters
-            elif p.name == 'sound_speed_safety_enabled':
+            elif p.name in ('sound_speed_safety_enabled', 'debug_raw'):
                 pass  # always acceptable; applied below
             elif p.name != 'use_sim_time' and self.has_parameter(p.name):
                 # Every other declared parameter is read once at startup. Silently
@@ -693,6 +720,11 @@ class GarminSidescanNode(Node):
                     self.get_logger().warn(
                         'sound-speed safety mechanism DISABLED (watchdog auto-stop and '
                         'transmit guard off - dry-transducer protection is not active)')
+            elif p.name == 'debug_raw':
+                self._debug_raw = bool(p.value)
+                self.get_logger().info(
+                    'debug_raw ON - publishing raw payloads on ~/debug/raw'
+                    if self._debug_raw else 'debug_raw off')
         return SetParametersResult(successful=True)
 
     def destroy_node(self):

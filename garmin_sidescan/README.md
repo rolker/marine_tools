@@ -17,7 +17,7 @@ Published (relative to the node namespace):
 | `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | SideVü port, single beam, `DTYPE_UINT8` |
 | `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | SideVü starboard |
 | `sonar_image_clearvu` | `marine_acoustic_msgs/RawSonarImage` | ClearVü down-look |
-| `waterfall_port` / `waterfall_starboard` | `sensor_msgs/Image` (`mono8`) | rolling waterfall for viewing (optional) |
+| `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
 
@@ -95,7 +95,8 @@ imagery stream because they are not reliably present there:
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
 | `expose_gcv10_controls` | `true` | include TVG / interference controls |
-| `waterfall_height` | `600` | rolling waterfall rows |
+| `device` | `auto` | `auto` detects GCV-10 vs GCV-20 by packet geometry (picks the echo extractor); `gcv20`/`gcv10` force it |
+| `debug_raw` | `false` | publish raw UDP payloads on `debug/raw` for offline re-decode; settable at runtime |
 
 ## Run
 
