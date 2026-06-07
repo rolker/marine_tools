@@ -1,0 +1,99 @@
+# CI for marine_tools. See ADR-0004/0005 (enforcement hierarchy) in the
+# workspace repo for the rationale behind the build+test+lint gate: a
+# framework-native per-repo check for fast feedback, backed by the workspace
+# `make build` integration gate.
+
+name: CI
+
+on:
+  push:
+    branches: [jazzy]
+  pull_request:
+    branches: [jazzy]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    container:
+      image: ros:jazzy-ros-core
+
+    steps:
+      - name: Update apt
+        run: apt-get update
+
+      - name: Install ros dev tools + git
+        run: DEBIAN_FRONTEND=noninteractive apt-get -y install ros-dev-tools git
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Init rosdep
+        run: |
+          if [ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then
+            rosdep init
+          fi
+
+      - name: Update rosdep
+        run: rosdep update
+
+      - name: Create workspace
+        run: mkdir -p ../ws/src && ln -s "$GITHUB_WORKSPACE" ../ws/src/marine_tools
+
+      # marine_tools packages depend on three interface packages that are source
+      # siblings, not rosdep/binary packages: marine_interfaces
+      # (unh_marine_autonomy), udp_bridge_interfaces (udp_bridge), and
+      # marine_radar_control_msgs (unh_marine_radar — used by garmin_sidescan).
+      # Clone each and prune to just the interface package so rosdep/colcon stay
+      # light (the parent repos carry heavy nav2/mavros/radar packages we don't
+      # need). The workspace `make build` is the full integration gate; this
+      # per-repo CI is the lighter-weight check.
+      - name: Clone source-sibling interface packages
+        run: |
+          set -e
+          clone_prune() {  # <repo-url> <branch> <dir> <keep-package-dir>
+            git clone --depth 1 -b "$2" "$1" "../ws/src/$3"
+            ( cd "../ws/src/$3" && \
+              find . -maxdepth 1 -mindepth 1 -type d \
+                ! -name "$4" ! -name '.git' -exec rm -rf {} + )
+          }
+          clone_prune https://github.com/rolker/unh_marine_autonomy.git jazzy \
+            unh_marine_autonomy marine_interfaces
+          clone_prune https://github.com/rolker/udp_bridge.git jazzy \
+            udp_bridge udp_bridge_interfaces
+          clone_prune https://github.com/rolker/unh_marine_radar.git jazzy \
+            unh_marine_radar marine_radar_control_msgs
+
+      - name: Install ROS dependencies
+        working-directory: ../ws
+        run: >
+          DEBIAN_FRONTEND=noninteractive
+          rosdep install --from-paths src --ignore-src -r -y
+
+      - name: Build
+        working-directory: ../ws
+        run: >
+          bash -c 'source /opt/ros/jazzy/setup.bash &&
+          colcon build --cmake-args -DBUILD_TESTING=ON'
+
+      # Test only this repo's packages (not the cloned interface siblings). The
+      # package list is derived from the repo path so newly added packages are
+      # covered automatically.
+      - name: Test
+        working-directory: ../ws
+        run: >
+          bash -c 'source /opt/ros/jazzy/setup.bash &&
+          source install/setup.bash &&
+          PKGS=$(colcon list --names-only --base-paths "$GITHUB_WORKSPACE" | tr "\n" " ") &&
+          echo "Testing packages: $PKGS" &&
+          colcon test --packages-select $PKGS
+          --event-handlers console_direct+
+          --return-code-on-test-failure'
+
+      - name: Test results
+        working-directory: ../ws
+        run: >
+          bash -c 'source /opt/ros/jazzy/setup.bash &&
+          colcon test-result --verbose'
+        if: always()
