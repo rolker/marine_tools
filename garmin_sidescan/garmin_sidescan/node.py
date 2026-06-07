@@ -136,7 +136,7 @@ class GarminSidescanNode(Node):
         self.declare_parameter('mcast_port', 50220)
         self.declare_parameter('iface_ip', '')                 # local NIC for the join
         self.declare_parameter('filter_src', True)
-        self.declare_parameter('frame_id', 'gcv_sonar')
+        self.declare_parameter('frame_id', 'garmin_sidescan')
 
         # channel map (GCV-20: 0=port 1=stbd 2=down; GCV-10 data: port=[3] stbd=[1])
         self.declare_parameter('port_channels', [0])
@@ -175,8 +175,8 @@ class GarminSidescanNode(Node):
 
         # sound-speed watchdog
         self.declare_parameter('sound_speed_safety_enabled', True)
-        self.declare_parameter('sound_speed_topic',
-                               '/bizzy/sensors/sound_speed/sound_speed')
+        # Generic default; a platform launch sets the absolute topic.
+        self.declare_parameter('sound_speed_topic', 'sound_speed')
         self.declare_parameter('sound_speed_type', 'marine_interfaces/msg/SoundSpeed')
         self.declare_parameter('sound_speed_field', 'sound_speed')
         self.declare_parameter('sv_min', 1400.0)

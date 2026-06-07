@@ -65,8 +65,8 @@ Published (relative to the node namespace):
 | `state` | `marine_radar_control_msgs/RadarControlSet` | latched operator-control set (CAMP renders it) |
 
 Subscribed:
-- the sound-speed topic (default `/bizzy/sensors/sound_speed/sound_speed`,
-  `marine_interfaces/SoundSpeed`).
+- the sound-speed topic (default `sound_speed`, `marine_interfaces/SoundSpeed`;
+  a platform launch sets the absolute path).
 - `change_state` (`marine_radar_control_msgs/RadarControlValue`) — operator
   control changes (`key`/`value`), same contract as the radar driver.
 
@@ -147,16 +147,23 @@ imagery stream because they are not reliably present there:
 
 ## Run
 
+`garmin_sidescan.launch.py` is a **generic example**: no namespace, neutral
+defaults. Override `gcv_ip` / `iface_ip` / `frame_id` for your host. A platform
+is expected to ship its own wrapper that sets the namespace, frame prefix, and
+the absolute sound-speed topic (the same split `sound_speed_bridge` uses:
+`aml_svs.launch.py` here vs. the boat's `sound_speed_launch.py`); topic paths
+below assume the bare example (node at `/garmin_sidescan`).
+
 ```bash
 ros2 launch garmin_sidescan garmin_sidescan.launch.py \
-    iface_ip:=<host Marine-Network IP>
+    gcv_ip:=<GCV IP> iface_ip:=<host Marine-Network IP>
 
 # transmit control
-ros2 service call /sensors/sidescan/garmin_sidescan/set_transmit \
+ros2 service call /garmin_sidescan/set_transmit \
     std_srvs/srv/SetBool "{data: true}"
 
 # set range
-ros2 param set /sensors/sidescan/garmin_sidescan range_m 12.0
+ros2 param set /garmin_sidescan range_m 12.0
 ```
 
 ## Status / follow-ups
