@@ -287,3 +287,24 @@ correct but 8-bit-truncated MSB view). Bench-verified on the GCV-20 bucket pcap:
 port/stbd 2096 bins, clearvu 2104, all decay near→far, ~16-bit range. 34 tests
 pass. (`829524c`) Open: whether the LSB is true precision vs dither — a wet-scene
 capture settles it; uint16 captures it faithfully either way.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-06-07 14:31 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-15 at `10786e4`
+**Mode**: pre-push
+**Depth**: Deep (new safety-critical sonar driver); reviewed delta = decode/node/tests since R5 (`bd6e5cb..HEAD`)
+**Must-fix**: 1 | **Suggestions**: 3
+**Specialists**: Static (clean) + Claude Adversarial + Copilot Adversarial; no plan (plan-drift skipped)
+
+### Findings
+- [ ] (must-fix, cross-confirmed: Claude Adv + Copilot Adv) device auto-detect decides `gcv20` from *absence* of a >1000B packet (40-count fallback) — a GCV-10 starting with only small packets (ClearVu-only / partial start) silently latches gcv20 -> wrong extractor+dtype, never re-evaluates. Fix: positive signal (>1000->gcv10, >900->gcv20, else wait) — `node.py:_observe_geometry`
+- [ ] (suggestion) `echo_layer` `find(FH)` scans from offset 0; a coincidental FH pattern in the header shifts extraction — start at CHANNEL_OFFSET — `decode.py:echo_layer`
+- [ ] (suggestion) `echo_layer` couples FH->SH / FHS->SHS; accept either SH/SHS terminator as insurance — `decode.py:echo_layer`
+- [ ] (suggestion) `device` param unvalidated; a typo silently falls to auto — validate + warn at startup — `node.py:__init__`
+
+### Verified clean (both adversarial passes)
+- cross-thread state (_assembler/_detected_gen/_sonar_dtype/_bytes_per_sample all rx-thread-only; _debug_raw/_controls GIL-atomic), uint16 alignment + is_bigendian, sample_rate divide-by-zero/NaN guards, _detect_sizes bounded, empty/short-payload handling.
