@@ -334,3 +334,20 @@ Corrects the earlier (wrong) rx_angle approach after reading the message spec + 
 - **Debug capture extended to all GCV streams**: `debug_raw` now also publishes `~/debug/raw_status` (:50050) and `~/debug/raw_config` (:51000) beside `~/debug/raw` (imagery), via a shared `_aux_loop` (same reconnect handling). A single wet-run bag is now fully re-decodable offline — including the depth field (still unverified, captured for later decode).
 - **`/diagnostics`** (`DiagnosticArray`, 1 Hz): imagery health (`imagery_diag_level` — OK in standby, ERROR if transmitting-but-stale; device gen/dtype/last-ping age/per-channel counts) + transmit/safety (WARNs on commanded-vs-device-reported tx mismatch — the device flag is parsed from the :50050 `8e03` frame, `byte[9]`, via `status_transmitting()` — or transmitting on stale SV).
 - package.xml: +`diagnostic_msgs`, −`sensor_msgs` (stale after self-waterfall removal). 42 tests pass, lint clean.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-07 17:01 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #17 at `cc76b1b`
+**Sources**: Copilot @ `cc76b1b` (1 review, 3 inline) + 11 stale prior rounds + local timeline
+**Cross-source confirmations**: 0
+**CI**: copilot-pull-request-reviewer success
+
+### Findings
+- none (no must-fix, no valid issues)
+
+### False positives
+- (Copilot) proxy double-quotes "can trigger Q000" — `tools/garmin_marine_network_proxy.py:45,148`: the outer literals are SINGLE-quoted f-strings; the double quotes are nested literals inside f-string expressions, which ament's flake8-quotes config does not flag. `ament_flake8` on the file is clean (exit 0) and test_flake8 passes.
+- (Copilot) "double-quoted separator" at `:203` — misread; the line has no double quotes (`' (+ re-multicast)'`).
