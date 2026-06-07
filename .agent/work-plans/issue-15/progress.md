@@ -271,3 +271,19 @@ Implemented after the output/params discussion with Roland:
 - `node.py`: `device` auto-detect (packet geometry, GCV-10 >1000B vs GCV-20 ≤953) selects the extractor, `gcv20`/`gcv10` force it, mismatch warned (wrong = silent gibberish, no crash); **self-rendered `~/waterfall_*` removed** (Roland: doesn't belong — rendering is rqt_sonar_waterfall's job; dropped waterfall_height/_rate_hz/publish_waterfall/range_bins params); **`~/debug/raw`** (UInt8MultiArray) gated by runtime-settable **`debug_raw`** param publishes every raw UDP payload so a bag is fully re-decodable offline (kills the lossy-bag problem for the next wet run); `sample_rate` derived from commanded range. README updated. (`1ad6175`)
 - Tests: 33 pass, lint clean. Integration-checked: committed `echo_layer`+`PingAssembler` decode the GCV-20 bench pcap to decaying port/stbd (~2096 bins, symmetric) + clearvu (~2104).
 - STILL bench-validated only — the wet-capture seafloor confirmation is now trivial to obtain: set `debug_raw:=true`, `ros2 bag record …/debug/raw` on the next wet GCV-20 run, then re-decode offline. No tcpdump needed.
+
+### C1 follow-up: even stream identified → GCV-20 echo is 16-bit (2026-06-07)
+The "even companion stream" is NOT a separate product — it's the **low byte (LSB)
+of a 16-bit little-endian sample**. Raw bytes (not averages) show the odd stream
+is smooth (jaggedness ~6) = the echo MSB, the even stream is full-range uniform
+(jaggedness ~88) = the LSB; reconstructing layer0 as uint16-LE gives a smooth,
+coherent high-dynamic-range signal (e.g. `[17399,17929,18410,...]`, max ~62000,
+with real features). (Earlier "even ≈ flat 127" was an averaging artifact.)
+
+So `echo_layer` now returns the first layer as raw uint16-LE bytes (even-trimmed)
+and the node publishes `DTYPE_UINT16` for GCV-20 (UINT8 for GCV-10) — dropping the
+de-interleave and keeping full dynamic range (the prior odd-only decode was a
+correct but 8-bit-truncated MSB view). Bench-verified on the GCV-20 bucket pcap:
+port/stbd 2096 bins, clearvu 2104, all decay near→far, ~16-bit range. 34 tests
+pass. (`829524c`) Open: whether the LSB is true precision vs dither — a wet-scene
+capture settles it; uint16 captures it faithfully either way.
