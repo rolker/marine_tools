@@ -264,3 +264,10 @@ sound_speed from SV topic, bins from len(samples)). Also restore the dropped cle
 Status: GCV-20 decode = bench-validated (decay signature vs GCV-10 ref); pending seafloor
 confirmation on a wet capture. Driver patch deferred to a discuss-then-implement step
 (output/params review with Roland first).
+
+### C1 driver implementation (2026-06-07) — landed on PR #17
+Implemented after the output/params discussion with Roland:
+- `decode.py`: `echo_layer()` (GCV-20: per-packet FH-layer odd bytes) added; `dark_layer()` kept (GCV-10); `PingAssembler(extractor)` now pluggable. (`f81331b`)
+- `node.py`: `device` auto-detect (packet geometry, GCV-10 >1000B vs GCV-20 ≤953) selects the extractor, `gcv20`/`gcv10` force it, mismatch warned (wrong = silent gibberish, no crash); **self-rendered `~/waterfall_*` removed** (Roland: doesn't belong — rendering is rqt_sonar_waterfall's job; dropped waterfall_height/_rate_hz/publish_waterfall/range_bins params); **`~/debug/raw`** (UInt8MultiArray) gated by runtime-settable **`debug_raw`** param publishes every raw UDP payload so a bag is fully re-decodable offline (kills the lossy-bag problem for the next wet run); `sample_rate` derived from commanded range. README updated. (`1ad6175`)
+- Tests: 33 pass, lint clean. Integration-checked: committed `echo_layer`+`PingAssembler` decode the GCV-20 bench pcap to decaying port/stbd (~2096 bins, symmetric) + clearvu (~2104).
+- STILL bench-validated only — the wet-capture seafloor confirmation is now trivial to obtain: set `debug_raw:=true`, `ros2 bag record …/debug/raw` on the next wet GCV-20 run, then re-decode offline. No tcpdump needed.
