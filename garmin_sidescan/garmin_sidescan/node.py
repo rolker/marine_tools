@@ -39,7 +39,8 @@ from .commands import (
     TRANSMIT_ON,
 )
 from .decode import (
-    dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET, MIN_DATA_LEN, PingAssembler)
+    CHANNEL_OFFSET, dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET,
+    is_water_column, MIN_DATA_LEN, PingAssembler)
 
 SIDES = ('port', 'stbd', 'clearvu')
 
@@ -120,6 +121,10 @@ class GarminSidescanNode(Node):
         self.declare_parameter('freq_stbd_hz', 0.0)
         self.declare_parameter('freq_clearvu_hz', 0.0)
         self.declare_parameter('sample_rate_hz', 0.0)
+        # Beam look-angle published in rx_angles/tx_angles so consumers can tell
+        # stream geometry from the message, not just the topic: +angle = port,
+        # -angle = starboard, 0 = ClearVu down-look (water column).
+        self.declare_parameter('beam_angle_deg', 90.0)
 
         # device generation. 'auto' detects by packet geometry (GCV-10 emits
         # >1000-byte imagery packets; GCV-20 never exceeds 953), which picks the
@@ -177,6 +182,8 @@ class GarminSidescanNode(Node):
             'clearvu': float(self._p('freq_clearvu_hz')),
         }
         self._sample_rate = float(self._p('sample_rate_hz'))
+        self._beam_angle = math.radians(float(self._p('beam_angle_deg')))
+        self._chan_beamtype = {}      # ch -> 'sidescan'|'clearvu' from pl[8]
         self._device = str(self._p('device')).lower()
         if self._device not in ('auto', 'gcv20', 'gcv10'):
             self.get_logger().warn(
@@ -574,6 +581,7 @@ class GarminSidescanNode(Node):
                 # re-decodable offline. Published as-is; bag timestamps give timing.
                 self._pub_raw.publish(UInt8MultiArray(data=payload))
             detected = self._detect_generation(payload)
+            self._classify_beam(payload)
             if self._assembler is None:
                 gen = self._device if self._device in ('gcv20', 'gcv10') else detected
                 if gen is None:
@@ -628,6 +636,41 @@ class GarminSidescanNode(Node):
             self._detected_gen = GEN_BY_TAG.get(payload[GEN_TAG_OFFSET])
         return self._detected_gen
 
+    def _classify_beam(self, payload):
+        """
+        Record each channel's beam type and warn on a channel-map mismatch.
+
+        The intrinsic beam type (ClearVu vs SideVu, from the render-layer byte)
+        of the down-look "water column" beam is identifiable from the stream
+        itself; this catches a mis-configured channel map (e.g. a channel
+        routed to a SideVu topic that is actually the ClearVu beam) without
+        relying on the unit-specific channel numbers.
+        """
+        if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
+            return
+        ch = payload[CHANNEL_OFFSET]
+        if ch in self._chan_beamtype:
+            return
+        observed = 'clearvu' if is_water_column(payload) else 'sidescan'
+        self._chan_beamtype[ch] = observed
+        side = self._chan_side.get(ch)
+        if side is None:
+            return
+        configured = 'clearvu' if side == 'clearvu' else 'sidescan'
+        if observed != configured:
+            self.get_logger().warn(
+                f'channel {ch} is mapped to {side} ({configured}) but the '
+                f'stream reports {observed} (render-layer byte); check the '
+                f'port/stbd/clearvu channel map')
+
+    def _beam_angle_for(self, side):
+        # +angle = port, -angle = starboard, 0 = ClearVu down-look.
+        if side == 'port':
+            return self._beam_angle
+        if side == 'stbd':
+            return -self._beam_angle
+        return 0.0
+
     def _emit_ping(self, ch, samples, stamp):
         side = self._chan_side.get(ch)
         if side is None or not samples:
@@ -655,9 +698,12 @@ class GarminSidescanNode(Node):
             msg.sample_rate = self._sample_rate
         msg.samples_per_beam = bins
         msg.sample0 = 0
+        # Beam look-angle marks the stream geometry in the message itself:
+        # +beam_angle = port, -beam_angle = starboard, 0 = ClearVu down-look.
+        angle = self._beam_angle_for(side)
         msg.tx_delays = [0.0]
-        msg.tx_angles = [0.0]
-        msg.rx_angles = [0.0]
+        msg.tx_angles = [angle]
+        msg.rx_angles = [angle]
         msg.image.is_bigendian = False        # GCV samples are little-endian
         msg.image.dtype = self._sonar_dtype
         msg.image.beam_count = 1

@@ -39,6 +39,12 @@ SH = bytes([174, 2, 172, 2])    # ae 02 ac 02  full-packet later-layer header
 SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
 
 CHANNEL_OFFSET = 12
+# Render-layer byte at offset 8 also encodes the beam TYPE: the ClearVu
+# down-look ("water column") beam is 0x0d on both generations, while SideVu
+# (sidescan) is 0x0e (GCV-20) / 0x0f (GCV-10). So the down-look stream is
+# identifiable intrinsically, independent of channel number or packet size.
+LAYER_OFFSET = 8
+CLEARVU_LAYER = 0x0d
 # Sub-header value-width tag at payload offset 13 distinguishes the device
 # generation: 0x11 (GCV-10, 1-byte value) vs 0x12 (GCV-20, 2-byte value).
 # Verified 100% consistent across both captures, every channel -- a positive,
@@ -96,6 +102,20 @@ def echo_layer(payload):
     s = min(ends) if ends else len(payload)
     first = payload[f + 4:s]
     return first[:len(first) // 2 * 2]
+
+
+def is_water_column(payload):
+    """
+    Return True if this imagery payload is the ClearVu (down-look) beam.
+
+    Identified by the render-layer byte at ``LAYER_OFFSET`` being
+    ``CLEARVU_LAYER`` (0x0d) -- the same on both generations, so it tells the
+    down-look stream from the side-scan streams without relying on the channel
+    number or packet size.  Does not distinguish port from starboard (both
+    SideVu sides share the non-ClearVu layer byte); use the channel map for
+    that.
+    """
+    return len(payload) > LAYER_OFFSET and payload[LAYER_OFFSET] == CLEARVU_LAYER
 
 
 class PingAssembler:

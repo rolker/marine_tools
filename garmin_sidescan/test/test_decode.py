@@ -10,7 +10,8 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, PingAssembler, SH)
+    dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, is_water_column,
+    PingAssembler, SH)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 
@@ -116,6 +117,18 @@ def test_generation_tag_byte_discriminates():
     assert GEN_BY_TAG.get(g10[GEN_TAG_OFFSET]) == 'gcv10'
     assert GEN_BY_TAG.get(g20[GEN_TAG_OFFSET]) == 'gcv20'
     assert GEN_BY_TAG.get(0x99) is None          # unknown tag -> undecided
+
+
+def _img_with_layer(layer):
+    # render-layer byte at offset 8 (0x0d=ClearVu, 0x0e/0x0f=SideVu)
+    return bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([layer, 1, 3, 9, 0]) + bytes(20)
+
+
+def test_is_water_column_by_layer_byte():
+    assert is_water_column(_img_with_layer(0x0d)) is True    # ClearVu down-look
+    assert is_water_column(_img_with_layer(0x0e)) is False   # SideVu (GCV-20)
+    assert is_water_column(_img_with_layer(0x0f)) is False   # SideVu (GCV-10)
+    assert is_water_column(b'\xeb\x07') is False             # too short, safe
 
 
 def test_assembler_uses_supplied_extractor():

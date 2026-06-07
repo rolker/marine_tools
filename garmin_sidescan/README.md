@@ -14,7 +14,7 @@ Published (relative to the node namespace):
 
 | Topic | Type | Notes |
 |-------|------|-------|
-| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | SideVü port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10) |
+| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | SideVü port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10). `rx_angles`/`tx_angles` mark the geometry: **+`beam_angle_deg` = port, −= starboard, 0 = ClearVü down-look** |
 | `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | SideVü starboard |
 | `sonar_image_clearvu` | `marine_acoustic_msgs/RawSonarImage` | ClearVü down-look |
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
@@ -95,7 +95,8 @@ imagery stream because they are not reliably present there:
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
 | `expose_gcv10_controls` | `true` | include TVG / interference controls |
-| `device` | `auto` | `auto` detects GCV-10 vs GCV-20 by packet geometry (picks the echo extractor); `gcv20`/`gcv10` force it |
+| `device` | `auto` | `auto` detects GCV-10 vs GCV-20 by the sub-header tag byte (picks the echo extractor); `gcv20`/`gcv10` force it |
+| `beam_angle_deg` | `90.0` | side-look angle in `rx_angles`/`tx_angles` (+port / −stbd / 0 ClearVü) |
 | `debug_raw` | `false` | publish raw UDP payloads on `debug/raw` for offline re-decode; settable at runtime |
 
 ## Run

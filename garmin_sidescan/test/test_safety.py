@@ -5,6 +5,7 @@ The critical invariant: a transmit-OFF command whose TCP send FAILED must not
 be recorded as OFF, or the watchdog would stop retrying and a dry transducer
 could keep pinging while everything reports OFF.
 """
+import math
 import types
 
 from garmin_sidescan.node import (
@@ -211,3 +212,57 @@ def test_detect_generation_undecided_cases():
     assert _detect(node, b'\xeb\x07' + bytes(8)) is None    # too short for tag
     assert _detect(node, b'\xd8\x07' + bytes(40)) is None   # not an eb07 packet
     assert node._detected_gen is None                       # still undecided
+
+
+# ----- beam look-angle + intrinsic beam-type classification --------------
+
+def test_beam_angle_by_side():
+    node = types.SimpleNamespace(_beam_angle=math.pi / 2)
+    f = GarminSidescanNode._beam_angle_for
+    assert f(node, 'port') == math.pi / 2       # +angle = port
+    assert f(node, 'stbd') == -math.pi / 2      # -angle = starboard
+    assert f(node, 'clearvu') == 0.0            # 0 = down-look / water column
+
+
+def _img_layer(layer, ch=0):
+    return bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([layer, 1, 3, 9, ch]) + bytes(24)
+
+
+class _RecLogger:
+    """Capturing logger stub so a test can assert on warnings."""
+
+    def __init__(self):
+        self.warns = []
+
+    def warn(self, m):
+        self.warns.append(m)
+
+    def error(self, *a, **k):
+        pass
+
+    def info(self, *a, **k):
+        pass
+
+
+def _classify_node(chan_side):
+    log = _RecLogger()
+    node = types.SimpleNamespace(_chan_beamtype={}, _chan_side=chan_side,
+                                 get_logger=lambda: log)
+    return node, log
+
+
+def test_classify_beam_warns_on_clearvu_mismatch():
+    # channel 0 mapped to 'port' but the stream's layer byte is ClearVu (0x0d)
+    node, log = _classify_node({0: 'port'})
+    GarminSidescanNode._classify_beam(node, _img_layer(0x0d, ch=0))
+    assert node._chan_beamtype[0] == 'clearvu'
+    assert len(log.warns) == 1 and 'channel 0' in log.warns[0]
+
+
+def test_classify_beam_silent_when_consistent():
+    # clearvu channel carrying the ClearVu layer; sidescan channel carrying SideVu
+    node, log = _classify_node({2: 'clearvu', 0: 'port'})
+    GarminSidescanNode._classify_beam(node, _img_layer(0x0d, ch=2))
+    GarminSidescanNode._classify_beam(node, _img_layer(0x0e, ch=0))
+    assert node._chan_beamtype == {2: 'clearvu', 0: 'sidescan'}
+    assert log.warns == []
