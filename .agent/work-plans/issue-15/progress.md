@@ -143,8 +143,13 @@ R5 did not re-raise them. Only R5's two comments are live.
 
 ### Findings
 - [ ] (HUMAN, rolker conversation) On-boat test data renders wrong in the rqt plugin; find the faulty component across the garmin->proxy->driver->rqt path (test used a separate-machine proxy). Debugging task, not a one-line fix — bisect: raw GCV frames @ proxy vs post-decode vs RawSonarImage fields vs rqt rendering (decode.py orientation/byteorder/scaling; proxy relay; rqt_sonar_waterfall pairing/scaling, PR #41)
-- [ ] (safety, Copilot R5) `transmit_state_after(True, send_ok=False)` forces `_transmitting=False`: failed safety OFF (stays True) -> SV recovers via ROS topic while control-TCP down -> auto-resume ON send also fails -> watchdog disarms while a dry transducer may still ping — `node.py:322` (fix: on failed ON keep prior `_transmitting`, so failed-ON-after-failed-OFF stays True; add unit test for that sequence)
-- [ ] (should-fix, Copilot R5) `_on_param_set` applies side effects (range `_send`+mirror+publish) during iteration then returns `successful=False` later in the same batch on a startup-static param -> bundled `set_parameters([range_m,sv_min])` commands GCV + updates UI but rclpy rejects the batch -> param store desync — `node.py:626` (fix: validate-all-then-apply)
+- [x] (safety, Copilot R5) `transmit_state_after(True, send_ok=False)` forces `_transmitting=False`: failed safety OFF (stays True) -> SV recovers via ROS topic while control-TCP down -> auto-resume ON send also fails -> watchdog disarms while a dry transducer may still ping — `node.py:322` (fixed in `6335f57`: `transmit_state_after` now takes `prior` and keeps it on a failed ON; failed-ON-from-off still stays OFF; unit test `test_failed_on_while_possibly_pinging_stays_transmitting`)
+- [x] (should-fix, Copilot R5) `_on_param_set` applies side effects (range `_send`+mirror+publish) during iteration then returns `successful=False` later in the same batch on a startup-static param -> bundled `set_parameters([range_m,sv_min])` commands GCV + updates UI but rclpy rejects the batch -> param store desync — `node.py:626` (fixed in `6335f57`: validate-all-then-apply; fallible range send runs first so it mutates no local state on failure)
 
 ### False positives
 - none this round (R3 frame_id-as-list FP not re-raised at head)
+
+### Resolution (fixes applied)
+- Both R5 code findings fixed in `6335f57`; `colcon test garmin_sidescan` = 29 tests, 0 failures (flake8/pep257 green).
+- Added `_on_param_set` unit tests via a lightweight fake-node (calling the unbound method against a stub `self`) — supersedes the R4 note that the rclpy-free suite couldn't cover it: batch-rejects-static-without-sending-range, order-independent, send-failure-doesn't-mirror.
+- C1 (human: on-boat data looks wrong in rqt) remains open — debugging task, next.
