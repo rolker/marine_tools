@@ -44,15 +44,21 @@ from .decode import PingAssembler
 SIDES = ('port', 'stbd', 'clearvu')
 
 
-def transmit_state_after(commanded_on, send_ok):
+def transmit_state_after(commanded_on, send_ok, prior):
     """
     Return the transmit state to record after issuing a command.
 
     A failed OFF must not be recorded as OFF: the sonar may still be pinging,
-    so we stay True and let the watchdog keep retrying.  A failed ON is simply
-    not transmitting.
+    so we stay True and let the watchdog keep retrying.  A successful command
+    records the commanded state.  A failed ON keeps the ``prior`` state rather
+    than asserting OFF: if the sonar may already be pinging (e.g. a preceding
+    OFF that also failed left ``prior`` True, then an auto-resume ON send fails
+    too), recording OFF would falsely disarm the watchdog over a live, dry
+    transducer.
     """
-    return send_ok if commanded_on else (not send_ok)
+    if not commanded_on:
+        return not send_ok
+    return True if send_ok else prior
 
 
 def watchdog_action(*, safety_enabled, transmitting, has_sv_topic,
@@ -316,8 +322,10 @@ class GarminSidescanNode(Node):
         with self._tx_lock:
             ok = self._send(TRANSMIT_ON if on else TRANSMIT_OFF)
             # A failed OFF keeps _transmitting True so the watchdog keeps
-            # retrying and status reflects reality (see transmit_state_after).
-            self._transmitting = transmit_state_after(on, ok)
+            # retrying and status reflects reality; a failed ON keeps the prior
+            # state so an auto-resume ON failing after a failed OFF can't
+            # falsely report OFF (see transmit_state_after).
+            self._transmitting = transmit_state_after(on, ok, prior=self._transmitting)
             if on and ok:
                 self._safety_latched = False
         if not on and not ok:
@@ -623,14 +631,20 @@ class GarminSidescanNode(Node):
             f'{self._ping_count["stbd"]}/{self._ping_count["clearvu"]}')))
 
     def _on_param_set(self, params):
+        # Validate the whole batch before applying ANY side effect. rclpy
+        # accepts/rejects a set_parameters() call atomically on the single
+        # returned result, so applying a side effect (sending the range command,
+        # mirroring it to the UI) for one param and then rejecting the batch
+        # because of a *different* param would desync the param store from the
+        # hardware/UI. Side effects happen only once every param is acceptable.
+        range_request = None
         for p in params:
             if p.name == 'range_m':
                 meters = float(p.value)
                 # Reject (don't silently accept) a non-finite or out-of-range
                 # request - including <=0 and NaN, which previously slipped
                 # through the truthiness guard and were reported successful while
-                # the node ignored them. The parameter store must never hold a
-                # value the GCV never got. Mirrors the control-set range guard.
+                # the node ignored them. Mirrors the control-set range guard.
                 if not math.isfinite(meters) or not range_in_bounds(
                         meters, self._range_min, self._range_max):
                     self.get_logger().warn(
@@ -640,23 +654,9 @@ class GarminSidescanNode(Node):
                         successful=False,
                         reason=(f'range {meters} m invalid or outside '
                                 f'{self._range_min}-{self._range_max} m'))
-                # Reject the parameter set if the command can't be sent, so the
-                # ROS parameter and UI never claim a range the GCV didn't apply.
-                if not self._send(build_range_cmd(meters)):
-                    self.get_logger().error(f'range command ({meters} m) failed to send')
-                    return SetParametersResult(
-                        successful=False, reason='range command failed to send')
-                self._controls['range'] = f'{meters:.1f}'
-                self._publish_control_set()
-                self.get_logger().info(f'range set to {meters} m')
+                range_request = meters
             elif p.name == 'sound_speed_safety_enabled':
-                self._safety_enabled = bool(p.value)
-                if self._safety_enabled:
-                    self.get_logger().info('sound-speed safety mechanism ENABLED')
-                else:
-                    self.get_logger().warn(
-                        'sound-speed safety mechanism DISABLED (watchdog auto-stop and '
-                        'transmit guard off - dry-transducer protection is not active)')
+                pass  # always acceptable; applied below
             elif p.name != 'use_sim_time' and self.has_parameter(p.name):
                 # Every other declared parameter is read once at startup. Silently
                 # accepting a runtime set would report success while the node keeps
@@ -670,6 +670,29 @@ class GarminSidescanNode(Node):
                 return SetParametersResult(
                     successful=False,
                     reason=f'{p.name} is set at launch, not at runtime')
+
+        # Every param is acceptable. Apply the fallible hardware command first,
+        # so a send failure rejects the batch before any local state is mutated;
+        # the ROS param and UI never claim a range the GCV didn't apply.
+        if range_request is not None:
+            if not self._send(build_range_cmd(range_request)):
+                self.get_logger().error(
+                    f'range command ({range_request} m) failed to send')
+                return SetParametersResult(
+                    successful=False, reason='range command failed to send')
+            self._controls['range'] = f'{range_request:.1f}'
+            self._publish_control_set()
+            self.get_logger().info(f'range set to {range_request} m')
+
+        for p in params:
+            if p.name == 'sound_speed_safety_enabled':
+                self._safety_enabled = bool(p.value)
+                if self._safety_enabled:
+                    self.get_logger().info('sound-speed safety mechanism ENABLED')
+                else:
+                    self.get_logger().warn(
+                        'sound-speed safety mechanism DISABLED (watchdog auto-stop and '
+                        'transmit guard off - dry-transducer protection is not active)')
         return SetParametersResult(successful=True)
 
     def destroy_node(self):
