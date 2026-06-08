@@ -21,7 +21,7 @@ from sensor_msgs.msg import FluidPressure, Temperature
 import serial
 
 from .parsers import PARSERS, SoundSpeedReading
-from .sinks import FORMATTERS, decode_template
+from .sinks import decode_template, FORMATTERS
 
 
 class _UdpTarget:
