@@ -5,9 +5,9 @@ Neutral defaults only: no ROS namespace, ``frame_id`` ``garmin_sidescan``, and t
 node's own safe defaults (transmit OFF at startup, sound-speed interlock on,
 sound-speed topic ``sound_speed``). A platform launch is expected to wrap this
 to set the namespace, frame prefix, the GCV's address, the local multicast
-interface, and the absolute sound-speed topic -- see, e.g.,
-``bizzyboat_project11``'s sidescan wrapper, the same split ``sound_speed_bridge``
-uses (``aml_svs.launch.py`` here vs. the boat's ``sound_speed_launch.py``).
+interface, and the absolute sound-speed topic -- the same example-vs-wrapper
+split ``sound_speed_bridge`` uses (``aml_svs.launch.py`` here vs. a downstream
+platform launch).
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument

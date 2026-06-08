@@ -38,8 +38,8 @@ powershell -ExecutionPolicy Bypass -File .\install_proxy_service.ps1
 This registers a `GarminProxy` service (auto-start at boot, restart on exit) that
 runs `garmin_marine_network_proxy.ps1` with its built-in defaults. Override the
 proxy's network parameters by editing the proxy's `param()` block or passing
-`-ProxyArgs '...'` to the installer. Logs rotate in `C:\project11\logs\` (set
-`-LogDir`).
+`-ProxyArgs '...'` to the installer. Logs rotate in
+`%ProgramData%\GarminProxy\logs\` (set `-LogDir`).
 
 ```powershell
 nssm status  GarminProxy          # SERVICE_RUNNING

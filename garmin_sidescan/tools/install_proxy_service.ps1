@@ -25,7 +25,7 @@ param(
     [string] $ServiceName = 'GarminProxy',
     [string] $ProxyScript = (Join-Path $PSScriptRoot 'garmin_marine_network_proxy.ps1'),
     [string] $ProxyArgs   = '',
-    [string] $LogDir      = 'C:\project11\logs'
+    [string] $LogDir      = (Join-Path $env:ProgramData 'GarminProxy\logs')
 )
 
 $ErrorActionPreference = 'Stop'
