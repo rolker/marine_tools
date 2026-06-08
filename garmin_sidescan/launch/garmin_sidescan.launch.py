@@ -1,46 +1,46 @@
 """
-Launch the Garmin GCV sidescan driver, namespaced for BizzyBoat.
+Example launch for the Garmin GCV sidescan driver.
 
-Topics land under ``/<namespace>/sensors/sidescan/...`` to match the
-``/<ns>/sensors/<sensor>/...`` convention used by the other sensor bridges.
-The sound-speed watchdog defaults to the BizzyBoat AML SVS topic.
+Neutral defaults only: no ROS namespace, ``frame_id`` ``garmin_sidescan``, and the
+node's own safe defaults (transmit OFF at startup, sound-speed interlock on,
+sound-speed topic ``sound_speed``). A platform launch is expected to wrap this
+to set the namespace, frame prefix, the GCV's address, the local multicast
+interface, and the absolute sound-speed topic -- the same example-vs-wrapper
+split ``sound_speed_bridge`` uses (``aml_svs.launch.py`` here vs. a downstream
+platform launch).
 """
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node, PushRosNamespace
+from launch_ros.actions import Node
 
 
-def generate_launch_description():
-    frame_prefix = LaunchConfiguration('frame_prefix')
-    gcv_ip = LaunchConfiguration('gcv_ip')
-    iface_ip = LaunchConfiguration('iface_ip')
+def generate_launch_description() -> LaunchDescription:
+    gcv_ip_arg = DeclareLaunchArgument(
+        'gcv_ip', default_value='172.16.3.0',
+        description='GCV unit IP (GCV-10 ships as 172.16.3.196)')
+    iface_ip_arg = DeclareLaunchArgument(
+        'iface_ip', default_value='',
+        description='Local NIC IP to join the imagery multicast on '
+                    '(set on multi-homed hosts)')
+    frame_id_arg = DeclareLaunchArgument(
+        'frame_id', default_value='garmin_sidescan',
+        description='Base frame; channels publish <frame_id>_port / '
+                    '_starboard / _down and are oriented via TF')
 
     return LaunchDescription([
-        DeclareLaunchArgument('frame_prefix', default_value='bizzy/'),
-        DeclareLaunchArgument('gcv_ip', default_value='172.16.3.0'),
-        DeclareLaunchArgument(
-            'iface_ip', default_value='',
-            description='Local NIC IP to join the imagery multicast on'),
-
-        GroupAction(actions=[
-            PushRosNamespace('sensors/sidescan'),
-            Node(
-                package='garmin_sidescan',
-                executable='garmin_sidescan',
-                name='garmin_sidescan',
-                parameters=[{
-                    'gcv_ip': gcv_ip,
-                    'iface_ip': iface_ip,
-                    'frame_id': [frame_prefix, 'gcv_sonar'],
-                    # SAFE default: do not transmit on startup.
-                    'transmit_on_startup': False,
-                    'sound_speed_safety_enabled': True,
-                    'sound_speed_topic': '/bizzy/sensors/sound_speed/sound_speed',
-                }],
-                respawn=True,
-                respawn_delay=2.0,
-                emulate_tty=True,
-            ),
-        ]),
+        gcv_ip_arg,
+        iface_ip_arg,
+        frame_id_arg,
+        Node(
+            package='garmin_sidescan',
+            executable='garmin_sidescan',
+            name='garmin_sidescan',
+            output='screen',
+            parameters=[{
+                'gcv_ip': LaunchConfiguration('gcv_ip'),
+                'iface_ip': LaunchConfiguration('iface_ip'),
+                'frame_id': LaunchConfiguration('frame_id'),
+            }],
+        ),
     ])
