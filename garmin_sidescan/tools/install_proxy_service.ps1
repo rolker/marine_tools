@@ -54,7 +54,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 # Gate on Get-Service, not `nssm status`: on a fresh install nssm writes
 # "Can't open service!" to stderr and exits non-zero, which trips
 # $ErrorActionPreference = 'Stop' and aborts before anything is installed.
-if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+if (Get-Service -Name ([System.Management.Automation.WildcardPattern]::Escape($ServiceName)) -ErrorAction SilentlyContinue) {
     Write-Host "Existing '$ServiceName' service found; removing first..."
     & $Nssm stop   $ServiceName 2>$null | Out-Null
     & $Nssm remove $ServiceName confirm | Out-Null
