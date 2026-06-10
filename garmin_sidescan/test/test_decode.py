@@ -11,14 +11,19 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, is_water_column,
-    PingAssembler, SH, status_transmitting)
+    PingAssembler, SH, status_transmitting, strip_first_layer_trailer,
+    strip_leading_ping_header, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
+# Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
+# raw eb07/d807 payloads spanning down-look (ch2) + both side-scan (ch0/ch1)
+# runs, same <u16 length><payload> record format as the GCV-10 fixture.
+GCV20_FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv20_real_pings.bin')
 
 
-def load_fixture():
-    """Return the list of payloads stored in the length-prefixed fixture."""
-    with open(FIXTURE, 'rb') as handle:
+def _load_records(path):
+    """Return the payloads stored in a length-prefixed fixture file."""
+    with open(path, 'rb') as handle:
         data = handle.read()
     payloads = []
     i = 0
@@ -28,6 +33,11 @@ def load_fixture():
         payloads.append(data[i:i + n])
         i += n
     return payloads
+
+
+def load_fixture():
+    """Return the list of payloads stored in the GCV-10 fixture."""
+    return _load_records(FIXTURE)
 
 
 def test_dark_layer_extracts_a_plausible_sample_run():
@@ -138,6 +148,66 @@ def test_status_transmitting():
     assert status_transmitting(bytes([0xeb, 0x07]) + bytes(40)) is None  # not status
     assert status_transmitting(bytes([0x8e, 0x03])) is None              # too short
     assert is_water_column(b'\xeb\x07') is False             # too short, safe
+
+
+# ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
+
+def test_strip_first_layer_trailer_removes_delimited_trailer():
+    # samples (no trailer magic) followed by a real trailer record
+    samples = bytes(range(40))
+    trailer = bytes([0x43, 0x81, 0x96, 0x03, 0x49, 0x00,
+                     0x52, 0x80, 0x10, 0x5a, 0xc6, 0x70])
+    assert strip_first_layer_trailer(samples + trailer) == samples
+
+
+def test_strip_first_layer_trailer_keeps_clean_layer():
+    # no trailer present -> unchanged (the delimiter, not a fixed length, bounds it)
+    samples = bytes(range(40))
+    assert strip_first_layer_trailer(samples) == samples
+
+
+def test_strip_first_layer_trailer_ignores_magic_far_from_end():
+    # a 52 80 10 byte sequence deep in the samples must not trigger a cut
+    layer = TRAILER_MAGIC + bytes(60)
+    assert strip_first_layer_trailer(layer) == layer
+
+
+def test_strip_leading_ping_header_drops_long_run():
+    block = b'\xb2\xad' * 19 + bytes([0x4f, 0x39, 0x8b, 0x37])
+    assert strip_leading_ping_header(block) == bytes([0x4f, 0x39, 0x8b, 0x37])
+
+
+def test_strip_leading_ping_header_keeps_short_run():
+    # a short repeat in genuine samples is left intact
+    block = b'\xb2\xad' * 3 + bytes([1, 2, 3, 4])
+    assert strip_leading_ping_header(block) == block
+
+
+def test_gcv20_real_capture_strips_trailer_and_leading_band():
+    # The without-fix concatenation leaks 7 trailer records (one per packet) and
+    # a long constant leading run into every scan line -> the bright lines.
+    payloads = _load_records(GCV20_FIXTURE)
+    assembler = PingAssembler(echo_layer)
+    pings = []
+    for pl in payloads:
+        pings.extend(assembler.feed(pl))
+    pings.extend(assembler.flush())
+
+    # fixture spans down-look (ch2) + both side-scan (ch0/ch1) runs
+    assert {ch for ch, _s, _t in pings} >= {0, 1, 2}
+    assert len(pings) >= 3
+    for ch, samples, _t in pings:
+        # no per-packet trailer bytes survive into the scan line
+        assert TRAILER_MAGIC not in samples, f'trailer leaked into ch{ch}'
+        # no long constant leading run (the bright near-range band)
+        pat = samples[:2]
+        run = 0
+        while run + 2 <= len(samples) and samples[run:run + 2] == pat:
+            run += 2
+        assert run < 24, f'leading band not stripped on ch{ch}'
+        # plausible ~2048-bin scan line, whole uint16 samples
+        assert len(samples) % 2 == 0
+        assert 1800 <= len(samples) // 2 <= 2100
 
 
 def test_assembler_uses_supplied_extractor():

@@ -54,6 +54,26 @@ FHS = bytes([242, 3, 240, 3])   # f2 03 f0 03  short-packet first-layer header
 SH = bytes([174, 2, 172, 2])    # ae 02 ac 02  full-packet later-layer header
 SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
 
+# Each GCV-20 first-layer sample block ends with a fixed trailer record the
+# device appends before the next layer header (side-scan) or end of packet
+# (down-look):  ``43 <id> 96 03 | <op>[seq] | 52 80 10 | 5a <crc…>``.  The sample
+# length is *delimited* by this trailer, not length-prefixed -- the eb07
+# LE-length at offset 4 covers the whole payload, and the FH/SH headers are
+# fixed magic (identical on every packet regardless of size), so neither yields
+# the sample-region length.  We locate the trailer by its fixed inner magic and
+# cut the samples at the start of the trailer record, rather than assume a fixed
+# sample count (which varies with range / firmware / generation).  Left
+# undecoded, the trailer reads back as constant bright lines at every
+# packet-concatenation boundary in the waterfall (issue #26).
+TRAILER_MAGIC = b'\x52\x80\x10'      # fixed inner magic of the trailer record
+TRAILER_OPENER = b'\x96\x03'         # '43 <id> 96 03' opener, just before it
+TRAILER_TAIL_WINDOW = 24             # trailer sits within this many bytes of the end
+# The first packet of a scan line begins with a per-ping header: one 16-bit
+# value repeated for a device-chosen run before the samples (reads back as the
+# bright near-range band).  Detected by value-repeat (length not hard-coded) and
+# dropped only when the run is longer than real echo could plausibly produce.
+LEADING_RUN_MIN_BYTES = 24           # >=12 repeated uint16 samples
+
 CHANNEL_OFFSET = 12
 # Render-layer byte at offset 8 also encodes the beam TYPE: the
 # down-look ("water column") beam is 0x0d on both generations, while side-scan
@@ -89,6 +109,47 @@ def dark_layer(payload):
     return payload[i + 4:]
 
 
+def strip_first_layer_trailer(layer):
+    """
+    Drop the per-packet trailer record the GCV-20 appends after the echo samples.
+
+    The trailer is delimited, not length-prefixed: ``43 <id> 96 03 … 52 80 10 …``.
+    Find its fixed magic near the end, confirm the ``96 03`` opener a few bytes
+    before (so sample data that coincidentally contains ``52 80 10`` elsewhere
+    can't trigger a cut), and return the bytes before the trailer record.
+    Returns ``layer`` unchanged when no trailer is present (older captures,
+    synthetic packets), so the delimiter -- not a hard-coded length -- bounds the
+    sample region.
+    """
+    m = layer.rfind(TRAILER_MAGIC)
+    if m < 0 or m < len(layer) - TRAILER_TAIL_WINDOW:
+        return layer
+    opener = layer.rfind(TRAILER_OPENER, max(0, m - 8), m)
+    if opener < 0:
+        return layer
+    # The record starts at the '43 <id>' two bytes before the '96 03' opener.
+    return layer[:max(0, opener - 2)]
+
+
+def strip_leading_ping_header(block):
+    """
+    Drop the per-ping header that opens the first packet of a GCV-20 scan line.
+
+    The header is one 16-bit value repeated for a device-chosen run before the
+    samples begin.  Detected by value-repeat (the run length is not hard-coded)
+    and removed only when the run is long enough that real echo could not produce
+    it (:data:`LEADING_RUN_MIN_BYTES`).  Short coincidental repeats in genuine
+    samples are left intact.
+    """
+    if len(block) < LEADING_RUN_MIN_BYTES:
+        return block
+    pat = block[:2]
+    n = 0
+    while n + 2 <= len(block) and block[n:n + 2] == pat:
+        n += 2
+    return block[n:] if n >= LEADING_RUN_MIN_BYTES else block
+
+
 def echo_layer(payload):
     """
     Return the GCV-20 16-bit echo from one eb07 payload as raw uint16-LE bytes.
@@ -116,7 +177,7 @@ def echo_layer(payload):
     # don't couple the terminator to the opener type.
     ends = [p for p in (payload.find(SH, f + 4), payload.find(SHS, f + 4)) if p >= 0]
     s = min(ends) if ends else len(payload)
-    first = payload[f + 4:s]
+    first = strip_first_layer_trailer(payload[f + 4:s])
     return first[:len(first) // 2 * 2]
 
 
@@ -167,11 +228,16 @@ class PingAssembler:
             self._cur_ch = None
         elif payload[:2] == EB07 and len(payload) > MIN_DATA_LEN:
             ch = payload[CHANNEL_OFFSET]
+            block = self._extract(payload)
             if ch != self._cur_ch:
                 self._emit(out)
                 self._cur_ch = ch
                 self._t0 = recv_time
-            self._acc.extend(self._extract(payload))
+                # The per-ping leading header rides only the first packet of a
+                # scan line, and only on the GCV-20 (echo_layer) stream.
+                if self._extract is echo_layer:
+                    block = strip_leading_ping_header(block)
+            self._acc.extend(block)
             if len(self._acc) > MAX_SCAN_BYTES:
                 # Degenerate stream (no channel change, no marker): drop the
                 # runaway accumulation rather than grow without bound.
