@@ -50,7 +50,7 @@
     THIS value.
 
 .PARAMETER RelayTo
-    One or more ROS-host IPs to forward imagery to (default: gabby).
+    One or more ROS-host IPs to forward imagery/status/config to (default: gabby).
 
 .PARAMETER ReMulticast
     Also re-emit imagery as multicast on the ListenIp side (in addition to the

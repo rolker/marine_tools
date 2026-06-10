@@ -207,8 +207,8 @@ def _relay_loop(args, stop, name, group, port, src_filter,
 def main():
     """Parse arguments and run the imagery/status/config/control relays."""
     parser = argparse.ArgumentParser(
-        description='Garmin Marine Network proxy: relay GCV imagery + control '
-                    'to a ROS host that cannot link the Garmin NIC.',
+        description='Garmin Marine Network proxy: relay GCV imagery + status + '
+                    'config + control to a ROS host that cannot link the Garmin NIC.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--garmin-iface-ip', default='172.16.55.235',
                         help='local NIC IP on the Garmin Marine Network')
@@ -221,7 +221,7 @@ def main():
                         help='local NIC IP facing the ROS host; set the driver '
                              'gcv_ip to this')
     parser.add_argument('--relay-to', nargs='+', default=['192.168.20.5'],
-                        help='ROS host IP(s) to forward imagery to')
+                        help='ROS host IP(s) to forward imagery/status/config to')
     parser.add_argument('--re-multicast', action='store_true',
                         help='also re-emit imagery as multicast on the ROS-host LAN')
     # Status + config streams: relayed by default so the driver's debug_raw
