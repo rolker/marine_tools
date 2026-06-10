@@ -148,7 +148,7 @@ $udpRelayScript = {
         }
 
         $buf = New-Object byte[] 65535
-        $pkts = 0L; $bytes = 0L; $dropped = 0L; $logged = -1L
+        $pkts = 0L; $bytes = 0L; $dropped = 0L; $logged = 0L
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $srcDesc = if ($SrcFilter) { $SrcFilter } else { 'any-source' }
         Log "${Name}: joined ${Group}:${Port} on ${GarminIfaceIp}; relaying ${srcDesc}"
@@ -158,7 +158,11 @@ $udpRelayScript = {
             try {
                 $n = $rx.ReceiveFrom($buf, [ref]$src)
             } catch [System.Net.Sockets.SocketException] {
-                # ReceiveTimeout -> heartbeat (only when something moved) and continue.
+                # Only the ReceiveTimeout is the heartbeat case; surface any other
+                # socket error (e.g. network down) instead of silently spinning.
+                if ($_.Exception.SocketErrorCode -ne [System.Net.Sockets.SocketError]::TimedOut) {
+                    Log "${Name}: socket error: $($_.Exception.SocketErrorCode)"
+                }
                 if ($sw.Elapsed.TotalSeconds -ge 10 -and $pkts -ne $logged) {
                     Log ("${Name}: {0} pkts / {1:n0} bytes relayed{2}" -f $pkts, $bytes,
                          $(if ($dropped) { " ($dropped dropped)" } else { '' }))
@@ -190,7 +194,7 @@ $udpRelayScript = {
 }
 
 # Spin status (GCV-sourced) and config (any-source) relays in their own runspaces.
-$auxPs = @()
+$auxRelays = @()
 function Start-UdpRelay($name, $group, $port, $srcFilter) {
     $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
     $ps = [powershell]::Create(); $ps.Runspace = $rs
@@ -199,10 +203,11 @@ function Start-UdpRelay($name, $group, $port, $srcFilter) {
         AddArgument($port).AddArgument($ListenIp).AddArgument($RelayTo).
         AddArgument($srcFilter)
     [void]$ps.BeginInvoke()
-    return $ps
+    # Track both so shutdown disposes the runspace too (no leak in the service).
+    return [pscustomobject]@{ Ps = $ps; Rs = $rs }
 }
-if (-not $NoStatus) { $auxPs += (Start-UdpRelay 'status' $StatusGroup $StatusPort $GcvIp) }
-if (-not $NoConfig) { $auxPs += (Start-UdpRelay 'config' $ConfigGroup $ConfigPort '') }
+if (-not $NoStatus) { $auxRelays += (Start-UdpRelay 'status' $StatusGroup $StatusPort $GcvIp) }
+if (-not $NoConfig) { $auxRelays += (Start-UdpRelay 'config' $ConfigGroup $ConfigPort '') }
 
 # --- background: TCP control relay -------------------------------------------
 # Run on its own runspace so the (blocking) accept loop does not stall the
@@ -339,10 +344,11 @@ try {
     try { $controlPs.Stop() } catch {}
     try { $controlPs.Dispose() } catch {}
     try { $controlRunspace.Dispose() } catch {}
-    # Tear down the status/config relay runspaces.
-    foreach ($ps in $auxPs) {
-        try { $ps.Stop() } catch {}
-        try { $ps.Dispose() } catch {}
+    # Tear down the status/config relay runspaces (dispose the runspace too).
+    foreach ($r in $auxRelays) {
+        try { $r.Ps.Stop() } catch {}
+        try { $r.Ps.Dispose() } catch {}
+        try { $r.Rs.Dispose() } catch {}
     }
     Log "stopped."
 }

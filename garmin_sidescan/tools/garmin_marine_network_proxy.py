@@ -174,7 +174,7 @@ def _relay_loop(args, stop, name, group, port, src_filter,
         f'{", ".join(f"{h}:{p}" for h, p in targets)}')
 
     pkts = bytes_ = dropped = 0
-    logged = -1
+    logged = 0
     last = time.monotonic()
     try:
         while not stop.is_set():
