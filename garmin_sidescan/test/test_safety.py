@@ -268,3 +268,19 @@ def test_classify_beam_silent_when_consistent():
     GarminSidescanNode._classify_beam(node, _img_layer(0x0e, ch=0))
     assert node._chan_beamtype == {2: 'down', 0: 'sidescan'}
     assert log.warns == []
+
+
+def test_status_heartbeat_republishes_control_set():
+    # Regression for #30: ~/state is volatile (not latched), so the control set
+    # must be re-published on the periodic status heartbeat -- not only on change
+    # -- or a late / udp-bridged rqt subscriber never populates the control panel.
+    node = _FakeNode()
+    node._transmitting = False
+    node._require_sv = True
+    node._safety_latched = False
+    node._last_sv_value = 1500.0
+    node._ping_count = {'port': 0, 'stbd': 0, 'down': 0}
+    node._sv_age = lambda: None
+    node._pub_status = types.SimpleNamespace(publish=lambda msg: None)
+    GarminSidescanNode._publish_status(node)
+    assert node.publishes == 1
