@@ -281,7 +281,12 @@ class GarminSidescanNode(Node):
         self._pub_diag = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
-        self._pub_state = self.create_publisher(RadarControlSet, '~/state', latched)
+        # Control set: volatile depth-10, NOT latched -- mirrors simrad_halo_radar
+        # (the rqt control panel + udp_bridge are built around the radar's model).
+        # transient_local does not cross the udp_bridge, and a volatile subscriber
+        # never sees a latched sample; the set is instead re-sent on a heartbeat
+        # (see _publish_status) so a late / bridged subscriber always populates.
+        self._pub_state = self.create_publisher(RadarControlSet, '~/state', 10)
 
         self.create_service(SetBool, '~/set_transmit', self._on_set_transmit)
         self.create_subscription(RadarControlValue, '~/change_state',
@@ -849,6 +854,10 @@ class GarminSidescanNode(Node):
             f'sv={self._last_sv_value:.1f} sv_age={age_s} '
             f'pings(port/stbd/down)={self._ping_count["port"]}/'
             f'{self._ping_count["stbd"]}/{self._ping_count["down"]}')))
+        # Heartbeat the control set on the same timer (mirrors the radar's 1 Hz
+        # heartbeat): ~/state is volatile, so a late or udp-bridged subscriber
+        # only ever sees it via this periodic re-publish, not the on-change ones.
+        self._publish_control_set()
 
     def _on_param_set(self, params):
         # Validate the whole batch before applying ANY side effect. rclpy
