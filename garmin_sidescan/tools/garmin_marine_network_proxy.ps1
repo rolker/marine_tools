@@ -9,7 +9,7 @@
     Garmin (here: NIC "Ethernet 2", 172.16.55.235/16), with a second NIC on the
     same LAN as the ROS host (here: "BRIDGE", 192.168.20.8/24, gabby = .5).
 
-    It relays the two channels the garmin_sidescan driver uses, exactly as the
+    It relays the channels the garmin_sidescan driver uses, exactly as the
     driver expects to see them, so the *unmodified* driver runs on gabby:
 
       * Imagery  : GCV UDP multicast 239.254.2.1:50220 (received on the Marine
@@ -18,15 +18,25 @@
                    datagrams' source address is -ListenIp; set the driver's
                    gcv_ip to -ListenIp and its filter_src check passes.
 
+      * Status   : GCV 8e03 multicast 239.254.2.2:50050 (transmit flag + nadir
+                   depth) -> relayed the same way, filtered to the GCV's source.
+                   Disable with -NoStatus.
+
+      * Config   : chartplotter CDP multicast 239.254.2.11:51000 (carries the
+                   active range under auto-range) -> relayed from EVERY source on
+                   the group (it originates at the chartplotter, not the GCV).
+                   Capture-only; the driver does not parse it. Disable -NoConfig.
+
       * Control  : TCP <ListenIp>:50227 (from the driver) -> GCV <GcvIp>:50227.
                    The driver opens one short connection per command frame and
                    serializes them, so the listener handles connections one at a
                    time. Bidirectional, though the GCV does not reply.
 
-    There is NO host->GCV imagery path; the relay is one-way for UDP and
-    on-demand for TCP. Nothing is sent to the GCV except the driver's own
-    control frames, so the sonar's transmit safety (sound-speed watchdog) still
-    lives entirely in the driver on gabby.
+    Every UDP relay is one-way GCV->ROS and the TCP relay is on-demand. Nothing
+    is sent to the GCV except the driver's own control frames, so the sonar's
+    transmit safety (sound-speed watchdog) still lives entirely in the driver on
+    gabby. Status/config are relayed by default so the driver's debug_raw
+    capture records them (and status also feeds the driver's device tx flag).
 
 .PARAMETER GarminIfaceIp
     Local IP of the NIC on the Garmin Marine Network (the multicast-join iface).
@@ -40,7 +50,7 @@
     THIS value.
 
 .PARAMETER RelayTo
-    One or more ROS-host IPs to forward imagery to (default: gabby).
+    One or more ROS-host IPs to forward imagery/status/config to (default: gabby).
 
 .PARAMETER ReMulticast
     Also re-emit imagery as multicast on the ListenIp side (in addition to the
@@ -69,7 +79,13 @@ param(
     [int]      $ImageryPort   = 50220,
     [string]   $ListenIp      = '192.168.20.8',    # mercat NIC facing gabby
     [string[]] $RelayTo       = @('192.168.20.5'), # gabby (ROS host)
-    [switch]   $ReMulticast
+    [switch]   $ReMulticast,
+    [string]   $StatusGroup   = '239.254.2.2',     # GCV 8e03 status (tx + depth)
+    [int]      $StatusPort    = 50050,
+    [switch]   $NoStatus,
+    [string]   $ConfigGroup   = '239.254.2.11',    # chartplotter CDP config (range)
+    [int]      $ConfigPort    = 51000,
+    [switch]   $NoConfig
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,9 +98,116 @@ function Log([string]$msg) {
 
 Log "Garmin Marine Network proxy"
 Log "  imagery : mcast ${McastGroup}:${ImageryPort} on ${GarminIfaceIp}  ->  unicast ${ImageryPort} to $($RelayTo -join ', ')$(if($ReMulticast){' (+ re-multicast)'})"
+if (-not $NoStatus) {
+    Log "  status  : mcast ${StatusGroup}:${StatusPort}  ->  unicast ${StatusPort} to $($RelayTo -join ', ')"
+}
+if (-not $NoConfig) {
+    Log "  config  : mcast ${ConfigGroup}:${ConfigPort}  ->  unicast ${ConfigPort} to $($RelayTo -join ', ')"
+}
 Log "  control : tcp ${ListenIp}:${ControlPort}  ->  ${GcvIp}:${ControlPort}"
 Log "  drive gabby with:  gcv_ip:=${ListenIp}  iface_ip:=<gabby LAN IP>"
 Log "  Ctrl+C to stop."
+
+# --- generic UDP relay (status/config): mcast <group>:<port> -> unicast -------
+# Mirrors the imagery loop below but parameterised; runs in its own runspace.
+# $SrcFilter = a GCV IP to accept only its datagrams, or '' to relay every
+# source (the CDP config originates at the chartplotter, not the GCV).
+$udpRelayScript = {
+    param($Name, $GarminIfaceIp, $Group, $Port, $ListenIp, $RelayTo, $SrcFilter)
+
+    function Log([string]$msg) {
+        [Console]::WriteLine(('{0:HH:mm:ss}  {1}' -f [DateTime]::Now, $msg))
+    }
+
+    $rx = $null; $tx = $null
+    try {
+        $rx = [System.Net.Sockets.Socket]::new(
+            [System.Net.Sockets.AddressFamily]::InterNetwork,
+            [System.Net.Sockets.SocketType]::Dgram,
+            [System.Net.Sockets.ProtocolType]::Udp)
+        $rx.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket,
+                            [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+        $rx.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $Port))
+        $mreq = [System.Net.Sockets.MulticastOption]::new(
+            [System.Net.IPAddress]::Parse($Group),
+            [System.Net.IPAddress]::Parse($GarminIfaceIp))
+        $rx.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IP,
+                            [System.Net.Sockets.SocketOptionName]::AddMembership, $mreq)
+        $rx.ReceiveTimeout = 1000
+
+        # Bind tx to ListenIp so forwarded datagrams' SOURCE is ListenIp.
+        $tx = [System.Net.Sockets.Socket]::new(
+            [System.Net.Sockets.AddressFamily]::InterNetwork,
+            [System.Net.Sockets.SocketType]::Dgram,
+            [System.Net.Sockets.ProtocolType]::Udp)
+        $tx.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($ListenIp), 0))
+
+        $targets = [System.Collections.Generic.List[System.Net.EndPoint]]::new()
+        foreach ($h in $RelayTo) {
+            $targets.Add([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($h), $Port))
+        }
+
+        $buf = New-Object byte[] 65535
+        $pkts = 0L; $bytes = 0L; $dropped = 0L; $logged = 0L
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $srcDesc = if ($SrcFilter) { $SrcFilter } else { 'any-source' }
+        Log "${Name}: joined ${Group}:${Port} on ${GarminIfaceIp}; relaying ${srcDesc}"
+
+        while ($true) {
+            [System.Net.EndPoint]$src = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+            try {
+                $n = $rx.ReceiveFrom($buf, [ref]$src)
+            } catch [System.Net.Sockets.SocketException] {
+                # Only the ReceiveTimeout is the heartbeat case; surface any other
+                # socket error (e.g. network down) instead of silently spinning.
+                if ($_.Exception.SocketErrorCode -ne [System.Net.Sockets.SocketError]::TimedOut) {
+                    Log "${Name}: socket error: $($_.Exception.SocketErrorCode)"
+                }
+                if ($sw.Elapsed.TotalSeconds -ge 10 -and $pkts -ne $logged) {
+                    Log ("${Name}: {0} pkts / {1:n0} bytes relayed{2}" -f $pkts, $bytes,
+                         $(if ($dropped) { " ($dropped dropped)" } else { '' }))
+                    $logged = $pkts; $sw.Restart()
+                }
+                continue
+            }
+            if ($SrcFilter -and (([System.Net.IPEndPoint]$src).Address.ToString() -ne $SrcFilter)) {
+                continue
+            }
+            foreach ($t in $targets) {
+                try {
+                    [void]$tx.SendTo($buf, 0, $n, [System.Net.Sockets.SocketFlags]::None, $t)
+                } catch {
+                    $dropped++
+                }
+            }
+            $pkts++; $bytes += $n
+            if ($sw.Elapsed.TotalSeconds -ge 10 -and $pkts -ne $logged) {
+                Log ("${Name}: {0} pkts / {1:n0} bytes relayed{2}" -f $pkts, $bytes,
+                     $(if ($dropped) { " ($dropped dropped)" } else { '' }))
+                $logged = $pkts; $sw.Restart()
+            }
+        }
+    } finally {
+        if ($rx) { $rx.Close() }
+        if ($tx) { $tx.Close() }
+    }
+}
+
+# Spin status (GCV-sourced) and config (any-source) relays in their own runspaces.
+$auxRelays = @()
+function Start-UdpRelay($name, $group, $port, $srcFilter) {
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($udpRelayScript).
+        AddArgument($name).AddArgument($GarminIfaceIp).AddArgument($group).
+        AddArgument($port).AddArgument($ListenIp).AddArgument($RelayTo).
+        AddArgument($srcFilter)
+    [void]$ps.BeginInvoke()
+    # Track both so shutdown disposes the runspace too (no leak in the service).
+    return [pscustomobject]@{ Ps = $ps; Rs = $rs }
+}
+if (-not $NoStatus) { $auxRelays += (Start-UdpRelay 'status' $StatusGroup $StatusPort $GcvIp) }
+if (-not $NoConfig) { $auxRelays += (Start-UdpRelay 'config' $ConfigGroup $ConfigPort '') }
 
 # --- background: TCP control relay -------------------------------------------
 # Run on its own runspace so the (blocking) accept loop does not stall the
@@ -221,5 +344,11 @@ try {
     try { $controlPs.Stop() } catch {}
     try { $controlPs.Dispose() } catch {}
     try { $controlRunspace.Dispose() } catch {}
+    # Tear down the status/config relay runspaces (dispose the runspace too).
+    foreach ($r in $auxRelays) {
+        try { $r.Ps.Stop() } catch {}
+        try { $r.Ps.Dispose() } catch {}
+        try { $r.Rs.Dispose() } catch {}
+    }
     Log "stopped."
 }
