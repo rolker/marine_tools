@@ -854,9 +854,10 @@ class GarminSidescanNode(Node):
             f'sv={self._last_sv_value:.1f} sv_age={age_s} '
             f'pings(port/stbd/down)={self._ping_count["port"]}/'
             f'{self._ping_count["stbd"]}/{self._ping_count["down"]}')))
-        # Heartbeat the control set on the same timer (mirrors the radar's 1 Hz
-        # heartbeat): ~/state is volatile, so a late or udp-bridged subscriber
-        # only ever sees it via this periodic re-publish, not the on-change ones.
+        # Re-publish the control set on the status timer so a late or udp-bridged
+        # subscriber always populates: ~/state is volatile, so it never sees the
+        # on-change publishes. The radar heartbeats this at 1 Hz; here it rides
+        # the existing 2 s status timer.
         self._publish_control_set()
 
     def _on_param_set(self, params):
