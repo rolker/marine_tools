@@ -7,7 +7,8 @@ code the driver uses (``garmin_sidescan.decode``) and produces a two-panel image
 over a time window:
 
   * top    — down-look (water column), depth-corrected;
-  * bottom — side-scan (port | starboard), across-track corrected;
+  * bottom — side-scan (port | starboard), slant-range scaled (sample index ->
+    metres via the sub-header v2 range; NO ground-range / slant correction);
   * shared time x-axis.
 
 It is **self-contained** — it depends only on the sidescan ``debug/raw`` topic,
@@ -15,7 +16,7 @@ no external nav/sonar (no M3). The metres-per-sample scale comes straight from
 each channel's sub-header: ``bin_size = display_range / n_bins`` where the
 display range is that channel's per-ping ``v2`` varint (see
 ``docs/gcv_protocol.md``). The down-look's v2 is the water-column depth range;
-the side-scan's v2 is the across-track slant range (~2x larger), so each channel
+the side-scan's v2 is its slant-range swath extent (~2x larger), so each channel
 is scaled by its OWN v2. No bottom detection, no hard-coded ladder. The down-look
 ``v1`` (bottom range) is drawn on the water-column panel as a check.
 
@@ -164,7 +165,7 @@ def render(chans, out, max_depth, across, vmin, vmax):
     if len(chans[PORT]) != len(chans[STBD]):
         print(f'warning: port ({len(chans[PORT])}) and starboard '
               f'({len(chans[STBD])}) ping counts differ — index pairing may drift')
-    a2.set_ylabel('across-track (m)\nPORT <- 0 -> STBD')
+    a2.set_ylabel('slant range (m)\nPORT <- 0 -> STBD')
     a2.set_xlabel('time (s, from first imagery packet)')
     a1.set_xlim(dt[0], dt[-1])
     if n == 0:                                  # no side-scan in this window
@@ -200,7 +201,7 @@ def main(argv=None):
     ap.add_argument('--out', default='sidescan_waterfall.png', help='output PNG')
     ap.add_argument('--max-depth', type=float, default=20.0, help='water-column depth axis (m)')
     ap.add_argument('--across', type=float, default=50.0,
-                    help='side-scan across-track half-width (m)')
+                    help='side-scan slant-range half-width (m)')
     ap.add_argument('--vmin', type=float, default=None,
                     help='raw-value black point (default 0)')
     ap.add_argument('--vmax', type=float, default=None,

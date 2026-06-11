@@ -35,8 +35,9 @@ D807 = b'\xd8\x07'
 STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # The :50050 stream multiplexes two 34-byte sub-types, discriminated by the
 # payload byte at offset 9 (see docs/gcv_protocol.md):
-#   0x00 -> settings echo (carries the historical transmit flag at this byte)
-#   0xe4 -> a separate mode/status sub-type, broadcast regardless of tx state
+#   0x00 / 0x01 -> settings echo, where byte 9 is also the transmit flag
+#                  (0x00 = transmitting, 0x01 = off)
+#   0xe4        -> a separate mode/status sub-type, broadcast regardless of tx state
 # Earlier bench notes read byte 9 as a bare transmit flag (0x00 on / 0x01 off);
 # the wet capture shows 0x00 and 0xe4 interleaved regardless of transmit state,
 # so byte 9 is (also) a sub-type selector.  We therefore read a transmit state
