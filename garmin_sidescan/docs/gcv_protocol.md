@@ -43,7 +43,7 @@ the driver sends. "LE id" is the 2-byte magic read as a little-endian `uint16`
 | Imagery data | `eb 07` | 2027 | `239.254.2.1:50220` UDP | in | 650–956 B | ~190/s | side/down scan-line sample packets | ✅ `decode.py` |
 | Channel marker | `d8 07` | 2008 | `239.254.2.1:50220` UDP | in | 15–16 B | per run | delimits one channel's packet run within a ping | ✅ |
 | Keepalive | `d1 07` | 2001 | `239.254.2.1:50220` UDP | in | 22 B | ~1 Hz | chartplotter-master keepalive that sustains pinging | ⚠️ partial |
-| Status | `8e 03` | 910 | `239.254.2.2:50050` UDP | in | 34 B | ~0.2/s | tx flag + a held `0xe4` sub-type value (NOT depth — §4) / settings echo | ◐ this doc |
+| Status | `8e 03` | 910 | `239.254.2.2:50050` UDP | in | 34 B | ~0.2/s | tx flag + a held `0xe4` sub-type value (NOT depth — §3.4) / settings echo | ◐ this doc |
 | Config heartbeat | `e7 08` | 2279 | `239.254.2.11:51000` UDP | in | 19 B | ~1/s | device-id heartbeat | ⚠️ partial |
 | Config record | `e5 08` | 2277 | `239.254.2.11:51000` UDP | in | 168 / 173 B | bursts | named CDP ping-schedule key/values | ◐ structure ✅, values partial |
 | Command | `d2 07 ef be` | 2002 | `172.16.3.0:50227` TCP | **out** | varies | on demand | transmit / range / TVG / interference | ✅ `commands.py` |
@@ -122,19 +122,21 @@ d1 07 (keepalive) payload:  04 01 03 0d  d5 a7 f2 8b 0d  12 8a 18 19 03
   4-byte body look MAC/serial-derived.
 - The leading byte (`03` / `04` / `05`) looks like a field/record count.
 
-### D. A ping-link token ties markers to data
+### D. The `d807` marker echoes the ping's range fields
 
-The `d807` channel marker embeds the same token that opens the `eb07`
-sub-header it delimits:
+The `d807` channel marker embeds the same bytes that open the `eb07` sub-header
+of the run it delimits — the **range bracket + bottom-range varint** (§3.1), not
+a sequence id:
 
 ```
-eb 07 …envelope… 0e 01 03 09 00  13 ea ef 01 19 00  23 ae eb …samples…
-d8 07 …envelope…              02  13 ea ef 01 19 00
-                                  └── shared ping token ──┘
+eb 07 …envelope… 0e 01 03 09 00 | 13 | ea ef 01 | 19 00 23 …samples…
+d8 07 …envelope…             02 | 13 | ea ef 01 | 19 00
+                                  └bracket┘└─ v1 ─┘└marker
 ```
 
-So a marker is not a bare delimiter — it carries the ping/sequence id of the run
-it closes.
+So a marker is not a bare delimiter — it carries that run's range bracket and
+measured bottom range, which is why the shared bytes change every ping (they
+track depth, not a counter).
 
 ### E. CDP named TLV + LEB128 values
 
@@ -168,7 +170,7 @@ authoritative layout. Key sub-header bytes
 | 8 | render-layer / beam-type byte: `0x0d` down-look (water column), `0x0e`/`0x0f` side-scan |
 | 12 | channel number (GCV-20 map: 0 = port, 1 = stbd, 2 = down) |
 | 13 | **range/scale index** — the coarse display bracket; steps with range (`0x11`/`0x12`/`0x13` seen), shared by all channels. NOT a generation tag (see below). |
-| 14… | **LEB128 varint** — on the down-look, the per-ping **measured bottom range** (~0.5 mm units, see below). Variable length (2–3 B), then a `19 00 23` marker. (This is the "token" the `d807` marker echoes — [pattern D](#d-a-ping-link-token-ties-markers-to-data) — not a sequence counter.) |
+| 14… | **LEB128 varint** — on the down-look, the per-ping **measured bottom range** (~0.5 mm units, see below). Variable length (2–3 B), then a `19 00 23` marker. (The `d807` marker echoes this bracket + varint — [pattern D](#d-the-d807-marker-echoes-the-pings-range-fields) — not a sequence counter.) |
 
 Frequency and a per-ping timestamp are **not** carried; the driver takes
 frequency from a parameter and stamps scan lines with receive time (see
@@ -282,10 +284,10 @@ values (848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly arti
 
 ### 3.2 Channel marker — `d807` (`239.254.2.1:50220`)
 
-15–16 byte delimiter emitted between channel runs. Payload
-`02 <ping-token>` where the ping token (`13 ea ef 01 19 00`) matches the
-following `eb07` sub-header ([pattern D](#d-a-ping-link-token-ties-markers-to-data)).
-The assembler treats it as "flush the current channel's accumulation."
+15–16 byte delimiter emitted between channel runs. Payload `02 <bracket> <v1…>`
+— it echoes the following `eb07` sub-header's range bracket + bottom-range varint
+([pattern D](#d-the-d807-marker-echoes-the-pings-range-fields)). The assembler
+treats it as "flush the current channel's accumulation."
 
 ### 3.3 Keepalive — `d107` (`239.254.2.1:50220`)
 
