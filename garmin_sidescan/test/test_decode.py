@@ -10,9 +10,11 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, is_water_column,
-    PingAssembler, SH, status_transmitting, strip_first_layer_trailer,
-    strip_leading_ping_header, TRAILER_MAGIC)
+    dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
+    generation_from_layers, is_water_column, parse_downlook_subheader,
+    parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
+    strip_first_layer_trailer, strip_leading_ping_header, subheader_bottom_range_m,
+    TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -118,6 +120,26 @@ def test_echo_layer_empty_without_first_header():
     assert echo_layer(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) == b''
 
 
+def test_generation_from_layers_on_real_fixtures():
+    # Range-INDEPENDENT generation: GCV-10 packets carry >=2 SH/SHS later-layer
+    # headers (3 layers); GCV-20 carry <=1 (<=2 layers). Validated on the real
+    # capture fixtures (the byte-13 'gen tag' is actually the range bracket).
+    g10 = [generation_from_layers(p) for p in load_fixture() if p[:2] == b'\xeb\x07']
+    g20 = [generation_from_layers(p) for p in _load_records(GCV20_FIXTURE)
+           if p[:2] == b'\xeb\x07']
+    assert any(g10) and all(g == 'gcv10' for g in g10 if g)   # GCV-10 capture
+    assert any(g20) and all(g == 'gcv20' for g in g20 if g)   # GCV-20 capture
+
+
+def test_generation_from_layers_synthetic():
+    pre = bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([0x0e, 1, 3, 9, 0, 0, 0, 0])
+    assert generation_from_layers(pre + FH + bytes(20)) == 'gcv20'                  # 0 SH
+    assert generation_from_layers(pre + FH + bytes(20) + SH + bytes(20)) == 'gcv20'  # 1 SH
+    assert generation_from_layers(pre + FH + SH + bytes(8) + SH + bytes(8)) == 'gcv10'  # 2 SH
+    assert generation_from_layers(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is None    # no FH
+    assert generation_from_layers(bytes([0xd8, 0x07]) + bytes(40)) is None          # not eb07
+
+
 def test_generation_tag_byte_discriminates():
     # sub-header value-width tag at offset 13: 0x11=GCV-10, 0x12=GCV-20
     g10 = _gcv20_packet(0, bytes(8))
@@ -150,6 +172,78 @@ def test_status_transmitting():
     assert is_water_column(b'\xeb\x07') is False             # too short, safe
 
 
+# ----- :50050 status sub-types (issue #16) -------------------------------
+# Real 34-byte 8e03 frames from the 2026-06-10 Piscataqua capture
+# (bag_2026-06-10T15.54.41_sidescan_raw). The 0xe4 sub-type holds a u16 @ offset
+# 20 we once took for nadir depth, but the M3 cross-check showed it is held and
+# does NOT track depth, so the driver no longer decodes it -- byte 9 is kept only
+# as a sub-type/mode selector that the transmit-flag read must not trip over.
+_STATUS_SUBTYPE_E4 = bytes.fromhex(
+    '8e0300001a00000002e40a0c0000030100000000d8ba0000e0a0910b010474530000')
+_STATUS_SETTINGS = bytes.fromhex(
+    '8e0300001a00000002000a0c0000030100ae05c075ae05c0e0a0910b010476530000')
+
+
+def test_status_subtype_discriminates():
+    assert status_subtype(_STATUS_SUBTYPE_E4) == 0xe4     # mode/status sub-type
+    assert status_subtype(_STATUS_SETTINGS) == 0x00       # settings echo
+    assert status_subtype(bytes([0xeb, 0x07]) + bytes(40)) is None   # not status
+    assert status_subtype(bytes([0x8e, 0x03])) is None               # too short
+
+
+def test_status_transmitting_ignores_e4_subtype():
+    # The 0xe4 sub-type is broadcast regardless of transmit state, so it must not
+    # flap the transmit flag to "off" (it shares byte 9 with the tx flag).
+    assert status_transmitting(_STATUS_SUBTYPE_E4) is None
+    assert status_transmitting(_STATUS_SETTINGS) is True
+
+
+# ----- down-look bottom-range varint (sub-header offset 14) ----------------
+
+def test_decode_leb128():
+    assert decode_leb128(bytes([0x05]), 0) == (5, 1)
+    assert decode_leb128(bytes([0x90, 0x7f]), 0) == (16272, 2)   # real value
+    assert decode_leb128(bytes([0x80]), 0) == (None, 1)          # unterminated
+
+
+def test_subheader_bottom_range_m():
+    # Real GCV-20 down-look sub-header (offset 8 = 0x0d layer, 13 = bracket,
+    # 14 = LEB128 bottom-range varint). 90 7f = 16272 * 0.5 mm = 8.136 m.
+    down = bytes.fromhex('eb07000000000000') + bytes.fromhex('0d0103090212907f190023')
+    assert abs(subheader_bottom_range_m(down) - 8.136) < 0.01
+    # side-scan layer (0x0e) -> None (no bottom range)
+    side = bytes.fromhex('eb07000000000000') + bytes.fromhex('0e0103090212907f190023')
+    assert subheader_bottom_range_m(side) is None
+    assert subheader_bottom_range_m(bytes([0xd8, 0x07]) + bytes(20)) is None  # not eb07
+
+
+def test_parse_downlook_subheader():
+    # Real ~7.9 m down-look sub-header: v1=16272 (8.136 m), 19 00 23, v2=24236
+    # (12.118 m), 2a, v3=178 (0.089 m), 31 02 3f, FH.
+    pkt = bytes.fromhex('eb07000000000000') + bytes.fromhex(
+        '0d0103090212907f190023acbd012ab20131023fda04d804') + bytes(8)  # + samples
+    sub = parse_downlook_subheader(pkt)
+    assert sub.bracket == 0x12
+    assert abs(sub.bottom_range_m - 8.136) < 0.01     # v1
+    assert abs(sub.display_range_m - 12.118) < 0.01   # v2
+    assert abs(sub.near_field_m - 0.089) < 0.01       # v3
+    # garbled marker / non-down-look -> None (markers are validated)
+    assert parse_downlook_subheader(bytes.fromhex('eb07000000000000') + bytes(30)) is None
+
+
+def test_parse_subheader_side_scan_has_own_display_range():
+    # Real side-scan (port) sub-header: layer 0x0e, v1 shared (39378 = 19.69 m),
+    # but v2 = its own across-track range (100798 = 50.40 m, ~2x the water column).
+    port = bytes.fromhex('eb07000000000000') + bytes.fromhex(
+        '0e0103090013d2b302190023be93062ae50131023fda04d80432')
+    sub = parse_subheader(port)
+    assert sub.channel == 0 and sub.layer == 0x0e
+    assert abs(sub.bottom_range_m - 19.689) < 0.01      # v1 (shared bottom depth)
+    assert abs(sub.display_range_m - 50.399) < 0.01     # v2 (across-track range)
+    # the down-look-only wrapper rejects a side-scan packet
+    assert parse_downlook_subheader(port) is None
+
+
 # ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
 
 def test_strip_first_layer_trailer_removes_delimited_trailer():
@@ -164,6 +258,18 @@ def test_strip_first_layer_trailer_keeps_clean_layer():
     # no trailer present -> unchanged (the delimiter, not a fixed length, bounds it)
     samples = bytes(range(40))
     assert strip_first_layer_trailer(samples) == samples
+
+
+def test_strip_first_layer_trailer_handles_firmware_without_96_03_opener():
+    # The 2026-06-10 GCV-20 wet capture trailer has an 'e6 24' opener, not the
+    # bench capture's '96 03'. Keying on '96 03' alone left this trailer in,
+    # which read back as constant per-packet bands in the waterfall. Anchor on
+    # the 0x43 opener + 52 80 10 magic instead. (Real bytes, both channels.)
+    samples = bytes(range(40))
+    down = bytes.fromhex('43d1e62449005280105b9ead026baaa40c')   # down-look
+    side = bytes.fromhex('43d2e6244aac025280105bc2af0267')       # side-scan
+    assert strip_first_layer_trailer(samples + down) == samples
+    assert strip_first_layer_trailer(samples + side) == samples
 
 
 def test_strip_first_layer_trailer_ignores_magic_far_from_end():

@@ -40,13 +40,14 @@ from .commands import (
     TRANSMIT_ON,
 )
 from .decode import (
-    CHANNEL_OFFSET, dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET,
+    CHANNEL_OFFSET, dark_layer, EB07, echo_layer, generation_from_layers,
     is_water_column, MIN_DATA_LEN, PingAssembler, status_transmitting)
 
 # Auxiliary GCV multicast streams the driver can listen to. The imagery group
 # is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
 STATUS_GROUP, STATUS_PORT = '239.254.2.2', 50050    # 8e03 status (tx flag + depth)
 CONFIG_GROUP, CONFIG_PORT = '239.254.2.11', 51000   # chartplotter CDP config (debug-capture only)
+GEN_VOTE_MIN = 5                # packets to vote before latching the generation
 
 
 def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
@@ -150,11 +151,12 @@ class GarminSidescanNode(Node):
         self.declare_parameter('freq_down_hz', 0.0)
         self.declare_parameter('sample_rate_hz', 0.0)
 
-        # device generation. 'auto' detects by packet geometry (GCV-10 emits
-        # >1000-byte imagery packets; GCV-20 never exceeds 953), which picks the
-        # right per-packet echo extractor. 'gcv20'/'gcv10' force it. A wrong
-        # choice silently yields a wrong-layer (gibberish) image -- no crash --
-        # so auto-detect is the default and a mismatch is warned.
+        # device generation. 'auto' detects from the render-layer structure
+        # (GCV-10 = 3 layers, GCV-20 <= 2; see decode.generation_from_layers),
+        # which is range-independent and picks the right per-packet echo
+        # extractor on every packet. 'gcv20'/'gcv10' force it. A wrong choice
+        # silently yields a wrong-layer (gibberish) image -- no crash -- so
+        # auto-detect is the default and a mismatch is warned.
         self.declare_parameter('device', 'auto')
         # Debug: when true, publish every raw UDP payload on ~/debug/raw
         # (std_msgs/UInt8MultiArray) so `ros2 bag record` captures fully
@@ -250,6 +252,7 @@ class GarminSidescanNode(Node):
         # for an explicit device; after geometry detection for 'auto').
         self._assembler = None
         self._detected_gen = None
+        self._gen_votes = {}          # structural generation votes (see _detect_generation)
         self._geom_warned = False
         # Sample format, set when the assembler is built from the generation
         # (GCV-20 = 16-bit uint16-LE, GCV-10 = 8-bit). Defaults are harmless
@@ -705,19 +708,23 @@ class GarminSidescanNode(Node):
 
     def _detect_generation(self, payload):
         """
-        Return the device generation from one imagery payload, or None.
+        Return the latched device generation, or None until enough packets vote.
 
-        Keys on the sub-header value-width tag at offset ``GEN_TAG_OFFSET``:
-        ``0x11`` (GCV-10) vs ``0x12`` (GCV-20). Verified 100% consistent across
-        thousands of packets on every channel (side-scan + down-look) in both
-        captures -- a positive, size-independent signal present on *every*
-        packet, unlike packet-size heuristics which a down-look-only or partial
-        stream can fool. ``MIN_DATA_LEN`` guarantees the tag byte is in bounds.
+        Uses the **structural** signal (:func:`generation_from_layers`: render-layer
+        count) -- range-independent, present on every sample packet, so a deep
+        GCV-20 is recognised immediately. (byte 13, the old "gen tag", is actually
+        the range bracket and mislabels a deep/shallow GCV-20.) Votes are
+        accumulated over the first :data:`GEN_VOTE_MIN` classifiable packets and
+        the majority latched, so one miscounted packet can't pick the wrong
+        extractor for the session.
         """
-        if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
+        if self._detected_gen is not None:
             return self._detected_gen
-        if self._detected_gen is None:
-            self._detected_gen = GEN_BY_TAG.get(payload[GEN_TAG_OFFSET])
+        gen = generation_from_layers(payload)
+        if gen is not None:
+            self._gen_votes[gen] = self._gen_votes.get(gen, 0) + 1
+            if sum(self._gen_votes.values()) >= GEN_VOTE_MIN:
+                self._detected_gen = max(self._gen_votes, key=self._gen_votes.get)
         return self._detected_gen
 
     def _classify_beam(self, payload):

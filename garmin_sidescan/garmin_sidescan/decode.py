@@ -28,24 +28,60 @@ Neither a frequency nor a usable per-ping timestamp is carried in the imagery
 sub-header, so the driver takes frequency from configuration and stamps pings
 with their receive time (see node.py).
 """
+from collections import namedtuple
 
 EB07 = b'\xeb\x07'
 D807 = b'\xd8\x07'
 STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
-STATUS_TX_OFFSET = 9             # byte[9]: 0x00 transmitting, 0x01 off
+# The :50050 stream multiplexes two 34-byte sub-types, discriminated by the
+# payload byte at offset 9 (see docs/gcv_protocol.md):
+#   0x00 / 0x01 -> settings echo, where byte 9 is also the transmit flag
+#                  (0x00 = transmitting, 0x01 = off)
+#   0xe4        -> a separate mode/status sub-type, broadcast regardless of tx state
+# Earlier bench notes read byte 9 as a bare transmit flag (0x00 on / 0x01 off);
+# the wet capture shows 0x00 and 0xe4 interleaved regardless of transmit state,
+# so byte 9 is (also) a sub-type selector.  We therefore read a transmit state
+# only from the 0x00/0x01 sub-types and treat the 0xe4 sub-type as carrying no
+# transmit information (rather than flapping it "off").
+#
+# The 0xe4 sub-type holds a u16 at offset 20 that we briefly took for a nadir
+# depth, but cross-checking the 2026-06-10 capture against the M3 multibeam
+# showed it is a HELD, coarse value that does NOT track depth (it lags by tens
+# of seconds and sits metres off the M3 nadir) -- so its meaning is unconfirmed
+# (a candidate mode/status field) and the driver does NOT decode or publish it.
+# A real nadir depth, if wanted, comes from bottom-tracking the down-look
+# imagery in a downstream node, not from this field.
+STATUS_SUBTYPE_OFFSET = 9
+STATUS_TX_OFFSET = STATUS_SUBTYPE_OFFSET     # legacy alias (tx flag == sub-type byte)
+STATUS_SUBTYPE_SETTINGS = 0x00
+
+
+def status_subtype(payload):
+    """
+    Return the ``8e03`` status sub-type byte (offset 9), or None if not status.
+
+    See the module constants for the meaning of each sub-type.
+    """
+    if payload[:2] != STATUS_MAGIC or len(payload) <= STATUS_SUBTYPE_OFFSET:
+        return None
+    return payload[STATUS_SUBTYPE_OFFSET]
 
 
 def status_transmitting(payload):
     """
-    Return transmit state from a GCV ``8e03`` status frame, or None if not one.
+    Return transmit state from a GCV ``8e03`` status frame, or None if unknown.
 
-    ``byte[9]`` is ``0x00`` while the sonar is transmitting and ``0x01`` when
-    off. (The same frame carries a depth field whose encoding is not yet
-    verified -- see the driver's debug capture.)
+    Reads the transmit flag only from the settings sub-type: ``0x00`` ->
+    transmitting, ``0x01`` -> off.  Returns None for a non-status payload and
+    for the ``0xe4`` sub-type (broadcast regardless of transmit state, so
+    reading it as "off" would flap the flag).
     """
-    if payload[:2] != STATUS_MAGIC or len(payload) <= STATUS_TX_OFFSET:
-        return None
-    return payload[STATUS_TX_OFFSET] == 0x00
+    sub = status_subtype(payload)
+    if sub == STATUS_SUBTYPE_SETTINGS:
+        return True
+    if sub == 0x01:
+        return False
+    return None
 
 
 # Render-layer header signatures (little-endian sample pairs).
@@ -56,17 +92,26 @@ SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
 
 # Each GCV-20 first-layer sample block ends with a fixed trailer record the
 # device appends before the next layer header (side-scan) or end of packet
-# (down-look):  ``43 <id> 96 03 | <op>[seq] | 52 80 10 | 5a <crc…>``.  The sample
-# length is *delimited* by this trailer, not length-prefixed -- the eb07
+# (down-look):  ``43 <id> <opener> | <op>[seq] | 52 80 10 | 5b <crc…>``.  The
+# sample length is *delimited* by this trailer, not length-prefixed -- the eb07
 # LE-length at offset 4 covers the whole payload, and the FH/SH headers are
 # fixed magic (identical on every packet regardless of size), so neither yields
 # the sample-region length.  We locate the trailer by its fixed inner magic and
-# cut the samples at the start of the trailer record, rather than assume a fixed
+# cut the samples at the ``0x43`` record opener, rather than assume a fixed
 # sample count (which varies with range / firmware / generation).  Left
 # undecoded, the trailer reads back as constant bright lines at every
 # packet-concatenation boundary in the waterfall (issue #26).
+#
+# The bytes between the ``0x43`` opener and the ``52 80 10`` magic vary by
+# firmware (an early bench capture had ``96 03``; the 2026-06-10 GCV-20 wet
+# capture has ``e6 24``) and the trailer appears on BOTH the down-look and
+# side-scan first layers.  So we anchor only on the two invariants -- the
+# ``0x43`` opener and the ``52 80 10`` magic ~6 bytes later -- not the variable
+# middle.  Keying on ``96 03`` alone (the old rule) left the trailer in place on
+# this firmware, which is exactly the residual banding seen in the waterfall.
 TRAILER_MAGIC = b'\x52\x80\x10'      # fixed inner magic of the trailer record
-TRAILER_OPENER = b'\x96\x03'         # '43 <id> 96 03' opener, just before it
+TRAILER_OPENER_BYTE = 0x43           # '43 <id>…' record-opener byte
+TRAILER_OPENER_SPAN = 10             # opener sits within this many bytes before the magic
 TRAILER_TAIL_WINDOW = 24             # trailer sits within this many bytes of the end
 # The first packet of a scan line begins with a per-ping header: one 16-bit
 # value repeated for a device-chosen run before the samples (reads back as the
@@ -81,16 +126,41 @@ CHANNEL_OFFSET = 12
 # identifiable intrinsically, independent of channel number or packet size.
 LAYER_OFFSET = 8
 WATER_COLUMN_LAYER = 0x0d
-# Sub-header value-width tag at payload offset 13 distinguishes the device
-# generation: 0x11 (GCV-10, 1-byte value) vs 0x12 (GCV-20, 2-byte value).
-# Verified 100% consistent across both captures, every channel -- a positive,
-# size-independent signal on every packet (unlike packet-size heuristics).
-GEN_TAG_OFFSET = 13
+# DEPRECATED: byte 13 was once read as a generation tag (0x11=GCV-10, 0x12=GCV-20),
+# but the 2026-06-10 capture disproved that -- it is the RANGE BRACKET
+# (:data:`RANGE_BRACKET_OFFSET` below; a GCV-20 shows 0x11/0x12/0x13 by range,
+# and the GCV-10 fixture shows 0x13 too). Generation is detected structurally
+# instead -- see :func:`generation_from_layers`. These constants are retained only
+# for reference / back-compat; do NOT use them to detect generation.
+GEN_TAG_OFFSET = 13             # == RANGE_BRACKET_OFFSET (range bracket, not gen)
 GEN_BY_TAG = {0x11: 'gcv10', 0x12: 'gcv20'}
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data
 # A real scan line is ~2048 bins; cap the accumulator so a degenerate stream
 # (one channel forever, no markers) can't grow it without bound.
 MAX_SCAN_BYTES = 65536
+
+
+def generation_from_layers(payload):
+    """
+    Return ``'gcv10'`` / ``'gcv20'`` from one eb07 packet's render-layer count.
+
+    This is the **range-independent** generation signal (byte 13 is the range
+    bracket, not a generation tag): GCV-10 packets carry 3 render layers (>= 2
+    ``SH``/``SHS`` later-layer headers; 8-bit "dark" echo), GCV-20 carry <= 2
+    (0-1 later-layer headers; 16-bit first-layer echo).  See
+    ``docs/gcv_protocol.md`` ("Generation is recoverable from packet structure").
+    Requires a first-layer header (``FH``/``FHS``) so non-sample packets (markers,
+    partials) return None.  Verified: GCV-20 packets reliably count <= 1 later
+    header (no coincidental ``SH`` in the 16-bit samples) across the 06-10 bag;
+    callers should still vote over a few packets to be safe (GCV-10 evidence is a
+    single fixture).
+    """
+    if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
+        return None
+    if payload.find(FH) < 0 and payload.find(FHS) < 0:
+        return None
+    later = payload.count(SH) + payload.count(SHS)
+    return 'gcv10' if later >= 2 else 'gcv20'
 
 
 def dark_layer(payload):
@@ -113,10 +183,10 @@ def strip_first_layer_trailer(layer):
     """
     Drop the per-packet trailer record the GCV-20 appends after the echo samples.
 
-    The trailer is delimited, not length-prefixed: ``43 <id> 96 03 … 52 80 10 …``.
-    Find its fixed magic near the end, confirm the ``96 03`` opener a few bytes
-    before (so sample data that coincidentally contains ``52 80 10`` elsewhere
-    can't trigger a cut), and return the bytes before the trailer record.
+    The trailer is delimited, not length-prefixed: ``43 <id> … 52 80 10 …``.
+    Find its fixed magic near the end, then the ``0x43`` record opener within a
+    few bytes before it (so sample data that coincidentally contains ``52 80 10``
+    elsewhere can't trigger a cut), and return the bytes before the opener.
     Returns ``layer`` unchanged when no trailer is present (older captures,
     synthetic packets), so the delimiter -- not a hard-coded length -- bounds the
     sample region.
@@ -124,11 +194,14 @@ def strip_first_layer_trailer(layer):
     m = layer.rfind(TRAILER_MAGIC)
     if m < 0 or m < len(layer) - TRAILER_TAIL_WINDOW:
         return layer
-    opener = layer.rfind(TRAILER_OPENER, max(0, m - 8), m)
+    # The record opens with 0x43 a handful of bytes before the magic (the bytes
+    # between vary by firmware -- see the module comment). The opener is the
+    # rightmost 0x43 in that span; an earlier coincidental 0x43 in real samples
+    # is left intact.
+    opener = layer.rfind(TRAILER_OPENER_BYTE, max(0, m - TRAILER_OPENER_SPAN), m)
     if opener < 0:
         return layer
-    # The record starts at the '43 <id>' two bytes before the '96 03' opener.
-    return layer[:max(0, opener - 2)]
+    return layer[:opener]
 
 
 def strip_leading_ping_header(block):
@@ -193,6 +266,99 @@ def is_water_column(payload):
     that.
     """
     return len(payload) > LAYER_OFFSET and payload[LAYER_OFFSET] == WATER_COLUMN_LAYER
+
+
+# eb07 sub-header range fields (see docs/gcv_protocol.md).
+RANGE_BRACKET_OFFSET = 13         # coarse range-bracket index (shared by all channels)
+RANGE_VARINT_OFFSET = 14          # down-look per-ping bottom-range LEB128 varint
+RANGE_UNIT_M = 0.0005             # 0.5 mm units (matches the TCP range command)
+
+
+def decode_leb128(buf, i):
+    """
+    Decode an unsigned LEB128 varint at ``buf[i:]``.
+
+    Returns ``(value, next_index)``. If the buffer ends before the varint
+    terminates, returns ``(None, end_index)`` -- the scan still advances ``i`` to
+    the end of the buffer, so the second element is the end index, not the
+    original ``i`` (callers should branch on the ``None`` value, not the index).
+    """
+    value = shift = 0
+    while i < len(buf):
+        b = buf[i]
+        value |= (b & 0x7F) << shift
+        i += 1
+        if not (b & 0x80):
+            return value, i
+        shift += 7
+    return None, i
+
+
+def subheader_bottom_range_m(payload):
+    """
+    Return the down-look per-ping bottom range (metres) from an eb07 sub-header.
+
+    The down-look (water-column) sub-header carries the device's measured bottom
+    range as an unsigned LEB128 varint at :data:`RANGE_VARINT_OFFSET`, in 0.5 mm
+    units (:data:`RANGE_UNIT_M`, the same unit as the TCP range command).
+    Validated against the M3 multibeam to ~1% (see ``docs/gcv_protocol.md``).
+    Returns None for a non-eb07 or non-down-look payload, or a short/garbled
+    sub-header.
+    """
+    if payload[:2] != EB07 or not is_water_column(payload):
+        return None
+    raw, _ = decode_leb128(payload, RANGE_VARINT_OFFSET)
+    if raw is None:
+        return None
+    return raw * RANGE_UNIT_M
+
+
+# Imagery sub-header: three LEB128 varints (0.5 mm units) with fixed markers,
+# the same layout on every channel --
+#   <layer> 01 03 09 <chan> <bracket> | v1 | 19 00 23 | v2 | 2a | v3 | 31 02 3f | FH…
+# (verified on 29k+ packets; see docs/gcv_protocol.md).
+#   v1 = measured bottom range/depth -- SHARED across channels (the boat's depth);
+#   v2 = this channel's display range/scan extent -- down-look = water-column
+#        depth range, side-scan = across-track slant range (~2x), so
+#        bin_size = v2 / n_bins is PER CHANNEL;
+#   v3 = a small near-field/start term (~0.1 m), per channel, meaning unconfirmed.
+Subheader = namedtuple(
+    'Subheader', 'channel layer bracket bottom_range_m display_range_m near_field_m')
+
+
+def parse_subheader(payload):
+    """
+    Parse an eb07 imagery sub-header (any channel), or return None.
+
+    Returns a :class:`Subheader`. ``display_range_m`` (v2) is this channel's own
+    scan extent -- water-column depth range on the down-look, across-track slant
+    range on the side-scan -- so bin size = ``display_range_m / n_bins`` must use
+    the matching channel. ``bottom_range_m`` (v1) is the shared bottom depth.
+    Validates the fixed markers (``01 03 09`` / ``19 00 23`` / ``2a``) so a
+    garbled payload yields None.
+    """
+    if (payload[:2] != EB07 or len(payload) < 33
+            or payload[9:12] != b'\x01\x03\x09'):
+        return None
+    v1, o = decode_leb128(payload, RANGE_VARINT_OFFSET)
+    if v1 is None or payload[o:o + 3] != b'\x19\x00\x23':
+        return None
+    v2, o = decode_leb128(payload, o + 3)
+    if v2 is None or o >= len(payload) or payload[o] != 0x2a:
+        return None
+    v3, _ = decode_leb128(payload, o + 1)
+    if v3 is None:
+        return None
+    return Subheader(payload[CHANNEL_OFFSET], payload[LAYER_OFFSET],
+                     payload[RANGE_BRACKET_OFFSET],
+                     v1 * RANGE_UNIT_M, v2 * RANGE_UNIT_M, v3 * RANGE_UNIT_M)
+
+
+def parse_downlook_subheader(payload):
+    """Parse the sub-header only for the down-look channel (else None)."""
+    if not is_water_column(payload):
+        return None
+    return parse_subheader(payload)
 
 
 class PingAssembler:
