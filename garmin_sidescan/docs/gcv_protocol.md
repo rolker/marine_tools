@@ -6,21 +6,29 @@ at-a-glance map; [patterns](#2-cross-message-patterns) calls out the structure
 shared across messages; the [per-message detail](#3-per-message-detail) sections
 give byte layouts.
 
+The foundational reverse engineering of the GCV Marine-Network protocol — the
+imagery stream (`eb07`/`d807` render-layer model) and the TCP command frames
+(`d207efbe`: transmit/range/TVG/interference) — is the work of **Dan
+Tauriello**, validated live on both the GCV-10 and GCV-20. The driver's
+`decode.py` and `commands.py` implement his findings. The status (`8e03` nadir
+depth) and config (`e508`/`e708`) decodes and the cross-message structural
+analysis in this document build on that base, from the 2026-06-10 capture.
+
 Every claim is grounded in a capture or in the driver source, not assumption.
 Provenance and anything still unverified are called out explicitly.
 
+- **Imagery + command frames** — reverse-engineered by **Dan Tauriello**;
+  authoritatively implemented and unit-tested in `garmin_sidescan/decode.py`
+  (imagery) and `garmin_sidescan/commands.py` (TCP control, verified live on
+  both generations 2026-06-05). This reference summarizes and cross-links them
+  rather than restating them. Command frames are transmitted, not captured.
+- **Status + config decode (this document)** — from the wet capture below.
 - **Wet capture:** `bag_2026-06-10T15.54.41_sidescan_raw` (gabby), 2026-06-10
   Piscataqua River deployment (rolker/unh_echoboats_project11#250):
   `debug/raw` (227,777 imagery datagrams), `debug/raw_status` (215),
   `debug/raw_config` (1,497), spanning two Cod Rock shoal passes.
 - **Ground truth for depth:** the M3 multibeam in the same sonar bag (same
   clock) — see [Validation](#4-validation-status-depth).
-- **Command frames** are from the driver's `commands.py` (reverse-engineered by
-  Dan Tauriello, verified live on both generations 2026-06-05); they are
-  transmitted, not captured.
-- Imagery internals are authoritatively documented and unit-tested in
-  `garmin_sidescan/decode.py`; this reference summarizes and cross-links rather
-  than restating them.
 
 ---
 
@@ -150,8 +158,9 @@ varint timestamp**. The same unsigned base-128 varint encodes the **range value
 Side-scan and down-look sample packets; a scan line is reassembled from a run of
 same-channel packets bracketed by `d807` markers. The render-layer model
 (per-generation echo extraction, GCV-10 "dark layer" vs GCV-20 16-bit first
-layer, trailer/leading-header stripping) is fully documented and unit-tested in
-**`decode.py`** — refer there for the authoritative layout. Key sub-header bytes
+layer, trailer/leading-header stripping) was reverse-engineered by **Dan Tauriello**
+and is fully documented and unit-tested in **`decode.py`** — refer there for the
+authoritative layout. Key sub-header bytes
 (full-frame offsets, after the 8-byte envelope):
 
 | offset | meaning |
