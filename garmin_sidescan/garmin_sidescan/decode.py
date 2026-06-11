@@ -241,6 +241,49 @@ def is_water_column(payload):
     return len(payload) > LAYER_OFFSET and payload[LAYER_OFFSET] == WATER_COLUMN_LAYER
 
 
+# eb07 sub-header range fields (see docs/gcv_protocol.md).
+RANGE_BRACKET_OFFSET = 13         # coarse range-bracket index (shared by all channels)
+RANGE_VARINT_OFFSET = 14          # down-look per-ping bottom-range LEB128 varint
+RANGE_UNIT_M = 0.0005             # 0.5 mm units (matches the TCP range command)
+
+
+def decode_leb128(buf, i):
+    """
+    Decode an unsigned LEB128 varint at ``buf[i:]``.
+
+    Returns ``(value, next_index)``, or ``(None, i)`` if the buffer ends before
+    the varint terminates.
+    """
+    value = shift = 0
+    while i < len(buf):
+        b = buf[i]
+        value |= (b & 0x7F) << shift
+        i += 1
+        if not (b & 0x80):
+            return value, i
+        shift += 7
+    return None, i
+
+
+def subheader_bottom_range_m(payload):
+    """
+    Return the down-look per-ping bottom range (metres) from an eb07 sub-header.
+
+    The down-look (water-column) sub-header carries the device's measured bottom
+    range as an unsigned LEB128 varint at :data:`RANGE_VARINT_OFFSET`, in 0.5 mm
+    units (:data:`RANGE_UNIT_M`, the same unit as the TCP range command).
+    Validated against the M3 multibeam to ~1% (see ``docs/gcv_protocol.md``).
+    Returns None for a non-eb07 or non-down-look payload, or a short/garbled
+    sub-header.
+    """
+    if payload[:2] != EB07 or not is_water_column(payload):
+        return None
+    raw, _ = decode_leb128(payload, RANGE_VARINT_OFFSET)
+    if raw is None:
+        return None
+    return raw * RANGE_UNIT_M
+
+
 class PingAssembler:
     """
     Reassemble GCV imagery datagrams into per-channel scan lines.

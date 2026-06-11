@@ -1,4 +1,25 @@
-# garmin_sidescan/tools — Marine Network proxy
+# garmin_sidescan/tools
+
+## `sidescan_waterfall.py` — offline waterfall image (QA)
+
+Renders a two-panel waterfall (down-look depth-corrected on top, side-scan
+port|starboard below, shared time axis) from a bag, using the **same decoder as
+the driver** (`garmin_sidescan.decode`). Self-contained — needs only the sidescan
+`debug/raw` topic (record with `debug_raw:=true`); no external nav/sonar. The
+metres-per-sample scale is self-derived from the device's per-ping **bottom-range
+varint** (sub-header offset 14), so there is no hard-coded calibration. Useful to
+eyeball decode quality (banding, range steps, bottom tracking) on any capture.
+
+```bash
+python3 tools/sidescan_waterfall.py BAG --start 100 --end 620 --out wf.png
+```
+
+Needs a sourced workspace (for `garmin_sidescan` on the path) plus numpy +
+matplotlib.
+
+---
+
+# Marine Network proxy
 
 The Garmin GCV sidescan sits on the Garmin **Marine Network** (172.16.0.0/16). A
 ROS host whose NIC won't link the Garmin PHY can't reach it directly, so run the

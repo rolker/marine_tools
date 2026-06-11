@@ -10,9 +10,10 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, is_water_column,
-    PingAssembler, SH, status_subtype, status_transmitting,
-    strip_first_layer_trailer, strip_leading_ping_header, TRAILER_MAGIC)
+    dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
+    is_water_column, PingAssembler, SH, status_subtype, status_transmitting,
+    strip_first_layer_trailer, strip_leading_ping_header,
+    subheader_bottom_range_m, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -174,6 +175,25 @@ def test_status_transmitting_ignores_e4_subtype():
     # flap the transmit flag to "off" (it shares byte 9 with the tx flag).
     assert status_transmitting(_STATUS_SUBTYPE_E4) is None
     assert status_transmitting(_STATUS_SETTINGS) is True
+
+
+# ----- down-look bottom-range varint (sub-header offset 14) ----------------
+
+def test_decode_leb128():
+    assert decode_leb128(bytes([0x05]), 0) == (5, 1)
+    assert decode_leb128(bytes([0x90, 0x7f]), 0) == (16272, 2)   # real value
+    assert decode_leb128(bytes([0x80]), 0) == (None, 1)          # unterminated
+
+
+def test_subheader_bottom_range_m():
+    # Real GCV-20 down-look sub-header (offset 8 = 0x0d layer, 13 = bracket,
+    # 14 = LEB128 bottom-range varint). 90 7f = 16272 * 0.5 mm = 8.136 m.
+    down = bytes.fromhex('eb07000000000000') + bytes.fromhex('0d0103090212907f190023')
+    assert abs(subheader_bottom_range_m(down) - 8.136) < 0.01
+    # side-scan layer (0x0e) -> None (no bottom range)
+    side = bytes.fromhex('eb07000000000000') + bytes.fromhex('0e0103090212907f190023')
+    assert subheader_bottom_range_m(side) is None
+    assert subheader_bottom_range_m(bytes([0xd8, 0x07]) + bytes(20)) is None  # not eb07
 
 
 # ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
