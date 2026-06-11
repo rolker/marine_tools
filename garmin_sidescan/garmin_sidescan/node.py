@@ -28,7 +28,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
-from std_msgs.msg import Bool, String, UInt8MultiArray
+from std_msgs.msg import Bool, Float64, String, UInt8MultiArray
 from std_srvs.srv import SetBool
 
 from .commands import (
@@ -41,7 +41,8 @@ from .commands import (
 )
 from .decode import (
     CHANNEL_OFFSET, dark_layer, EB07, echo_layer, GEN_BY_TAG, GEN_TAG_OFFSET,
-    is_water_column, MIN_DATA_LEN, PingAssembler, status_transmitting)
+    is_water_column, MIN_DATA_LEN, PingAssembler, status_depth_m,
+    status_transmitting)
 
 # Auxiliary GCV multicast streams the driver can listen to. The imagery group
 # is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
@@ -281,6 +282,10 @@ class GarminSidescanNode(Node):
         self._pub_diag = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
+        # Nadir bottom depth (metres) decoded from the :50050 0xe4 status frame.
+        # Latched: the device broadcasts it on-change and holds it between
+        # updates, so a late subscriber should get the last value.
+        self._pub_depth = self.create_publisher(Float64, '~/nadir_depth', latched)
         # Control set: volatile depth-10, NOT latched -- mirrors simrad_halo_radar
         # (the rqt control panel + udp_bridge are built around the radar's model).
         # transient_local does not cross the udp_bridge, and a volatile subscriber
@@ -632,6 +637,9 @@ class GarminSidescanNode(Node):
         if tx is not None:
             self._device_transmitting = tx
             self._last_status_t = time.monotonic()
+        depth_m = status_depth_m(payload)
+        if depth_m is not None:
+            self._pub_depth.publish(Float64(data=depth_m))
 
     def _rx_loop(self):
         sock = None

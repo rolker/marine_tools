@@ -61,6 +61,7 @@ Published (relative to the node namespace):
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
+| `nadir_depth` | `std_msgs/Float64` | latched bottom depth (m) decoded from the `:50050` `0xe4` status frame; published only on a real reading. Feet→m, M3-validated — see [`docs/gcv_protocol.md`](docs/gcv_protocol.md) |
 
 | `state` | `marine_radar_control_msgs/RadarControlSet` | latched operator-control set (CAMP renders it) |
 
