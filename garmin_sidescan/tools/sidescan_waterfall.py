@@ -12,11 +12,12 @@ over a time window:
 
 It is **self-contained** — it depends only on the sidescan ``debug/raw`` topic,
 no external nav/sonar (no M3). The metres-per-sample scale comes straight from
-the down-look sub-header: ``bin_size = display_range / n_bins`` where the display
-range is the per-ping ``v2`` varint (see ``docs/gcv_protocol.md``). No bottom
-detection, no hard-coded ladder. The decoded **bottom range** (``v1``) is drawn
-on the water-column panel as a check; the side-scan uses the down-look's per-
-bracket bin size (the range bracket, byte 13, is shared across channels).
+each channel's sub-header: ``bin_size = display_range / n_bins`` where the
+display range is that channel's per-ping ``v2`` varint (see
+``docs/gcv_protocol.md``). The down-look's v2 is the water-column depth range;
+the side-scan's v2 is the across-track slant range (~2x larger), so each channel
+is scaled by its OWN v2. No bottom detection, no hard-coded ladder. The down-look
+``v1`` (bottom range) is drawn on the water-column panel as a check.
 
 Requires a bag recorded with ``debug_raw:=true``. Run in a sourced workspace
 (needs ``garmin_sidescan`` on the path) with numpy + matplotlib available:
@@ -27,8 +28,7 @@ import argparse
 import sys
 
 from garmin_sidescan.decode import (
-    D807, EB07, echo_layer, is_water_column, parse_downlook_subheader,
-    PingAssembler, RANGE_BRACKET_OFFSET)
+    D807, EB07, echo_layer, parse_subheader, PingAssembler)
 import numpy as np
 from rclpy.serialization import deserialize_message
 import rosbag2_py
@@ -56,14 +56,13 @@ def read_pings(bag, raw_topic, start, end):
     """
     Assemble pings in ``[start, end]``.
 
-    Returns ``{channel: [(t, bracket, samples, sub)]}`` where ``sub`` is the
-    parsed down-look sub-header for the down channel (None for side-scan).
+    Returns ``{channel: [(t, sub, samples)]}`` where ``sub`` is the parsed
+    sub-header for that channel (None if it failed to parse).
     """
     r = _reader(bag)
     t0 = None
     asm = PingAssembler(echo_layer)
-    bracket = None
-    sub = None
+    subs = {}                         # channel -> latest parsed Subheader
     chans = {DOWN: [], PORT: [], STBD: []}
     while r.has_next():
         topic, data, ts = r.read_next()
@@ -77,28 +76,26 @@ def read_pings(bag, raw_topic, start, end):
         b = bytes(deserialize_message(data, UInt8MultiArray).data)
         out = []
         if b[:2] == EB07 and len(b) > 32:
-            bracket = b[RANGE_BRACKET_OFFSET]
-            if is_water_column(b):
-                sub = parse_downlook_subheader(b)
+            s = parse_subheader(b)
+            if s is not None:
+                subs[s.channel] = s
             out = asm.feed(b, recv_time=rel)
         elif b[:2] == D807:
             out = asm.feed(b, recv_time=rel)
         for ch, samp, st in out:
             if start <= st <= end and ch in chans:
-                chans[ch].append((st, bracket, samp, sub if ch == DOWN else None))
+                chans[ch].append((st, subs.get(ch), samp))
     return chans
 
 
-def bin_size_by_bracket(down_pings):
-    """median(display_range / n_bins) per range bracket -> metres/sample."""
-    acc = {}
-    for _st, bracket, samp, sub in down_pings:
-        if sub and sub.display_range_m and len(samp):
-            acc.setdefault(bracket, []).append(sub.display_range_m / (len(samp) // 2))
-    return {k: float(np.median(v)) for k, v in acc.items() if v}
+def _bin_size(sub, n_samples, fallback):
+    """metres/sample from this channel's own display range (v2)."""
+    if sub and sub.display_range_m and n_samples:
+        return sub.display_range_m / n_samples
+    return fallback
 
 
-def _normalize_col(col):
+def _normalize(col):
     v = col[np.isfinite(col)]
     if len(v) > 10:
         lo, hi = np.percentile(v, 35), np.percentile(v, 99.5)
@@ -106,22 +103,27 @@ def _normalize_col(col):
     return np.nan_to_num(col)
 
 
-def render(chans, bin_size, out, max_depth, across):
+def _median_bin(pings):
+    bs = [s.display_range_m / (len(samp) // 2)
+          for _t, s, samp in pings if s and s.display_range_m and len(samp)]
+    return float(np.median(bs)) if bs else 0.011
+
+
+def render(chans, out, max_depth, across):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    fallback = float(np.median(list(bin_size.values()))) if bin_size else 0.011
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
 
-    # top: down-look depth-corrected (per-ping bin = display_range / n_bins)
+    # top: down-look depth-corrected (per-ping bin = water-column v2 / n_bins)
+    fb_down = _median_bin(chans[DOWN])
     grid = np.linspace(0, max_depth, 560)
     dcols, dt, brl = [], [], []
-    for st, bracket, samp, sub in chans[DOWN]:
+    for st, sub, samp in chans[DOWN]:
         a = np.frombuffer(samp, dtype='<u2').astype(float)
-        bs = (sub.display_range_m / len(a)) if (sub and sub.display_range_m) \
-            else bin_size.get(bracket, fallback)
-        dcols.append(_normalize_col(np.interp(grid / bs, np.arange(len(a)), a, right=np.nan)))
+        bs = _bin_size(sub, len(a), fb_down)
+        dcols.append(_normalize(np.interp(grid / bs, np.arange(len(a)), a, right=np.nan)))
         dt.append(st)
         if sub and sub.bottom_range_m:
             brl.append((st, sub.bottom_range_m))
@@ -134,9 +136,10 @@ def render(chans, bin_size, out, max_depth, across):
     a1.set_ylabel('depth (m)')
     a1.set_ylim(max_depth, 0)
     a1.set_title('GCV sidescan waterfall — down-look (top) + side-scan (bottom); '
-                 'bin size = display_range / n_bins from the sub-header')
+                 'each channel scaled by its own display-range varint (v2)')
 
-    # bottom: side-scan port|starboard (per-bracket bin size; bracket is shared)
+    # bottom: side-scan port|starboard (each side scaled by its own v2)
+    fb_side = _median_bin(chans[PORT] + chans[STBD])
     n = min(len(chans[PORT]), len(chans[STBD]))
     NR = 420
     grid = np.linspace(0, across, NR)
@@ -145,10 +148,10 @@ def render(chans, bin_size, out, max_depth, across):
     for i in range(n):
         parts = []
         for side, flip in ((PORT, True), (STBD, False)):
-            st, bracket, samp, _ = chans[side][i]
+            st, sub, samp = chans[side][i]
             a = np.frombuffer(samp, dtype='<u2').astype(float)
-            bs = bin_size.get(bracket, fallback)
-            c = _normalize_col(np.interp(grid / bs, np.arange(len(a)), a, right=np.nan))
+            bs = _bin_size(sub, len(a), fb_side)
+            c = _normalize(np.interp(grid / bs, np.arange(len(a)), a, right=np.nan))
             parts.append(c[::-1] if flip else c)
         img[:, i] = np.concatenate(parts)
         stimes.append(chans[PORT][i][0])
@@ -170,7 +173,7 @@ def main(argv=None):
     ap.add_argument('--end', type=float, default=1e9, help='window end (s into bag)')
     ap.add_argument('--out', default='sidescan_waterfall.png', help='output PNG')
     ap.add_argument('--max-depth', type=float, default=20.0, help='water-column depth axis (m)')
-    ap.add_argument('--across', type=float, default=20.0,
+    ap.add_argument('--across', type=float, default=50.0,
                     help='side-scan across-track half-width (m)')
     args = ap.parse_args(argv)
 
@@ -180,10 +183,9 @@ def main(argv=None):
     chans = read_pings(args.bag, raw_topic, args.start, args.end)
     if not chans[DOWN]:
         sys.exit('error: no down-look pings decoded in the window')
-    bs = bin_size_by_bracket(chans[DOWN])
-    print('bin size per range bracket (mm/sample): '
-          + ', '.join(f'0x{k:02x}={v * 1000:.2f}' for k, v in sorted(bs.items())))
-    render(chans, bs, args.out, args.max_depth, args.across)
+    print(f'down-look bin ~{_median_bin(chans[DOWN]) * 1000:.2f} mm/sample, '
+          f'side-scan bin ~{_median_bin(chans[PORT] + chans[STBD]) * 1000:.2f} mm/sample')
+    render(chans, args.out, args.max_depth, args.across)
 
 
 if __name__ == '__main__':

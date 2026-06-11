@@ -262,12 +262,16 @@ verified byte-for-byte on **29,267 packets, 0 mismatches** (`parse_downlook_subh
     da 04 d8 04   FH header → samples begin
 ```
 
-- **v1 = measured bottom depth**, per ping (near-exact vs M3 — *not* the
-  held/laggy `0xe4` value).
-- **v2 = display range** (the auto-ranged scan extent). `v1/v2 ≈ 0.79` → the
-  bottom sits at ~79 % of the display. The metres-per-sample scale follows
-  directly: **`bin_size = v2 / n_bins`** (no bottom detection, no calibration
-  ladder, no M3 — `tools/sidescan_waterfall.py` uses exactly this).
+- **v1 = measured bottom depth**, per ping, and **shared across all channels**
+  (the boat's depth; near-exact vs M3 — *not* the held/laggy `0xe4` value).
+- **v2 = this channel's display range** — the auto-ranged scan extent, and it is
+  **per channel**: on the down-look it is the water-column depth range (e.g.
+  24.2 m, with `v1/v2 ≈ 0.79` so the bottom sits ~79 % down); on the side-scan it
+  is the across-track slant range (~50 m, ~2× the water column). So
+  **`bin_size = v2 / n_bins`** must use the matching channel's v2 (no bottom
+  detection, no ladder, no M3 — `tools/sidescan_waterfall.py` uses exactly this).
+  The same sub-header layout (and the structural markers) is present on every
+  channel; only the channel/layer bytes and v2/v3 differ.
 - **v3 ≈ 96 mm**, weakly depth-correlated — a candidate near-field/blanking or
   start-range term (possibly the residual sonar-vs-M3 offset).
 

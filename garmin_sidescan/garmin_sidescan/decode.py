@@ -285,28 +285,32 @@ def subheader_bottom_range_m(payload):
     return raw * RANGE_UNIT_M
 
 
-# Down-look sub-header: three LEB128 varints (0.5 mm units) with fixed markers --
-#   0d 01 03 09 <chan> <bracket> | v1 | 19 00 23 | v2 | 2a | v3 | 31 02 3f | FH…
+# Imagery sub-header: three LEB128 varints (0.5 mm units) with fixed markers,
+# the same layout on every channel --
+#   <layer> 01 03 09 <chan> <bracket> | v1 | 19 00 23 | v2 | 2a | v3 | 31 02 3f | FH…
 # (verified on 29k+ packets; see docs/gcv_protocol.md).
-DownlookSubheader = namedtuple(
-    'DownlookSubheader', 'bracket bottom_range_m display_range_m near_field_m')
+#   v1 = measured bottom range/depth -- SHARED across channels (the boat's depth);
+#   v2 = this channel's display range/scan extent -- down-look = water-column
+#        depth range, side-scan = across-track slant range (~2x), so
+#        bin_size = v2 / n_bins is PER CHANNEL;
+#   v3 = a small near-field/start term (~0.1 m), per channel, meaning unconfirmed.
+Subheader = namedtuple(
+    'Subheader', 'channel layer bracket bottom_range_m display_range_m near_field_m')
 
 
-def parse_downlook_subheader(payload):
+def parse_subheader(payload):
     """
-    Parse the full down-look eb07 sub-header, or return None.
+    Parse an eb07 imagery sub-header (any channel), or return None.
 
-    Returns a :class:`DownlookSubheader` with:
-      * ``bottom_range_m`` (v1) -- the device's measured bottom range/depth;
-      * ``display_range_m`` (v2) -- the auto-ranged scan extent
-        (``bin_size = display_range_m / n_bins``);
-      * ``near_field_m`` (v3) -- a small near-field/start term (~0.1 m, meaning
-        unconfirmed).
-    Validates the fixed markers (``19 00 23`` / ``2a`` / opening ``0d 01 03 09``)
-    so a garbled or non-down-look payload yields None.
+    Returns a :class:`Subheader`. ``display_range_m`` (v2) is this channel's own
+    scan extent -- water-column depth range on the down-look, across-track slant
+    range on the side-scan -- so bin size = ``display_range_m / n_bins`` must use
+    the matching channel. ``bottom_range_m`` (v1) is the shared bottom depth.
+    Validates the fixed markers (``01 03 09`` / ``19 00 23`` / ``2a``) so a
+    garbled payload yields None.
     """
-    if (payload[:2] != EB07 or not is_water_column(payload) or len(payload) < 33
-            or payload[8:12] != b'\x0d\x01\x03\x09'):
+    if (payload[:2] != EB07 or len(payload) < 33
+            or payload[9:12] != b'\x01\x03\x09'):
         return None
     v1, o = decode_leb128(payload, RANGE_VARINT_OFFSET)
     if v1 is None or payload[o:o + 3] != b'\x19\x00\x23':
@@ -317,8 +321,16 @@ def parse_downlook_subheader(payload):
     v3, _ = decode_leb128(payload, o + 1)
     if v3 is None:
         return None
-    return DownlookSubheader(payload[RANGE_BRACKET_OFFSET],
-                             v1 * RANGE_UNIT_M, v2 * RANGE_UNIT_M, v3 * RANGE_UNIT_M)
+    return Subheader(payload[CHANNEL_OFFSET], payload[LAYER_OFFSET],
+                     payload[RANGE_BRACKET_OFFSET],
+                     v1 * RANGE_UNIT_M, v2 * RANGE_UNIT_M, v3 * RANGE_UNIT_M)
+
+
+def parse_downlook_subheader(payload):
+    """Parse the sub-header only for the down-look channel (else None)."""
+    if not is_water_column(payload):
+        return None
+    return parse_subheader(payload)
 
 
 class PingAssembler:

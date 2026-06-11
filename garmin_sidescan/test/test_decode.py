@@ -11,9 +11,9 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
-    is_water_column, parse_downlook_subheader, PingAssembler, SH, status_subtype,
-    status_transmitting, strip_first_layer_trailer, strip_leading_ping_header,
-    subheader_bottom_range_m, TRAILER_MAGIC)
+    is_water_column, parse_downlook_subheader, parse_subheader, PingAssembler, SH,
+    status_subtype, status_transmitting, strip_first_layer_trailer,
+    strip_leading_ping_header, subheader_bottom_range_m, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -208,6 +208,19 @@ def test_parse_downlook_subheader():
     assert abs(sub.near_field_m - 0.089) < 0.01       # v3
     # garbled marker / non-down-look -> None (markers are validated)
     assert parse_downlook_subheader(bytes.fromhex('eb07000000000000') + bytes(30)) is None
+
+
+def test_parse_subheader_side_scan_has_own_display_range():
+    # Real side-scan (port) sub-header: layer 0x0e, v1 shared (39378 = 19.69 m),
+    # but v2 = its own across-track range (100798 = 50.40 m, ~2x the water column).
+    port = bytes.fromhex('eb07000000000000') + bytes.fromhex(
+        '0e0103090013d2b302190023be93062ae50131023fda04d80432')
+    sub = parse_subheader(port)
+    assert sub.channel == 0 and sub.layer == 0x0e
+    assert abs(sub.bottom_range_m - 19.689) < 0.01      # v1 (shared bottom depth)
+    assert abs(sub.display_range_m - 50.399) < 0.01     # v2 (across-track range)
+    # the down-look-only wrapper rejects a side-scan packet
+    assert parse_downlook_subheader(port) is None
 
 
 # ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
