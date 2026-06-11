@@ -205,6 +205,18 @@ def test_strip_first_layer_trailer_keeps_clean_layer():
     assert strip_first_layer_trailer(samples) == samples
 
 
+def test_strip_first_layer_trailer_handles_firmware_without_96_03_opener():
+    # The 2026-06-10 GCV-20 wet capture trailer has an 'e6 24' opener, not the
+    # bench capture's '96 03'. Keying on '96 03' alone left this trailer in,
+    # which read back as constant per-packet bands in the waterfall. Anchor on
+    # the 0x43 opener + 52 80 10 magic instead. (Real bytes, both channels.)
+    samples = bytes(range(40))
+    down = bytes.fromhex('43d1e62449005280105b9ead026baaa40c')   # down-look
+    side = bytes.fromhex('43d2e6244aac025280105bc2af0267')       # side-scan
+    assert strip_first_layer_trailer(samples + down) == samples
+    assert strip_first_layer_trailer(samples + side) == samples
+
+
 def test_strip_first_layer_trailer_ignores_magic_far_from_end():
     # a 52 80 10 byte sequence deep in the samples must not trigger a cut
     layer = TRAILER_MAGIC + bytes(60)

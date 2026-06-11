@@ -105,17 +105,26 @@ SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
 
 # Each GCV-20 first-layer sample block ends with a fixed trailer record the
 # device appends before the next layer header (side-scan) or end of packet
-# (down-look):  ``43 <id> 96 03 | <op>[seq] | 52 80 10 | 5a <crc…>``.  The sample
-# length is *delimited* by this trailer, not length-prefixed -- the eb07
+# (down-look):  ``43 <id> <opener> | <op>[seq] | 52 80 10 | 5b <crc…>``.  The
+# sample length is *delimited* by this trailer, not length-prefixed -- the eb07
 # LE-length at offset 4 covers the whole payload, and the FH/SH headers are
 # fixed magic (identical on every packet regardless of size), so neither yields
 # the sample-region length.  We locate the trailer by its fixed inner magic and
-# cut the samples at the start of the trailer record, rather than assume a fixed
+# cut the samples at the ``0x43`` record opener, rather than assume a fixed
 # sample count (which varies with range / firmware / generation).  Left
 # undecoded, the trailer reads back as constant bright lines at every
 # packet-concatenation boundary in the waterfall (issue #26).
+#
+# The bytes between the ``0x43`` opener and the ``52 80 10`` magic vary by
+# firmware (an early bench capture had ``96 03``; the 2026-06-10 GCV-20 wet
+# capture has ``e6 24``) and the trailer appears on BOTH the down-look and
+# side-scan first layers.  So we anchor only on the two invariants -- the
+# ``0x43`` opener and the ``52 80 10`` magic ~6 bytes later -- not the variable
+# middle.  Keying on ``96 03`` alone (the old rule) left the trailer in place on
+# this firmware, which is exactly the residual banding seen in the waterfall.
 TRAILER_MAGIC = b'\x52\x80\x10'      # fixed inner magic of the trailer record
-TRAILER_OPENER = b'\x96\x03'         # '43 <id> 96 03' opener, just before it
+TRAILER_OPENER_BYTE = 0x43           # '43 <id>…' record-opener byte
+TRAILER_OPENER_SPAN = 10             # opener sits within this many bytes before the magic
 TRAILER_TAIL_WINDOW = 24             # trailer sits within this many bytes of the end
 # The first packet of a scan line begins with a per-ping header: one 16-bit
 # value repeated for a device-chosen run before the samples (reads back as the
@@ -162,10 +171,10 @@ def strip_first_layer_trailer(layer):
     """
     Drop the per-packet trailer record the GCV-20 appends after the echo samples.
 
-    The trailer is delimited, not length-prefixed: ``43 <id> 96 03 … 52 80 10 …``.
-    Find its fixed magic near the end, confirm the ``96 03`` opener a few bytes
-    before (so sample data that coincidentally contains ``52 80 10`` elsewhere
-    can't trigger a cut), and return the bytes before the trailer record.
+    The trailer is delimited, not length-prefixed: ``43 <id> … 52 80 10 …``.
+    Find its fixed magic near the end, then the ``0x43`` record opener within a
+    few bytes before it (so sample data that coincidentally contains ``52 80 10``
+    elsewhere can't trigger a cut), and return the bytes before the opener.
     Returns ``layer`` unchanged when no trailer is present (older captures,
     synthetic packets), so the delimiter -- not a hard-coded length -- bounds the
     sample region.
@@ -173,11 +182,14 @@ def strip_first_layer_trailer(layer):
     m = layer.rfind(TRAILER_MAGIC)
     if m < 0 or m < len(layer) - TRAILER_TAIL_WINDOW:
         return layer
-    opener = layer.rfind(TRAILER_OPENER, max(0, m - 8), m)
+    # The record opens with 0x43 a handful of bytes before the magic (the bytes
+    # between vary by firmware -- see the module comment). The opener is the
+    # rightmost 0x43 in that span; an earlier coincidental 0x43 in real samples
+    # is left intact.
+    opener = layer.rfind(TRAILER_OPENER_BYTE, max(0, m - TRAILER_OPENER_SPAN), m)
     if opener < 0:
         return layer
-    # The record starts at the '43 <id>' two bytes before the '96 03' opener.
-    return layer[:max(0, opener - 2)]
+    return layer[:opener]
 
 
 def strip_leading_ping_header(block):
