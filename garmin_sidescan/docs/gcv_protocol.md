@@ -167,8 +167,8 @@ authoritative layout. Key sub-header bytes
 |-------:|---------|
 | 8 | render-layer / beam-type byte: `0x0d` down-look (water column), `0x0e`/`0x0f` side-scan |
 | 12 | channel number (GCV-20 map: 0 = port, 1 = stbd, 2 = down) |
-| 13 | **range/scale index** (small integer, steps with range — see below). NOT a generation tag. |
-| 14–18 | per-ping token: a 2-byte counter at 14–15 (changes every ping) flanked by range-coupled bytes; also appears in the `d807` marker ([pattern D](#d-a-ping-link-token-ties-markers-to-data)) |
+| 13 | **range/scale index** — the coarse display bracket; steps with range (`0x11`/`0x12`/`0x13` seen), shared by all channels. NOT a generation tag (see below). |
+| 14… | **LEB128 varint** — on the down-look, the per-ping **measured bottom range** (~0.5 mm units, see below). Variable length (2–3 B), then a `19 00 23` marker. (This is the "token" the `d807` marker echoes — [pattern D](#d-a-ping-link-token-ties-markers-to-data) — not a sequence counter.) |
 
 Frequency and a per-ping timestamp are **not** carried; the driver takes
 frequency from a parameter and stamps scan lines with receive time (see
@@ -185,8 +185,8 @@ Diffing the three channels' sub-headers within one range/time window
 | 9–11 | `01 03 09` | `01 03 09` | `01 03 09` | constant |
 | **12** | **`00`** | **`01`** | **`02`** | **channel number** |
 | 13 | `13` | `13` | `13` | range index (same on all channels) |
-| 14–19 | identical | identical | identical | per-ping counter / token |
-| 20–22 | `be 93 06` | `be 93 06` | `c4 fa 02` | start of sample/render data (differs by beam content) |
+| 14… | varint + `19 00 23` | varint + … | varint + … | per-ping range varint (down-look = bottom range); whether the side-scan value is meaningful is open |
+| (after) | `be 93 06` | `be 93 06` | `c4 fa 02` | further sub-header / start of render data |
 
 So:
 
@@ -208,18 +208,17 @@ So:
 assertion was an over-eager guess, not a verified fact:
 
 - On a single GCV-20, byte 13 takes **`0x11`, `0x12`, and `0x13`** purely as a
-  function of range — identical on all three channels, stepping at exactly the
-  Cod Rock auto-range transitions (`0x13` deep ~52 m / `0x12` shoal ~31 m /
-  `0x11` shallowest).
+  function of range — identical on all three channels, stepping at the auto-range
+  transitions (`0x13` ≈ 19 m display / `0x12` ≈ 14 m / `0x11` shallowest,
+  recovery-only).
 - The **GCV-10** survey fixture reads byte 13 = **`0x13`** — the *same* value a
   GCV-20 produces in deep water. A value shared across generations cannot be a
   generation tag.
 
-So byte 13 is a **range/scale step index** (higher = longer range). It is the
-only field we have *read* that tracks range; it is an index, so converting it to
-metres needs a calibrated ladder (only three adjacent steps, `0x11`–`0x13`, are
-in the data so far — a TCP range-sweep would map the rest). The active range is
-otherwise not broadcast as a value (see §3.5 and #32).
+So byte 13 is the **coarse range bracket** (higher = longer range), one of two
+range controls — the other is the per-ping bottom-range varint below. It is an
+index, so converting it to metres needs a calibrated ladder (only `0x11`–`0x13`
+seen so far; a TCP range-sweep would map the rest).
 
 Why `decode.py`'s old detection still "worked": its default extractor is GCV-10,
 and its one live rule (`0x12` → switch to GCV-20) happens to fire for the common
@@ -244,27 +243,27 @@ its `SH`/`SHS` headers (≥2 → GCV-10, ≤1 → GCV-20)** — no external gene
 knowledge, and immune to the range-coupling that makes byte 13 unusable for this.
 (GCV-10 evidence is one 16-packet fixture; widen before relying on it.)
 
-#### Deriving range / bin size from the data
+#### Range has two controls: the byte-13 bracket + the per-ping bottom-range varint
 
-Bin count is fixed (~2080 samples) regardless of range, so **bin size** (metres
-per sample) carries the range. It can be derived without decoding any header:
-find the bottom-return index in the down-look (water-column) channel and combine
-with an **independent** depth (the M3 multibeam — the `0xe4` field is not a usable
-depth, §4):
+The device auto-ranges with **two** controls:
 
-```
-bin_size = depth / bottom_index          # m per sample (down-look is vertical)
-range    = n_bins * bin_size
-```
+1. **Coarse:** byte 13 (above) — the display bracket, shared by all channels,
+   steps rarely. Each value maps to a bin size: `0x13` ≈ 9.2 mm/sample
+   (~19 m display), `0x12` ≈ 6.8 mm/sample (~14 m); step ≈ ×4⁄3.
+2. **Fine (down-look):** the **offset-14 LEB128 varint** is the **measured
+   bottom range, per ping**, in **~0.5 mm units** (the same unit as the TCP range
+   command). Decoded vs M3 depth: `16272 @ 7.9 m`, `23186 @ 11.5 m`,
+   `36594 @ 18.0 m` → ≈ **2036 units/m** = 1/(0.5 mm). It updates every ping, so
+   the down-look re-ranges far more often than the side-scan (which carries no
+   live bottom range here) — directly visible as the water-column display
+   adjusting continuously while the side-scan holds.
 
-2026-06-10 (byte-13 range index, §3.1): `0x13` ≈ 9.2 mm/sample → ~19 m range;
-`0x12` ≈ 6.8 mm/sample → ~14 m; step ≈ ×4⁄3 (geometric). `0x11` only appeared
-during recovery and is not measurable. The down-look bottom (the strong
-sustained band at ~60–90 % of the display, **not** the near-field reflector at
-~28 %) corrected by this ladder tracks the M3 bathymetry. Numbers are still
-*derived* (noisy bottom detection) and carry a residual sonar-vs-M3 offset (a
-transducer-depth/blanking term not yet pinned); a TCP range-sweep would
-calibrate the whole ladder cleanly.
+So the down-look reports a clean per-ping bottom range itself; `n_bins`
+(scan-line length) is **not** a range control — it sits at ~2034, and the short
+values (848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly
+artifacts. Cross-checking the bottom-return index against the M3 multibeam
+confirms the bin-size ladder tracks the real bathymetry, with a residual
+sonar-vs-M3 offset (a transducer-depth/blanking term) not yet pinned.
 
 ### 3.2 Channel marker — `d807` (`239.254.2.1:50220`)
 
@@ -310,14 +309,13 @@ offset 17 18 19 | 20 21 | 22 23
         00 00 00 | VV VV | 00 00      value = u16_LE(20)  (offsets 17-19/22-23 = 00)
 ```
 
-This `u16` looked like a nadir depth at first (`raw/1000` ≈ feet matched M3 in
-the flat channel), but the M3 cross-check disproved it — see
-[§4](#4-the-0xe4-value-is-not-a-usable-depth). It is **held** (one value for tens
-of seconds), lags M3 by 2–7 m, and does not track the bottom; the driver does
-**not** decode or publish it. Most likely it belongs to a mode/status field
-we have not fully deciphered. A real nadir depth, if needed, comes from
-bottom-tracking the down-look imagery in a downstream node (issue #16). Example
-frame: `…02 e4 …00 00 00 d8 ba 00 00…` → `0xbad8` = 47832.
+The offset-20 `u16` is **not a depth**: it is **held** (one value for tens of
+seconds), lags the M3 nadir by 2–7 m, and does not track the bottom (it only
+*looked* depth-like because its mean and Cod-Rock dips happened to align). Its
+meaning is unconfirmed — likely a mode/status field. The driver does **not**
+decode or publish it. A real per-ping bottom range is instead in the **down-look
+imagery sub-header** (§3.1, offset-14 varint); for a nadir *depth*, bottom-track
+the down-look in a downstream node (issue #16).
 
 **Sub-type `0x00` — settings echo (NOT the active range):**
 
@@ -366,62 +364,33 @@ chartplotter's auto-range.
 
 ---
 
-## 4. The `0xe4` value is not a usable depth
+## 4. Ground-truth method (M3 multibeam)
 
-The `0xe4` sub-type's offset-20 `u16` was cross-checked against the M3 multibeam
-(same sonar bag, same clock). At first it looked like a feet × 1000 nadir depth:
-its *mean* matched M3 (44.3 vs 43.7 ft) and it dipped at each Cod Rock pass
-(Pearson r ≈ 0.80). But those aggregate stats hid the real behaviour — per-ping
-it does **not** track depth:
-
-- It is **held**: one value for tens of seconds, then a step. Over a 0x13→shoal
-  approach it stayed `14.91 m` while M3 fell continuously 11.1 → 8.2 m
-  (diff up to **+6.7 m**), then jumped to `8.85 m` and held while M3 wandered
-  5–6.5 m.
-- The **same range index** (0x13) appears at both ~15 m (flat channel, where the
-  value happened to agree with M3) and ~8–11 m (shoal approach, where it did
-  not) — so its agreement in flat water was coincidental, not tracking.
-- Independently, the **down-look bottom return** (depth-corrected by the
-  bin-size ladder, §3.1) *does* follow M3's bathymetry — confirming M3 is the
-  truth and the `0xe4` value is the odd one out.
-
-So the `0xe4` value is not a depth the device meaningfully reports; its meaning
-is unconfirmed (a candidate mode/status field). The driver does not publish it.
-For a real nadir depth, bottom-track the down-look imagery downstream (issue
-#16). (M3 bottom depth per ping = median over beams of
-`twtt/2 · sound_speed · cos(rx_angle)`, sound_speed ≈ 1498 m/s from `ping_info`.)
+Decodes that needed a depth/bathymetry reference were checked against the M3
+multibeam in the same sonar bag (same gabby clock). M3 bottom depth per ping =
+median over beams of `twtt/2 · sound_speed · cos(rx_angle)` (sound_speed ≈ 1498
+m/s from `ping_info`). Boat position is in `/bizzy/odom` — used to locate the two
+Cod Rock crossings (the survey lines, ~t174 & ~t561) vs the dock return (end of
+bag). The M3 confirms the bin-size ladder and bottom-range varint (§3.1) and
+disproved the `0xe4`-as-depth reading (§3.4).
 
 ---
 
 ## 5. Open questions
 
-- **Byte-9 sub-type / the `0xe4` value.** Byte 9 is both the transmit flag
-  (`0x00` = transmitting, `0x01` = off, from a bench capture) **and** a sub-type
-  selector — this wet capture shows `0x00` / `0xe4`, never `0x01`, interleaved
-  regardless of transmit state, so `status_transmitting` reads a state only from
-  `0x00`/`0x01` and ignores `0xe4`. What the `0xe4` sub-type's offset-20 `u16`
-  actually means is still open (it is **not** depth — §4); likely a mode/status
-  field. Worth a `:50050` capture across known device states to decipher.
-- **`00 00` after every magic** — high half of a 32-bit id, or reserved? Always
-  zero here.
-- **Node id bodies** (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`) — MAC/serial mapping
-  unconfirmed; only used to tell the two announcing devices apart.
-- **`e508` value records** (`27 74 07 72`, `0f 58 04`, `0e 03 04 51 59 04 69`)
-  and the `0x00`-status settings block (`ae 05 c0 …`) — field decodes unknown;
-  not required for depth or range.
-- **`d107` / `d807` payload bodies** beyond the shared tokens — undecoded; not
-  needed (driver relies on the real chartplotter and reassembles by channel
-  run).
-- **Byte 13 (resolved here): a range/scale index, not a generation tag** — see
-  §3.1. Open part: it's an *index*; mapping the full ladder to metres needs a TCP
-  range-sweep (only `0x11`–`0x13` seen so far). `decode.py` should switch its
-  generation detection to the structural (layer-count) test in §3.1 — tracked as
-  a decode bug.
-- **Range value** — the active range is not broadcast as a value on any captured
-  stream; recover it via the down-look bin-size derivation (§3.1) or, once
-  calibrated, the byte-13 index. #32-B (pin range over TCP) remains the way to
-  *hold* a known swath.
-- **Nadir depth** — not reported usably by the device (§4). If wanted, a
-  downstream node bottom-tracks the published `sonar_image_down`; any
-  draft/tide/transducer-offset correction is that node's concern, not the
-  driver's.
+- **Imagery sub-header varints (down-look).** Offset-14 = per-ping bottom range
+  in ~0.5 mm units (§3.1); there are 1–2 more varints after the `2a` marker that
+  also track depth — not yet parsed. The full down-look sub-header structure
+  (and whether the side-scan carries an analogous field) is the next decode step.
+- **Byte 13 → metres.** Only `0x11`–`0x13` seen; a TCP range-sweep would map the
+  full bracket ladder. `decode.py` should also switch generation detection from
+  byte 13 to the structural (layer-count) test (§3.1) — a tracked decode bug.
+- **`0xe4` sub-type value** — not depth (§3.4); meaning open. A `:50050` capture
+  across known device states would decipher it.
+- **`00 00` after every magic** — high half of a 32-bit id, or reserved?
+- **Node id bodies** (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`), **`e508` value
+  records**, and the **`0x00`-status settings block** (`ae 05 c0 …`) — field
+  decodes unknown; not yet needed.
+- **Nadir depth** — not reported usably by the device. If wanted, a downstream
+  node bottom-tracks `sonar_image_down`; draft/tide/transducer-offset correction
+  is that node's concern, not the driver's.
