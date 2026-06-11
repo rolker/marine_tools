@@ -19,6 +19,13 @@ the side-scan's v2 is the across-track slant range (~2x larger), so each channel
 is scaled by its OWN v2. No bottom detection, no hard-coded ladder. The down-look
 ``v1`` (bottom range) is drawn on the water-column panel as a check.
 
+Sample values are shown **as decoded** (raw ``uint16``) on a single global
+linear brightness scale per panel — no per-ping/contrast manipulation, so the
+device's real brightness (e.g. the range-bracket gain step) is visible. The only
+transform is spatial: resampling sample-index onto a metric axis. ``vmax``
+defaults to a global high percentile (robust to the near-field spike); override
+with ``--vmax``/``--vmin`` for the full ``uint16`` range.
+
 Requires a bag recorded with ``debug_raw:=true``. Run in a sourced workspace
 (needs ``garmin_sidescan`` on the path) with numpy + matplotlib available:
 
@@ -95,40 +102,49 @@ def _bin_size(sub, n_samples, fallback):
     return fallback
 
 
-def _normalize(col):
-    v = col[np.isfinite(col)]
-    if len(v) > 10:
-        lo, hi = np.percentile(v, 35), np.percentile(v, 99.5)
-        col = np.clip((col - lo) / (hi - lo + 1e-9), 0, 1)
-    return np.nan_to_num(col)
-
-
 def _median_bin(pings):
     bs = [s.display_range_m / (len(samp) // 2)
           for _t, s, samp in pings if s and s.display_range_m and len(samp)]
     return float(np.median(bs)) if bs else 0.011
 
 
-def render(chans, out, max_depth, across):
+def _column(samp, sub, grid, fallback):
+    """Resample a ping onto the metric grid -- RAW values, NaN beyond range."""
+    a = np.frombuffer(samp, dtype='<u2').astype(float)
+    bs = _bin_size(sub, len(a), fallback)
+    return np.interp(grid / bs, np.arange(len(a)), a, right=np.nan)
+
+
+def _show_raw(ax, img, extent, cmap, vmin, vmax):
+    """Draw raw sample values on one global linear scale; NaN -> black."""
+    import matplotlib.pyplot as plt
+    finite = img[np.isfinite(img)]
+    vlo = 0.0 if vmin is None else vmin
+    vhi = vmax if vmax is not None else (float(np.percentile(finite, 99.5))
+                                         if len(finite) else 1.0)
+    cm = plt.get_cmap(cmap).copy()
+    cm.set_bad('black')
+    ax.imshow(img, aspect='auto', cmap=cm, interpolation='bilinear',
+              extent=extent, vmin=vlo, vmax=vhi)
+
+
+def render(chans, out, max_depth, across, vmin, vmax):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
 
-    # top: down-look depth-corrected (per-ping bin = water-column v2 / n_bins)
+    # top: down-look depth-corrected (raw values, one global scale)
     fb_down = _median_bin(chans[DOWN])
     grid = np.linspace(0, max_depth, 560)
     dcols, dt, brl = [], [], []
     for st, sub, samp in chans[DOWN]:
-        a = np.frombuffer(samp, dtype='<u2').astype(float)
-        bs = _bin_size(sub, len(a), fb_down)
-        dcols.append(_normalize(np.interp(grid / bs, np.arange(len(a)), a, right=np.nan)))
+        dcols.append(_column(samp, sub, grid, fb_down))
         dt.append(st)
         if sub and sub.bottom_range_m:
             brl.append((st, sub.bottom_range_m))
-    a1.imshow(np.array(dcols).T, aspect='auto', cmap='magma', interpolation='bilinear',
-              extent=[dt[0], dt[-1], max_depth, 0])
+    _show_raw(a1, np.array(dcols).T, [dt[0], dt[-1], max_depth, 0], 'magma', vmin, vmax)
     if brl:
         a1.plot([x[0] for x in brl], [x[1] for x in brl], '.', color='cyan', ms=2,
                 label='bottom range (sub-header v1)')
@@ -136,27 +152,21 @@ def render(chans, out, max_depth, across):
     a1.set_ylabel('depth (m)')
     a1.set_ylim(max_depth, 0)
     a1.set_title('GCV sidescan waterfall — down-look (top) + side-scan (bottom); '
-                 'each channel scaled by its own display-range varint (v2)')
+                 'raw samples on a single global brightness scale')
 
     # bottom: side-scan port|starboard (each side scaled by its own v2)
     fb_side = _median_bin(chans[PORT] + chans[STBD])
     n = min(len(chans[PORT]), len(chans[STBD]))
     NR = 420
     grid = np.linspace(0, across, NR)
-    img = np.zeros((2 * NR, n))
+    img = np.full((2 * NR, n), np.nan)
     stimes = []
     for i in range(n):
-        parts = []
-        for side, flip in ((PORT, True), (STBD, False)):
-            st, sub, samp = chans[side][i]
-            a = np.frombuffer(samp, dtype='<u2').astype(float)
-            bs = _bin_size(sub, len(a), fb_side)
-            c = _normalize(np.interp(grid / bs, np.arange(len(a)), a, right=np.nan))
-            parts.append(c[::-1] if flip else c)
-        img[:, i] = np.concatenate(parts)
+        cp = _column(chans[PORT][i][2], chans[PORT][i][1], grid, fb_side)
+        cs = _column(chans[STBD][i][2], chans[STBD][i][1], grid, fb_side)
+        img[:, i] = np.concatenate([cp[::-1], cs])
         stimes.append(chans[PORT][i][0])
-    a2.imshow(img, aspect='auto', cmap='copper', interpolation='bilinear',
-              extent=[stimes[0], stimes[-1], across, -across])
+    _show_raw(a2, img, [stimes[0], stimes[-1], across, -across], 'copper', vmin, vmax)
     a2.axhline(0, color='cyan', lw=0.5, alpha=0.5)
     a2.set_ylabel('across-track (m)\nPORT <- 0 -> STBD')
     a2.set_xlabel('time in bag (s)')
@@ -175,6 +185,11 @@ def main(argv=None):
     ap.add_argument('--max-depth', type=float, default=20.0, help='water-column depth axis (m)')
     ap.add_argument('--across', type=float, default=50.0,
                     help='side-scan across-track half-width (m)')
+    ap.add_argument('--vmin', type=float, default=None,
+                    help='raw-value black point (default 0)')
+    ap.add_argument('--vmax', type=float, default=None,
+                    help='raw-value white point (default a global 99.5%% percentile; '
+                         'use 65535 for full uint16 range)')
     args = ap.parse_args(argv)
 
     raw_topic = find_raw_topic(args.bag)
@@ -185,7 +200,7 @@ def main(argv=None):
         sys.exit('error: no down-look pings decoded in the window')
     print(f'down-look bin ~{_median_bin(chans[DOWN]) * 1000:.2f} mm/sample, '
           f'side-scan bin ~{_median_bin(chans[PORT] + chans[STBD]) * 1000:.2f} mm/sample')
-    render(chans, args.out, args.max_depth, args.across)
+    render(chans, args.out, args.max_depth, args.across, args.vmin, args.vmax)
 
 
 if __name__ == '__main__':

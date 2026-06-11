@@ -402,6 +402,12 @@ disproved the `0xe4`-as-depth reading (§3.4).
   byte 13 to the structural (layer-count) test (§3.1) — a tracked decode bug.
 - **`0xe4` sub-type value** — not depth (§3.4); meaning open. A `:50050` capture
   across known device states would decipher it.
+- **Gain coupled to the range bracket.** Raw sample brightness *steps* at each
+  byte-13 transition (higher gain at short range `0x12`, lower at long range
+  `0x13`) — a range-coupled TVG/AGC the device applies before sending samples.
+  Whether a separate gain field is encoded (vs. implied by the bracket) is open.
+  The driver publishes samples as-is; any gain normalization is a downstream
+  concern.
 - **`00 00` after every magic** — high half of a 32-bit id, or reserved?
 - **Node id bodies** (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`), **`e508` value
   records**, and the **`0x00`-status settings block** (`ae 05 c0 …`) — field
