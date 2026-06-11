@@ -28,6 +28,7 @@ Neither a frequency nor a usable per-ping timestamp is carried in the imagery
 sub-header, so the driver takes frequency from configuration and stamps pings
 with their receive time (see node.py).
 """
+from collections import namedtuple
 
 EB07 = b'\xeb\x07'
 D807 = b'\xd8\x07'
@@ -282,6 +283,42 @@ def subheader_bottom_range_m(payload):
     if raw is None:
         return None
     return raw * RANGE_UNIT_M
+
+
+# Down-look sub-header: three LEB128 varints (0.5 mm units) with fixed markers --
+#   0d 01 03 09 <chan> <bracket> | v1 | 19 00 23 | v2 | 2a | v3 | 31 02 3f | FH…
+# (verified on 29k+ packets; see docs/gcv_protocol.md).
+DownlookSubheader = namedtuple(
+    'DownlookSubheader', 'bracket bottom_range_m display_range_m near_field_m')
+
+
+def parse_downlook_subheader(payload):
+    """
+    Parse the full down-look eb07 sub-header, or return None.
+
+    Returns a :class:`DownlookSubheader` with:
+      * ``bottom_range_m`` (v1) -- the device's measured bottom range/depth;
+      * ``display_range_m`` (v2) -- the auto-ranged scan extent
+        (``bin_size = display_range_m / n_bins``);
+      * ``near_field_m`` (v3) -- a small near-field/start term (~0.1 m, meaning
+        unconfirmed).
+    Validates the fixed markers (``19 00 23`` / ``2a`` / opening ``0d 01 03 09``)
+    so a garbled or non-down-look payload yields None.
+    """
+    if (payload[:2] != EB07 or not is_water_column(payload) or len(payload) < 33
+            or payload[8:12] != b'\x0d\x01\x03\x09'):
+        return None
+    v1, o = decode_leb128(payload, RANGE_VARINT_OFFSET)
+    if v1 is None or payload[o:o + 3] != b'\x19\x00\x23':
+        return None
+    v2, o = decode_leb128(payload, o + 3)
+    if v2 is None or o >= len(payload) or payload[o] != 0x2a:
+        return None
+    v3, _ = decode_leb128(payload, o + 1)
+    if v3 is None:
+        return None
+    return DownlookSubheader(payload[RANGE_BRACKET_OFFSET],
+                             v1 * RANGE_UNIT_M, v2 * RANGE_UNIT_M, v3 * RANGE_UNIT_M)
 
 
 class PingAssembler:

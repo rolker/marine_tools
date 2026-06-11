@@ -11,8 +11,8 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
-    is_water_column, PingAssembler, SH, status_subtype, status_transmitting,
-    strip_first_layer_trailer, strip_leading_ping_header,
+    is_water_column, parse_downlook_subheader, PingAssembler, SH, status_subtype,
+    status_transmitting, strip_first_layer_trailer, strip_leading_ping_header,
     subheader_bottom_range_m, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
@@ -194,6 +194,20 @@ def test_subheader_bottom_range_m():
     side = bytes.fromhex('eb07000000000000') + bytes.fromhex('0e0103090212907f190023')
     assert subheader_bottom_range_m(side) is None
     assert subheader_bottom_range_m(bytes([0xd8, 0x07]) + bytes(20)) is None  # not eb07
+
+
+def test_parse_downlook_subheader():
+    # Real ~7.9 m down-look sub-header: v1=16272 (8.136 m), 19 00 23, v2=24236
+    # (12.118 m), 2a, v3=178 (0.089 m), 31 02 3f, FH.
+    pkt = bytes.fromhex('eb07000000000000') + bytes.fromhex(
+        '0d0103090212907f190023acbd012ab20131023fda04d804') + bytes(8)  # + samples
+    sub = parse_downlook_subheader(pkt)
+    assert sub.bracket == 0x12
+    assert abs(sub.bottom_range_m - 8.136) < 0.01     # v1
+    assert abs(sub.display_range_m - 12.118) < 0.01   # v2
+    assert abs(sub.near_field_m - 0.089) < 0.01       # v3
+    # garbled marker / non-down-look -> None (markers are validated)
+    assert parse_downlook_subheader(bytes.fromhex('eb07000000000000') + bytes(30)) is None
 
 
 # ----- GCV-20 trailer / leading-header stripping (issue #26) --------------

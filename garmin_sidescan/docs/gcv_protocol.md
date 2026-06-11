@@ -245,27 +245,36 @@ knowledge, and immune to the range-coupling that makes byte 13 unusable for this
 
 #### Range has two controls: the byte-13 bracket + the per-ping bottom-range varint
 
-The device auto-ranges with **two** controls:
+The full **down-look sub-header** is three LEB128 varints (all in **0.5 mm
+units** — the TCP range command's unit) bracketed by fixed markers. Structure
+verified byte-for-byte on **29,267 packets, 0 mismatches** (`parse_downlook_subheader`):
 
-1. **Coarse:** byte 13 (above) — the display bracket, shared by all channels,
-   steps rarely. Each value maps to a bin size: `0x13` ≈ 9.2 mm/sample
-   (~19 m display), `0x12` ≈ 6.8 mm/sample (~14 m); step ≈ ×4⁄3.
-2. **Fine (down-look):** the **offset-14 LEB128 varint** is the **measured
-   bottom range, per ping**, in **0.5 mm units** (the same unit as the TCP range
-   command). Decoding it as `raw × 0.5 mm` and comparing to M3 depth across the
-   window: **ratio 1.013, correlation 1.00** (`16272 → 7.81 m`, `23186 → 11.55 m`,
-   `36594 → 18.36 m`). So it is a **clean per-ping bottom depth/range** — near
-   exact vs M3, not the held/laggy thing the `0xe4` value was. It updates every
-   ping, so the down-look re-ranges far more often than the side-scan — directly
-   visible as the water-column display adjusting continuously while the side-scan
-   holds. (Verify with `.agent/scratchpad/gcv_re.py varint`.)
+```
+08: 0d 01 03 09   beam (0d=down) + const
+12: <channel>
+13: <bracket>     coarse range index (byte 13, above)
+14: v1  ───────── BOTTOM RANGE   (depth; 7.1–19.9 m; corr 1.00 / ratio 1.013 vs M3)
+    19 00 23      marker
+    v2  ───────── DISPLAY RANGE  (scan extent; 10.8–24.2 m; corr 0.99)
+    2a            marker
+    v3  ───────── ~88–99 mm      (near-field / start range?; corr 0.94; meaning TBD)
+    31 02 3f      const
+    da 04 d8 04   FH header → samples begin
+```
 
-So the down-look reports a clean per-ping bottom range itself; `n_bins`
-(scan-line length) is **not** a range control — it sits at ~2034, and the short
-values (848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly
-artifacts. Cross-checking the bottom-return index against the M3 multibeam
-confirms the bin-size ladder tracks the real bathymetry, with a residual
-sonar-vs-M3 offset (a transducer-depth/blanking term) not yet pinned.
+- **v1 = measured bottom depth**, per ping (near-exact vs M3 — *not* the
+  held/laggy `0xe4` value).
+- **v2 = display range** (the auto-ranged scan extent). `v1/v2 ≈ 0.79` → the
+  bottom sits at ~79 % of the display. The metres-per-sample scale follows
+  directly: **`bin_size = v2 / n_bins`** (no bottom detection, no calibration
+  ladder, no M3 — `tools/sidescan_waterfall.py` uses exactly this).
+- **v3 ≈ 96 mm**, weakly depth-correlated — a candidate near-field/blanking or
+  start-range term (possibly the residual sonar-vs-M3 offset).
+
+byte 13 is the coarse bracket that gates which range band v2 lives in; v2 is the
+actual per-ping range. `n_bins` (~2034) is **not** a range control — its short
+values (848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly artifacts.
+(Verify with `.agent/scratchpad/gcv_re.py varint`.)
 
 ### 3.2 Channel marker — `d807` (`239.254.2.1:50220`)
 
