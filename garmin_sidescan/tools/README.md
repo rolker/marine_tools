@@ -6,9 +6,11 @@ Renders a two-panel waterfall (down-look depth-corrected on top, side-scan
 port|starboard below, shared time axis) from a bag, using the **same decoder as
 the driver** (`garmin_sidescan.decode`). Self-contained — needs only the sidescan
 `debug/raw` topic (record with `debug_raw:=true`); no external nav/sonar. The
-metres-per-sample scale is self-derived from the device's per-ping **bottom-range
-varint** (sub-header offset 14), so there is no hard-coded calibration. Useful to
-eyeball decode quality (banding, range steps, bottom tracking) on any capture.
+metres-per-sample scale is self-derived per channel from the device's per-ping
+**display-range varint** (sub-header `v2`); no hard-coded calibration. Sample
+values are shown raw on a single global brightness scale (no per-ping
+manipulation). Useful to eyeball decode quality (banding, range steps, bottom
+tracking) on any capture.
 
 ```bash
 python3 tools/sidescan_waterfall.py BAG --start 100 --end 620 --out wf.png

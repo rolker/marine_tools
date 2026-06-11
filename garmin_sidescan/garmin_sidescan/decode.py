@@ -125,10 +125,15 @@ CHANNEL_OFFSET = 12
 # identifiable intrinsically, independent of channel number or packet size.
 LAYER_OFFSET = 8
 WATER_COLUMN_LAYER = 0x0d
-# Sub-header value-width tag at payload offset 13 distinguishes the device
-# generation: 0x11 (GCV-10, 1-byte value) vs 0x12 (GCV-20, 2-byte value).
-# Verified 100% consistent across both captures, every channel -- a positive,
-# size-independent signal on every packet (unlike packet-size heuristics).
+# NOTE: byte 13 was once read as a generation tag (0x11=GCV-10, 0x12=GCV-20),
+# but the 2026-06-10 capture disproved that -- it is the RANGE BRACKET
+# (:data:`RANGE_BRACKET_OFFSET` below; a GCV-20 shows 0x11/0x12/0x13 by range,
+# and the GCV-10 fixture shows 0x13 too). So GEN_BY_TAG-based detection is
+# UNRELIABLE: a deep GCV-20 (0x13) maps to None and a shallow one (0x11) maps to
+# 'gcv10', either of which can pick the wrong extractor unless device:= is pinned.
+# Generation is instead recoverable structurally (render-layer count, see
+# docs/gcv_protocol.md). Switching _detect_generation to that is tracked in #34;
+# the constants are kept until then. SAME OFFSET as RANGE_BRACKET_OFFSET.
 GEN_TAG_OFFSET = 13
 GEN_BY_TAG = {0x11: 'gcv10', 0x12: 'gcv20'}
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data

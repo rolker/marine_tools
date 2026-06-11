@@ -47,7 +47,8 @@ DOWN, PORT, STBD = 2, 0, 1        # GCV-20 channel map
 def _reader(bag):
     r = rosbag2_py.SequentialReader()
     r.open(rosbag2_py.StorageOptions(uri=bag, storage_id='mcap'),
-           rosbag2_py.ConverterOptions('', ''))
+           rosbag2_py.ConverterOptions(input_serialization_format='cdr',
+                                       output_serialization_format='cdr'))
     return r
 
 
