@@ -137,7 +137,7 @@ def render(chans, out, max_depth, across, vmin, vmax):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    fig, (a1, a2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+    _fig, (a1, a2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
 
     # top: down-look depth-corrected (raw values, one global scale)
     fb_down = _median_bin(chans[DOWN])
@@ -165,7 +165,7 @@ def render(chans, out, max_depth, across, vmin, vmax):
         print(f'warning: port ({len(chans[PORT])}) and starboard '
               f'({len(chans[STBD])}) ping counts differ — index pairing may drift')
     a2.set_ylabel('across-track (m)\nPORT <- 0 -> STBD')
-    a2.set_xlabel('time in bag (s)')
+    a2.set_xlabel('time (s, from first imagery packet)')
     a1.set_xlim(dt[0], dt[-1])
     if n == 0:                                  # no side-scan in this window
         a2.text(0.5, 0.5, 'no side-scan pings in window', ha='center',
@@ -193,8 +193,10 @@ def render(chans, out, max_depth, across, vmin, vmax):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     ap.add_argument('bag', help='path to an mcap bag recorded with debug_raw:=true')
-    ap.add_argument('--start', type=float, default=0.0, help='window start (s into bag)')
-    ap.add_argument('--end', type=float, default=1e9, help='window end (s into bag)')
+    ap.add_argument('--start', type=float, default=0.0,
+                    help='window start (s, relative to the first imagery packet)')
+    ap.add_argument('--end', type=float, default=1e9,
+                    help='window end (s, relative to the first imagery packet)')
     ap.add_argument('--out', default='sidescan_waterfall.png', help='output PNG')
     ap.add_argument('--max-depth', type=float, default=20.0, help='water-column depth axis (m)')
     ap.add_argument('--across', type=float, default=50.0,

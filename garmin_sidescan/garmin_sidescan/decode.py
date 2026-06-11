@@ -277,8 +277,10 @@ def decode_leb128(buf, i):
     """
     Decode an unsigned LEB128 varint at ``buf[i:]``.
 
-    Returns ``(value, next_index)``, or ``(None, i)`` if the buffer ends before
-    the varint terminates.
+    Returns ``(value, next_index)``. If the buffer ends before the varint
+    terminates, returns ``(None, end_index)`` -- the scan still advances ``i`` to
+    the end of the buffer, so the second element is the end index, not the
+    original ``i`` (callers should branch on the ``None`` value, not the index).
     """
     value = shift = 0
     while i < len(buf):
