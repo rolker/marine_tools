@@ -174,6 +174,33 @@ Frequency and a per-ping timestamp are **not** carried; the driver takes
 frequency from a parameter and stamps scan lines with receive time (see
 `decode.py` / README).
 
+#### Distinguishing the beams (down / port / starboard)
+
+Diffing the three channels' sub-headers within one range/time window
+(2026-06-10, byte 13 = `0x13`):
+
+| offset | port (ch0) | stbd (ch1) | down (ch2) | note |
+|-------:|:----------:|:----------:|:----------:|------|
+| 8 | `0e` | `0e` | **`0d`** | beam type — separates **down vs side-scan** only |
+| 9–11 | `01 03 09` | `01 03 09` | `01 03 09` | constant |
+| **12** | **`00`** | **`01`** | **`02`** | **channel number** |
+| 13 | `13` | `13` | `13` | range index (same on all channels) |
+| 14–19 | identical | identical | identical | per-ping counter / token |
+| 20–22 | `be 93 06` | `be 93 06` | `c4 fa 02` | start of sample/render data (differs by beam content) |
+
+So:
+
+- **Down vs side-scan** is intrinsic at **offset 8** (`0x0d` down vs
+  `0x0e`/`0x0f` side). (The `0x0e`/`0x0f` split is generation, not side.)
+- **Port vs starboard:** in this capture the two side-scan channels are
+  byte-for-byte identical in the sub-header **except the channel number at
+  offset 12** — no other byte separates them here. The driver therefore maps
+  side from the channel number via the `port_channels` / `stbd_channels` params.
+  Whether an intrinsic side marker exists elsewhere (other offsets not examined,
+  the render payload, or a different capture) is **not yet established**; note
+  only that the channel→side mapping itself differs by generation (GCV-20
+  `0/1/2` vs the GCV-10 survey `3/1`).
+
 #### Byte 13 is a range/scale index, not a generation tag
 
 `decode.py` historically read offset 13 as a GCV-10-vs-GCV-20 "generation tag"
