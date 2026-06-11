@@ -251,12 +251,14 @@ The device auto-ranges with **two** controls:
    steps rarely. Each value maps to a bin size: `0x13` ≈ 9.2 mm/sample
    (~19 m display), `0x12` ≈ 6.8 mm/sample (~14 m); step ≈ ×4⁄3.
 2. **Fine (down-look):** the **offset-14 LEB128 varint** is the **measured
-   bottom range, per ping**, in **~0.5 mm units** (the same unit as the TCP range
-   command). Decoded vs M3 depth: `16272 @ 7.9 m`, `23186 @ 11.5 m`,
-   `36594 @ 18.0 m` → ≈ **2036 units/m** = 1/(0.5 mm). It updates every ping, so
-   the down-look re-ranges far more often than the side-scan (which carries no
-   live bottom range here) — directly visible as the water-column display
-   adjusting continuously while the side-scan holds.
+   bottom range, per ping**, in **0.5 mm units** (the same unit as the TCP range
+   command). Decoding it as `raw × 0.5 mm` and comparing to M3 depth across the
+   window: **ratio 1.013, correlation 1.00** (`16272 → 7.81 m`, `23186 → 11.55 m`,
+   `36594 → 18.36 m`). So it is a **clean per-ping bottom depth/range** — near
+   exact vs M3, not the held/laggy thing the `0xe4` value was. It updates every
+   ping, so the down-look re-ranges far more often than the side-scan — directly
+   visible as the water-column display adjusting continuously while the side-scan
+   holds. (Verify with `.agent/scratchpad/gcv_re.py varint`.)
 
 So the down-look reports a clean per-ping bottom range itself; `n_bins`
 (scan-line length) is **not** a range control — it sits at ~2034, and the short
