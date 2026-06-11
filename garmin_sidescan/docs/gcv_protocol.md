@@ -222,11 +222,12 @@ range controls — the other is the per-ping bottom-range varint below. It is an
 index, so converting it to metres needs a calibrated ladder (only `0x11`–`0x13`
 seen so far; a TCP range-sweep would map the rest).
 
-Why `decode.py`'s old detection still "worked": its default extractor is GCV-10,
-and its one live rule (`0x12` → switch to GCV-20) happens to fire for the common
-GCV-20 range. But a GCV-20 in deep water (`0x13`, unmapped) falls back to the
-**GCV-10 extractor** until a `0x12` ping arrives — wrong imagery unless the launch
-pins `device:=gcv20`. Tracked as a `marine_tools` decode bug.
+Why `decode.py`'s old byte-13 detection was broken: in `auto` mode the node
+*waited* (emitting nothing) until `0x12`/`0x11` resolved, so a GCV-20 in deep
+water (`0x13`) stayed silent until a `0x12` ping, and a shallow one (`0x11`)
+mislatched `gcv10`. **Fixed** — detection now uses the structural layer-count
+test below (`decode.generation_from_layers`, voted over a few packets in the
+node), which classifies every packet regardless of range.
 
 #### Generation is recoverable from packet structure (range-independent)
 
@@ -243,7 +244,9 @@ GCV-20 packet (fixture *and* the 06-10 bag, at **both** byte-13 ranges) has at
 most one `(1,0)`/`(1,1)`. So a packet can be classified **per-packet by counting
 its `SH`/`SHS` headers (≥2 → GCV-10, ≤1 → GCV-20)** — no external generation
 knowledge, and immune to the range-coupling that makes byte 13 unusable for this.
-(GCV-10 evidence is one 16-packet fixture; widen before relying on it.)
+This is implemented as `decode.generation_from_layers()` and used by the node's
+`auto` device-detect (voted over a few packets). (GCV-10 evidence is one
+16-packet fixture; widen before relying on it.)
 
 #### Range has two controls: the byte-13 bracket + the per-ping bottom-range varint
 
@@ -396,12 +399,13 @@ disproved the `0xe4`-as-depth reading (§3.4).
 ## 5. Open questions
 
 - **Imagery sub-header varints (down-look).** Offset-14 = per-ping bottom range
-  in ~0.5 mm units (§3.1); there are 1–2 more varints after the `2a` marker that
-  also track depth — not yet parsed. The full down-look sub-header structure
-  (and whether the side-scan carries an analogous field) is the next decode step.
+  in ~0.5 mm units (§3.1). The down-look sub-header is fully parsed (v1 bottom
+  range, v2 display range, v3 ≈ near-field) and the side-scan carries the same
+  structure with its own v2; **v3's meaning (~0.1 m, weakly depth-coupled) is
+  still open**.
 - **Byte 13 → metres.** Only `0x11`–`0x13` seen; a TCP range-sweep would map the
-  full bracket ladder. `decode.py` should also switch generation detection from
-  byte 13 to the structural (layer-count) test (§3.1) — a tracked decode bug.
+  full bracket ladder to metres. (Generation detection no longer uses byte 13 —
+  now structural, §3.1.)
 - **`0xe4` sub-type value** — not depth (§3.4); meaning open. A `:50050` capture
   across known device states would decipher it.
 - **Gain coupled to the range bracket.** Raw sample brightness *steps* at each

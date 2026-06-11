@@ -125,21 +125,41 @@ CHANNEL_OFFSET = 12
 # identifiable intrinsically, independent of channel number or packet size.
 LAYER_OFFSET = 8
 WATER_COLUMN_LAYER = 0x0d
-# NOTE: byte 13 was once read as a generation tag (0x11=GCV-10, 0x12=GCV-20),
+# DEPRECATED: byte 13 was once read as a generation tag (0x11=GCV-10, 0x12=GCV-20),
 # but the 2026-06-10 capture disproved that -- it is the RANGE BRACKET
 # (:data:`RANGE_BRACKET_OFFSET` below; a GCV-20 shows 0x11/0x12/0x13 by range,
-# and the GCV-10 fixture shows 0x13 too). So GEN_BY_TAG-based detection is
-# UNRELIABLE: a deep GCV-20 (0x13) maps to None and a shallow one (0x11) maps to
-# 'gcv10', either of which can pick the wrong extractor unless device:= is pinned.
-# Generation is instead recoverable structurally (render-layer count, see
-# docs/gcv_protocol.md). Switching _detect_generation to that is tracked in #34;
-# the constants are kept until then. SAME OFFSET as RANGE_BRACKET_OFFSET.
-GEN_TAG_OFFSET = 13
+# and the GCV-10 fixture shows 0x13 too). Generation is detected structurally
+# instead -- see :func:`generation_from_layers`. These constants are retained only
+# for reference / back-compat; do NOT use them to detect generation.
+GEN_TAG_OFFSET = 13             # == RANGE_BRACKET_OFFSET (range bracket, not gen)
 GEN_BY_TAG = {0x11: 'gcv10', 0x12: 'gcv20'}
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data
 # A real scan line is ~2048 bins; cap the accumulator so a degenerate stream
 # (one channel forever, no markers) can't grow it without bound.
 MAX_SCAN_BYTES = 65536
+
+
+def generation_from_layers(payload):
+    """
+    Return ``'gcv10'`` / ``'gcv20'`` from one eb07 packet's render-layer count.
+
+    This is the **range-independent** generation signal (byte 13 is the range
+    bracket, not a generation tag): GCV-10 packets carry 3 render layers (>= 2
+    ``SH``/``SHS`` later-layer headers; 8-bit "dark" echo), GCV-20 carry <= 2
+    (0-1 later-layer headers; 16-bit first-layer echo).  See
+    ``docs/gcv_protocol.md`` ("Generation is recoverable from packet structure").
+    Requires a first-layer header (``FH``/``FHS``) so non-sample packets (markers,
+    partials) return None.  Verified: GCV-20 packets reliably count <= 1 later
+    header (no coincidental ``SH`` in the 16-bit samples) across the 06-10 bag;
+    callers should still vote over a few packets to be safe (GCV-10 evidence is a
+    single fixture).
+    """
+    if payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN:
+        return None
+    if payload.find(FH) < 0 and payload.find(FHS) < 0:
+        return None
+    later = payload.count(SH) + payload.count(SHS)
+    return 'gcv10' if later >= 2 else 'gcv20'
 
 
 def dark_layer(payload):

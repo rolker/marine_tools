@@ -8,8 +8,10 @@ could keep pinging while everything reports OFF.
 import types
 
 from diagnostic_msgs.msg import DiagnosticStatus
+from garmin_sidescan.decode import FH, SH
 from garmin_sidescan.node import (
     GarminSidescanNode,
+    GEN_VOTE_MIN,
     imagery_diag_level,
     range_in_bounds,
     transmit_state_after,
@@ -195,32 +197,50 @@ def test_range_send_failure_rejects_without_mirroring():
     assert 'range' not in node._controls  # but not mirrored on failure
 
 
-# ----- device auto-detect by sub-header tag byte -------------------------
+# ----- device auto-detect from render-layer structure --------------------
 
-def _img_packet(tag, length=40):
-    # eb07 + 4-byte len + sub-header (value-width tag at offset 13), padded
-    head = bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([0x0e, 1, 3, 9, 0, tag])
-    return head + bytes(max(0, length - len(head)))
+def _img_packet(later_sh, bracket=0x13):
+    # eb07 + 4-byte len + sub-header (bracket at offset 13) + FH + `later_sh`
+    # SH headers. Generation comes from the SH count, NOT the bracket byte.
+    head = bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([0x0e, 1, 3, 9, 0, bracket])
+    return head + FH + bytes(20) + (SH + bytes(8)) * later_sh
+
+
+def _node():
+    return types.SimpleNamespace(_detected_gen=None, _gen_votes={})
 
 
 def _detect(node, payload):
     return GarminSidescanNode._detect_generation(node, payload)
 
 
-def test_detect_generation_by_tag_byte():
-    node = types.SimpleNamespace(_detected_gen=None)
-    assert _detect(node, _img_packet(0x12)) == 'gcv20'
-    assert _detect(node, _img_packet(0x11)) == 'gcv20'   # decide-once: stays gcv20
-    node = types.SimpleNamespace(_detected_gen=None)
-    assert _detect(node, _img_packet(0x11)) == 'gcv10'
+def test_detect_generation_votes_then_latches_gcv20():
+    node = _node()
+    for _ in range(GEN_VOTE_MIN - 1):              # not enough votes yet
+        assert _detect(node, _img_packet(0)) is None     # FH only -> gcv20 vote
+    assert _detect(node, _img_packet(1)) == 'gcv20'      # <=1 SH still gcv20; latches
+    assert _detect(node, _img_packet(2)) == 'gcv20'      # latched, a gcv10 packet can't flip it
 
 
-def test_detect_generation_undecided_cases():
-    node = types.SimpleNamespace(_detected_gen=None)
-    assert _detect(node, _img_packet(0x99)) is None        # unknown tag
-    assert _detect(node, b'\xeb\x07' + bytes(8)) is None    # too short for tag
+def test_detect_generation_gcv10_by_layer_count():
+    node = _node()
+    for _ in range(GEN_VOTE_MIN):
+        _detect(node, _img_packet(2))              # 2 SH (3 layers) -> gcv10
+    assert node._detected_gen == 'gcv10'
+
+
+def test_detect_generation_ignores_bracket_and_skips_non_sample():
+    # Same render structure but different bracket bytes both vote gcv20 -- byte 13
+    # is the range bracket, not the generation.
+    node = _node()
+    for tag in (0x11, 0x12, 0x13, 0x11, 0x12):
+        _detect(node, _img_packet(0, bracket=tag))
+    assert node._detected_gen == 'gcv20'
+    # non-sample packets never vote
+    node = _node()
+    assert _detect(node, b'\xeb\x07' + bytes(40)) is None   # eb07 but no FH layer
     assert _detect(node, b'\xd8\x07' + bytes(40)) is None   # not an eb07 packet
-    assert node._detected_gen is None                       # still undecided
+    assert node._detected_gen is None and node._gen_votes == {}
 
 
 # ----- intrinsic beam-type classification (down-look vs side-scan) -------

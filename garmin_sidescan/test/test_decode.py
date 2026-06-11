@@ -11,9 +11,10 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
-    is_water_column, parse_downlook_subheader, parse_subheader, PingAssembler, SH,
-    status_subtype, status_transmitting, strip_first_layer_trailer,
-    strip_leading_ping_header, subheader_bottom_range_m, TRAILER_MAGIC)
+    generation_from_layers, is_water_column, parse_downlook_subheader,
+    parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
+    strip_first_layer_trailer, strip_leading_ping_header, subheader_bottom_range_m,
+    TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -117,6 +118,26 @@ def test_echo_layer_runs_to_end_without_sh():
 
 def test_echo_layer_empty_without_first_header():
     assert echo_layer(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) == b''
+
+
+def test_generation_from_layers_on_real_fixtures():
+    # Range-INDEPENDENT generation: GCV-10 packets carry >=2 SH/SHS later-layer
+    # headers (3 layers); GCV-20 carry <=1 (<=2 layers). Validated on the real
+    # capture fixtures (the byte-13 'gen tag' is actually the range bracket).
+    g10 = [generation_from_layers(p) for p in load_fixture() if p[:2] == b'\xeb\x07']
+    g20 = [generation_from_layers(p) for p in _load_records(GCV20_FIXTURE)
+           if p[:2] == b'\xeb\x07']
+    assert any(g10) and all(g == 'gcv10' for g in g10 if g)   # GCV-10 capture
+    assert any(g20) and all(g == 'gcv20' for g in g20 if g)   # GCV-20 capture
+
+
+def test_generation_from_layers_synthetic():
+    pre = bytes([0xeb, 0x07, 0, 0]) + bytes(4) + bytes([0x0e, 1, 3, 9, 0, 0, 0, 0])
+    assert generation_from_layers(pre + FH + bytes(20)) == 'gcv20'                  # 0 SH
+    assert generation_from_layers(pre + FH + bytes(20) + SH + bytes(20)) == 'gcv20'  # 1 SH
+    assert generation_from_layers(pre + FH + SH + bytes(8) + SH + bytes(8)) == 'gcv10'  # 2 SH
+    assert generation_from_layers(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is None    # no FH
+    assert generation_from_layers(bytes([0xd8, 0x07]) + bytes(40)) is None          # not eb07
 
 
 def test_generation_tag_byte_discriminates():
