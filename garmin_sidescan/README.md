@@ -61,7 +61,6 @@ Published (relative to the node namespace):
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
-| `nadir_depth` | `sensor_msgs/Range` | latched downward bottom-depth range (m) decoded from the `:50050` `0xe4` status frame; published only on a real reading. Feet→m, M3-validated — see [`docs/gcv_protocol.md`](docs/gcv_protocol.md). Stamped in the `_nadir` frame (Range's beam axis is +X, so this is a **separate** frame from the Z-down water-column `_down` frame; the URDF supplies +X-down) |
 
 | `state` | `marine_radar_control_msgs/RadarControlSet` | latched operator-control set (CAMP renders it) |
 
@@ -141,9 +140,7 @@ imagery stream because they are not reliably present there:
 | `sv_timeout` | `12.0` | seconds of bad/missing SV before auto-stop |
 | `auto_resume` | `true` | resume transmit when valid in-water SV returns |
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
-| `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control; `range_max_m` also bounds the `nadir_depth` Range |
-| `nadir_frame_id` | `''` | frame for the `nadir_depth` Range; empty derives `<frame_id>_nadir` (must be +X-down) |
-| `nadir_beam_width_rad` | `0.0` | down-look beam width → `Range.field_of_view` |
+| `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
 | `expose_gcv10_controls` | `true` | include TVG / interference controls |
 | `device` | `auto` | `auto` detects GCV-10 vs GCV-20 by the sub-header tag byte (picks the echo extractor); `gcv20`/`gcv10` force it |
 | `debug_raw` | `false` | publish raw UDP payloads on `debug/raw` for offline re-decode; settable at runtime |

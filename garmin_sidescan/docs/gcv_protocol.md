@@ -10,9 +10,9 @@ The foundational reverse engineering of the GCV Marine-Network protocol — the
 imagery stream (`eb07`/`d807` render-layer model) and the TCP command frames
 (`d207efbe`: transmit/range/TVG/interference) — is the work of **Dan
 Tauriello**, validated live on both the GCV-10 and GCV-20. The driver's
-`decode.py` and `commands.py` implement his findings. The status (`8e03` nadir
-depth) and config (`e508`/`e708`) decodes and the cross-message structural
-analysis in this document build on that base, from the 2026-06-10 capture.
+`decode.py` and `commands.py` implement his findings. The status (`8e03`) and
+config (`e508`/`e708`) decodes and the cross-message structural analysis in this
+document build on that base, from the 2026-06-10 capture.
 
 Every claim is grounded in a capture or in the driver source, not assumption.
 Provenance and anything still unverified are called out explicitly.
@@ -27,8 +27,8 @@ Provenance and anything still unverified are called out explicitly.
   Piscataqua River deployment (rolker/unh_echoboats_project11#250):
   `debug/raw` (227,777 imagery datagrams), `debug/raw_status` (215),
   `debug/raw_config` (1,497), spanning two Cod Rock shoal passes.
-- **Ground truth for depth:** the M3 multibeam in the same sonar bag (same
-  clock) — see [Validation](#4-validation-status-depth).
+- **Ground truth (depth/bathymetry):** the M3 multibeam in the same sonar bag
+  (same clock) — used to test the `0xe4` value (§4) and the bin-size ladder.
 
 ---
 
@@ -43,7 +43,7 @@ the driver sends. "LE id" is the 2-byte magic read as a little-endian `uint16`
 | Imagery data | `eb 07` | 2027 | `239.254.2.1:50220` UDP | in | 650–956 B | ~190/s | side/down scan-line sample packets | ✅ `decode.py` |
 | Channel marker | `d8 07` | 2008 | `239.254.2.1:50220` UDP | in | 15–16 B | per run | delimits one channel's packet run within a ping | ✅ |
 | Keepalive | `d1 07` | 2001 | `239.254.2.1:50220` UDP | in | 22 B | ~1 Hz | chartplotter-master keepalive that sustains pinging | ⚠️ partial |
-| Status | `8e 03` | 910 | `239.254.2.2:50050` UDP | in | 34 B | ~0.2/s | sub-type + **nadir depth** / settings echo | ✅ this doc |
+| Status | `8e 03` | 910 | `239.254.2.2:50050` UDP | in | 34 B | ~0.2/s | tx flag + a held `0xe4` sub-type value (NOT depth — §4) / settings echo | ◐ this doc |
 | Config heartbeat | `e7 08` | 2279 | `239.254.2.11:51000` UDP | in | 19 B | ~1/s | device-id heartbeat | ⚠️ partial |
 | Config record | `e5 08` | 2277 | `239.254.2.11:51000` UDP | in | 168 / 173 B | bursts | named CDP ping-schedule key/values | ◐ structure ✅, values partial |
 | Command | `d2 07 ef be` | 2002 | `172.16.3.0:50227` TCP | **out** | varies | on demand | transmit / range / TVG / interference | ✅ `commands.py` |
@@ -249,19 +249,22 @@ knowledge, and immune to the range-coupling that makes byte 13 unusable for this
 Bin count is fixed (~2080 samples) regardless of range, so **bin size** (metres
 per sample) carries the range. It can be derived without decoding any header:
 find the bottom-return index in the down-look (water-column) channel and combine
-with the decoded nadir depth (§3.4):
+with an **independent** depth (the M3 multibeam — the `0xe4` field is not a usable
+depth, §4):
 
 ```
 bin_size = depth / bottom_index          # m per sample (down-look is vertical)
 range    = n_bins * bin_size
 ```
 
-2026-06-10: deep ≈ 25 mm/sample → ~52 m range; shoal ≈ 15 mm/sample → ~31 m;
-the bottom sat at a near-constant ~28 % of the display (auto-range rescaling),
-and bin size returned to the same value at each range step. These numbers are
-*derived* (depth + argmax bottom index, both noisy) — e.g. "24.98 mm" is
-consistent with a round 25 mm but not distinguishable from it without a TCP
-range-sweep calibration.
+2026-06-10 (byte-13 range index, §3.1): `0x13` ≈ 9.2 mm/sample → ~19 m range;
+`0x12` ≈ 6.8 mm/sample → ~14 m; step ≈ ×4⁄3 (geometric). `0x11` only appeared
+during recovery and is not measurable. The down-look bottom (the strong
+sustained band at ~60–90 % of the display, **not** the near-field reflector at
+~28 %) corrected by this ladder tracks the M3 bathymetry. Numbers are still
+*derived* (noisy bottom detection) and carry a residual sonar-vs-M3 offset (a
+transducer-depth/blanking term not yet pinned); a TCP range-sweep would
+calibrate the whole ladder cleanly.
 
 ### 3.2 Channel marker — `d807` (`239.254.2.1:50220`)
 
@@ -279,7 +282,7 @@ of [pattern C](#c-a-recurring-node-descriptor-n-01-03-0d-5-byte-node-id). Body
 after the id (`12 8a 18 19 03`) is not decoded; not needed (the driver does not
 synthesize keepalives — it relies on the real chartplotter).
 
-### 3.4 Status — `8e03` (`239.254.2.2:50050`) — **nadir depth**
+### 3.4 Status — `8e03` (`239.254.2.2:50050`) — tx flag + an undeciphered sub-type
 
 Fixed 34 bytes. The stream interleaves **two sub-types**, discriminated by the
 payload byte at **offset 9** (`0x00` or `0xe4` in the capture; the two are
@@ -292,7 +295,7 @@ emitted concurrently, not tied to a phase). Shared frame:
 | 8 | `02` | constant |
 | **9** | `00` \| `e4` | **sub-type discriminator** |
 | 10–16 | `0a 0c 00 00 03 01 00` | constant |
-| 17–23 | *sub-type specific* | depth or settings echo |
+| 17–23 | *sub-type specific* | `0xe4` value (below) or settings echo |
 | 24–29 | `e0 a0 91 0b 01 04` | constant device/message tail |
 | 30–31 | u16 LE | monotonic counter (uptime/sequence, ~1/frame) |
 | 32–33 | `00 00` | constant |
@@ -300,18 +303,21 @@ emitted concurrently, not tied to a phase). Shared frame:
 Constant region confirmed byte-for-byte across all 124 `0x00` + 91 `0xe4`
 frames; only offsets 17–23, the 30–31 counter, and byte 9 vary.
 
-**Sub-type `0xe4` — nadir bottom depth (the decode target for #16):**
+**Sub-type `0xe4` — a held value of unconfirmed meaning (NOT depth):**
 
 ```
 offset 17 18 19 | 20 21 | 22 23
-        00 00 00 | DD DD | 00 00      depth = u16_LE(20)   feet = raw/1000
+        00 00 00 | VV VV | 00 00      value = u16_LE(20)  (offsets 17-19/22-23 = 00)
 ```
 
-`depth_ft = u16 / 1000.0`; `depth_m = u16 / 3280.84`. Feet, not metres
-(M3-confirmed — [Validation](#4-validation-status-depth)). Updated on-change
-(held between updates), so it lags a live echosounder; offsets 17–19 / 22–23 are
-always `00` (a single 16-bit depth). Example: `…02 e4 …00 00 00 d8 ba 00 00…` →
-`0xbad8` = 47832 → 47.8 ft.
+This `u16` looked like a nadir depth at first (`raw/1000` ≈ feet matched M3 in
+the flat channel), but the M3 cross-check disproved it — see
+[§4](#4-the-0xe4-value-is-not-a-usable-depth). It is **held** (one value for tens
+of seconds), lags M3 by 2–7 m, and does not track the bottom; the driver does
+**not** decode or publish it. Most likely it belongs to a mode/status field
+we have not fully deciphered. A real nadir depth, if needed, comes from
+bottom-tracking the down-look imagery in a downstream node (issue #16). Example
+frame: `…02 e4 …00 00 00 d8 ba 00 00…` → `0xbad8` = 47832.
 
 **Sub-type `0x00` — settings echo (NOT the active range):**
 
@@ -360,39 +366,42 @@ chartplotter's auto-range.
 
 ---
 
-## 4. Validation (status depth)
+## 4. The `0xe4` value is not a usable depth
 
-The `0xe4` depth field was cross-checked against the M3 multibeam in the same
-bag. M3 bottom depth per ping = median over beams of
-`twtt/2 · sound_speed · cos(rx_angle)` (sound_speed 1469 m/s from `ping_info`).
-Pairing all 91 GCV samples to nearest M3 ping (±3 s):
+The `0xe4` sub-type's offset-20 `u16` was cross-checked against the M3 multibeam
+(same sonar bag, same clock). At first it looked like a feet × 1000 nadir depth:
+its *mean* matched M3 (44.3 vs 43.7 ft) and it dipped at each Cod Rock pass
+(Pearson r ≈ 0.80). But those aggregate stats hid the real behaviour — per-ping
+it does **not** track depth:
 
-| event | GCV `u16/1000` | M3 depth |
-|-------|----------------|----------|
-| channel (t+4 s)           | **47.8 ft** | 14.76 m = **48.4 ft** |
-| Cod Rock pass 1 (t+154 s) | 30.4 ft | 7.65 m = 25.1 ft |
-| channel (t+239 s)         | 50.4 ft | 18.10 m = 59.4 ft |
-| Cod Rock pass 2 (t+914 s) | 29.0 ft | 7.07 m = 23.2 ft |
+- It is **held**: one value for tens of seconds, then a step. Over a 0x13→shoal
+  approach it stayed `14.91 m` while M3 fell continuously 11.1 → 8.2 m
+  (diff up to **+6.7 m**), then jumped to `8.85 m` and held while M3 wandered
+  5–6.5 m.
+- The **same range index** (0x13) appears at both ~15 m (flat channel, where the
+  value happened to agree with M3) and ~8–11 m (shoal approach, where it did
+  not) — so its agreement in flat water was coincidental, not tracking.
+- Independently, the **down-look bottom return** (depth-corrected by the
+  bin-size ladder, §3.1) *does* follow M3's bathymetry — confirming M3 is the
+  truth and the `0xe4` value is the odd one out.
 
-- **Means: GCV 44.3 ft vs M3 43.7 ft** — agree to 0.6 ft.
-- **Pearson r = 0.80** — both dip at each Cod Rock pass.
-- Metres ruled out: as metres, 44.3 m vs M3 13.3 m (off by 31 m).
-
-~9 ft instantaneous residual RMS is expected (held/on-change field lags live M3;
-different transducer footprints over Cod Rock's steep rock; no draft/tide offset
-applied). Central tendency exact; feet scale unambiguous.
+So the `0xe4` value is not a depth the device meaningfully reports; its meaning
+is unconfirmed (a candidate mode/status field). The driver does not publish it.
+For a real nadir depth, bottom-track the down-look imagery downstream (issue
+#16). (M3 bottom depth per ping = median over beams of
+`twtt/2 · sound_speed · cos(rx_angle)`, sound_speed ≈ 1498 m/s from `ping_info`.)
 
 ---
 
 ## 5. Open questions
 
-- **Byte-9 vs the transmit flag.** `decode.py`'s `status_transmitting` reads
-  status byte 9 as a transmit flag (`0x00` = transmitting, `0x01` = off, from a
-  bench capture). This wet capture shows byte 9 = `0x00` / `0xe4`, never `0x01`,
-  with the two sub-types interleaved regardless of transmit state — so byte 9 is
-  (also) a **message sub-type selector**. Reconcile before relying on either
-  read alone; possible latent mis-ID. *(Follow-up; not changed by the depth
-  decoder.)*
+- **Byte-9 sub-type / the `0xe4` value.** Byte 9 is both the transmit flag
+  (`0x00` = transmitting, `0x01` = off, from a bench capture) **and** a sub-type
+  selector — this wet capture shows `0x00` / `0xe4`, never `0x01`, interleaved
+  regardless of transmit state, so `status_transmitting` reads a state only from
+  `0x00`/`0x01` and ignores `0xe4`. What the `0xe4` sub-type's offset-20 `u16`
+  actually means is still open (it is **not** depth — §4); likely a mode/status
+  field. Worth a `:50050` capture across known device states to decipher.
 - **`00 00` after every magic** — high half of a 32-bit id, or reserved? Always
   zero here.
 - **Node id bodies** (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`) — MAC/serial mapping
@@ -412,5 +421,7 @@ applied). Central tendency exact; feet scale unambiguous.
   stream; recover it via the down-look bin-size derivation (§3.1) or, once
   calibrated, the byte-13 index. #32-B (pin range over TCP) remains the way to
   *hold* a known swath.
-- **Depth datum** — raw transducer bottom-track; draft/tide correction is
-  downstream (TF + nav), not in-frame.
+- **Nadir depth** — not reported usably by the device (§4). If wanted, a
+  downstream node bottom-tracks the published `sonar_image_down`; any
+  draft/tide/transducer-offset correction is that node's concern, not the
+  driver's.

@@ -11,7 +11,7 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET, is_water_column,
-    PingAssembler, SH, status_depth_m, status_subtype, status_transmitting,
+    PingAssembler, SH, status_subtype, status_transmitting,
     strip_first_layer_trailer, strip_leading_ping_header, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
@@ -150,42 +150,29 @@ def test_status_transmitting():
     assert is_water_column(b'\xeb\x07') is False             # too short, safe
 
 
-# ----- :50050 status sub-types + nadir depth (issue #16) -----------------
+# ----- :50050 status sub-types (issue #16) -------------------------------
 # Real 34-byte 8e03 frames from the 2026-06-10 Piscataqua capture
-# (bag_2026-06-10T15.54.41_sidescan_raw), depth cross-validated vs the M3.
-_STATUS_DEPTH_DEEP = bytes.fromhex(
+# (bag_2026-06-10T15.54.41_sidescan_raw). The 0xe4 sub-type holds a u16 @ offset
+# 20 we once took for nadir depth, but the M3 cross-check showed it is held and
+# does NOT track depth, so the driver no longer decodes it -- byte 9 is kept only
+# as a sub-type/mode selector that the transmit-flag read must not trip over.
+_STATUS_SUBTYPE_E4 = bytes.fromhex(
     '8e0300001a00000002e40a0c0000030100000000d8ba0000e0a0910b010474530000')
-_STATUS_DEPTH_SHOAL = bytes.fromhex(
-    '8e0300001a00000002e40a0c00000301000000009c760000e0a0910b010492530000')
 _STATUS_SETTINGS = bytes.fromhex(
     '8e0300001a00000002000a0c0000030100ae05c075ae05c0e0a0910b010476530000')
 
 
 def test_status_subtype_discriminates():
-    assert status_subtype(_STATUS_DEPTH_DEEP) == 0xe4     # depth broadcast
+    assert status_subtype(_STATUS_SUBTYPE_E4) == 0xe4     # mode/status sub-type
     assert status_subtype(_STATUS_SETTINGS) == 0x00       # settings echo
     assert status_subtype(bytes([0xeb, 0x07]) + bytes(40)) is None   # not status
     assert status_subtype(bytes([0x8e, 0x03])) is None               # too short
 
 
-def test_status_depth_decodes_feet_milli_to_metres():
-    # u16 LE @ offset 20 in feet*1000: 47832 -> 47.832 ft -> 14.579 m
-    assert abs(status_depth_m(_STATUS_DEPTH_DEEP) - 14.579) < 0.01
-    # shoal (Cod Rock pass): 30364 -> 30.364 ft -> 9.255 m
-    assert abs(status_depth_m(_STATUS_DEPTH_SHOAL) - 9.255) < 0.01
-
-
-def test_status_depth_none_for_non_depth_frames():
-    assert status_depth_m(_STATUS_SETTINGS) is None        # settings sub-type
-    assert status_depth_m(bytes([0xeb, 0x07]) + bytes(40)) is None   # not status
-    assert status_depth_m(bytes([0x8e, 0x03, 0, 0]) + bytes(5)
-                          + bytes([0xe4])) is None         # 0xe4 but too short
-
-
-def test_status_transmitting_ignores_depth_subtype():
-    # The depth frame is broadcast regardless of transmit state, so it must not
+def test_status_transmitting_ignores_e4_subtype():
+    # The 0xe4 sub-type is broadcast regardless of transmit state, so it must not
     # flap the transmit flag to "off" (it shares byte 9 with the tx flag).
-    assert status_transmitting(_STATUS_DEPTH_DEEP) is None
+    assert status_transmitting(_STATUS_SUBTYPE_E4) is None
     assert status_transmitting(_STATUS_SETTINGS) is True
 
 

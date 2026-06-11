@@ -7,29 +7,14 @@ could keep pinging while everything reports OFF.
 """
 import types
 
-from builtin_interfaces.msg import Time
 from diagnostic_msgs.msg import DiagnosticStatus
 from garmin_sidescan.node import (
-    build_nadir_range,
     GarminSidescanNode,
     imagery_diag_level,
     range_in_bounds,
     transmit_state_after,
     watchdog_action,
 )
-from sensor_msgs.msg import Range
-
-
-def test_build_nadir_range_maps_depth_to_downward_range():
-    msg = build_nadir_range(14.58, 'gs_nadir', Time(sec=5, nanosec=0),
-                            field_of_view=0.2, max_range=60.0)
-    assert msg.header.frame_id == 'gs_nadir'        # dedicated +X-down frame
-    assert msg.header.stamp.sec == 5                # receive-time stamp
-    assert msg.radiation_type == Range.ULTRASOUND
-    assert abs(msg.range - 14.58) < 1e-4            # depth -> range
-    assert msg.min_range == 0.0                     # shallow not flagged invalid
-    assert abs(msg.max_range - 60.0) < 1e-4
-    assert abs(msg.field_of_view - 0.2) < 1e-4
 
 
 def test_imagery_diag_level():

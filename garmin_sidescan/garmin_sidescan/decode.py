@@ -33,22 +33,25 @@ EB07 = b'\xeb\x07'
 D807 = b'\xd8\x07'
 STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # The :50050 stream multiplexes two 34-byte sub-types, discriminated by the
-# payload byte at offset 9 (see docs/gcv_protocol.md, validated against the
-# 2026-06-10 capture + M3 multibeam):
+# payload byte at offset 9 (see docs/gcv_protocol.md):
 #   0x00 -> settings echo (carries the historical transmit flag at this byte)
-#   0xe4 -> nadir bottom-depth broadcast (depth field below)
+#   0xe4 -> a separate mode/status sub-type, broadcast regardless of tx state
 # Earlier bench notes read byte 9 as a bare transmit flag (0x00 on / 0x01 off);
 # the wet capture shows 0x00 and 0xe4 interleaved regardless of transmit state,
 # so byte 9 is (also) a sub-type selector.  We therefore read a transmit state
-# only from the 0x00/0x01 sub-types and treat the 0xe4 depth frame as carrying
-# no transmit information (rather than flapping it "off").
+# only from the 0x00/0x01 sub-types and treat the 0xe4 sub-type as carrying no
+# transmit information (rather than flapping it "off").
+#
+# The 0xe4 sub-type holds a u16 at offset 20 that we briefly took for a nadir
+# depth, but cross-checking the 2026-06-10 capture against the M3 multibeam
+# showed it is a HELD, coarse value that does NOT track depth (it lags by tens
+# of seconds and sits metres off the M3 nadir) -- so its meaning is unconfirmed
+# (a candidate mode/status field) and the driver does NOT decode or publish it.
+# A real nadir depth, if wanted, comes from bottom-tracking the down-look
+# imagery in a downstream node, not from this field.
 STATUS_SUBTYPE_OFFSET = 9
 STATUS_TX_OFFSET = STATUS_SUBTYPE_OFFSET     # legacy alias (tx flag == sub-type byte)
 STATUS_SUBTYPE_SETTINGS = 0x00
-STATUS_SUBTYPE_DEPTH = 0xe4
-STATUS_DEPTH_OFFSET = 20          # u16 LE, feet * 1000 (M3-validated)
-STATUS_DEPTH_PER_RAW_FT = 0.001   # raw count -> feet
-FEET_PER_METER = 3.280839895
 
 
 def status_subtype(payload):
@@ -68,8 +71,8 @@ def status_transmitting(payload):
 
     Reads the transmit flag only from the settings sub-type: ``0x00`` ->
     transmitting, ``0x01`` -> off.  Returns None for a non-status payload and
-    for the ``0xe4`` depth sub-type (which is broadcast regardless of transmit
-    state, so reading it as "off" would flap the flag).
+    for the ``0xe4`` sub-type (broadcast regardless of transmit state, so
+    reading it as "off" would flap the flag).
     """
     sub = status_subtype(payload)
     if sub == STATUS_SUBTYPE_SETTINGS:
@@ -77,24 +80,6 @@ def status_transmitting(payload):
     if sub == 0x01:
         return False
     return None
-
-
-def status_depth_m(payload):
-    """
-    Return nadir bottom depth (metres) from a ``0xe4`` status frame, or None.
-
-    The depth sub-type carries depth as a little-endian ``uint16`` at
-    :data:`STATUS_DEPTH_OFFSET` in **feet x 1000** (Garmin's native unit;
-    cross-validated against the M3 multibeam, 2026-06-10 -- see
-    ``docs/gcv_protocol.md``).  Returns None for the settings sub-type (``0x00``)
-    or any non-depth payload, so callers can publish only real readings.
-    """
-    if status_subtype(payload) != STATUS_SUBTYPE_DEPTH:
-        return None
-    if len(payload) < STATUS_DEPTH_OFFSET + 2:
-        return None
-    raw = int.from_bytes(payload[STATUS_DEPTH_OFFSET:STATUS_DEPTH_OFFSET + 2], 'little')
-    return raw * STATUS_DEPTH_PER_RAW_FT / FEET_PER_METER
 
 
 # Render-layer header signatures (little-endian sample pairs).
