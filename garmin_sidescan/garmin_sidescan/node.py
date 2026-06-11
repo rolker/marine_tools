@@ -28,7 +28,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
-from std_msgs.msg import Bool, Float64, String, UInt8MultiArray
+from sensor_msgs.msg import Range
+from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import SetBool
 
 from .commands import (
@@ -124,6 +125,29 @@ def range_in_bounds(meters, range_min, range_max):
     return range_min <= meters <= range_max
 
 
+def build_nadir_range(depth_m, frame_id, stamp, field_of_view, max_range):
+    """
+    Build a ``sensor_msgs/Range`` for a nadir bottom-depth reading.
+
+    Per ``sensor_msgs/Range`` the range is measured along the **+X axis** of
+    ``frame_id``, so ``frame_id`` must be a dedicated nadir frame whose +X points
+    down -- NOT the water-column ``_down`` frame, which is Z-down (the marine
+    convention the down-look ``RawSonarImage`` uses; see ``docs/gcv_protocol.md``).
+    ``min_range`` is 0 so a genuinely shallow reading is not flagged invalid;
+    ``max_range`` bounds it at the configured swath maximum.  ``stamp`` is the
+    receive time (the status frame carries no transmit clock).
+    """
+    msg = Range()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.radiation_type = Range.ULTRASOUND
+    msg.field_of_view = float(field_of_view)
+    msg.min_range = 0.0
+    msg.max_range = float(max_range)
+    msg.range = float(depth_m)
+    return msg
+
+
 class GarminSidescanNode(Node):
     """Driver node: GCV imagery in, RawSonarImage out, transmit under safety."""
 
@@ -170,6 +194,13 @@ class GarminSidescanNode(Node):
         # operator control set (radar-style; rendered by CAMP)
         self.declare_parameter('range_min_m', 1.0)
         self.declare_parameter('range_max_m', 60.0)
+
+        # Nadir bottom depth (sensor_msgs/Range from the :50050 0xe4 status
+        # frame). The Range beam axis is +X, so this needs its own frame whose
+        # +X points down -- distinct from the Z-down water-column _down frame.
+        # Empty -> derive '<frame_id>_nadir'; the platform URDF supplies the TF.
+        self.declare_parameter('nadir_frame_id', '')
+        self.declare_parameter('nadir_beam_width_rad', 0.0)   # Range.field_of_view
         # TVG / interference frames are GCV-10-derived and unverified on the
         # GCV-20 (TVG is display-side there); expose them but allow opting out.
         self.declare_parameter('expose_gcv10_controls', True)
@@ -194,6 +225,8 @@ class GarminSidescanNode(Node):
         self._iface_ip = self._p('iface_ip')
         self._filter_src = bool(self._p('filter_src'))
         self._frame_id = self._p('frame_id')
+        self._nadir_frame_id = self._p('nadir_frame_id') or f'{self._frame_id}_nadir'
+        self._nadir_fov = float(self._p('nadir_beam_width_rad'))
         self._chan_side = {}
         for ch in self._p('port_channels'):
             self._chan_side[ch] = 'port'
@@ -282,10 +315,11 @@ class GarminSidescanNode(Node):
         self._pub_diag = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
-        # Nadir bottom depth (metres) decoded from the :50050 0xe4 status frame.
+        # Nadir bottom depth decoded from the :50050 0xe4 status frame, as a
+        # downward sensor_msgs/Range (see build_nadir_range / the _nadir frame).
         # Latched: the device broadcasts it on-change and holds it between
         # updates, so a late subscriber should get the last value.
-        self._pub_depth = self.create_publisher(Float64, '~/nadir_depth', latched)
+        self._pub_depth = self.create_publisher(Range, '~/nadir_depth', latched)
         # Control set: volatile depth-10, NOT latched -- mirrors simrad_halo_radar
         # (the rqt control panel + udp_bridge are built around the radar's model).
         # transient_local does not cross the udp_bridge, and a volatile subscriber
@@ -639,7 +673,9 @@ class GarminSidescanNode(Node):
             self._last_status_t = time.monotonic()
         depth_m = status_depth_m(payload)
         if depth_m is not None:
-            self._pub_depth.publish(Float64(data=depth_m))
+            self._pub_depth.publish(build_nadir_range(
+                depth_m, self._nadir_frame_id, self.get_clock().now().to_msg(),
+                self._nadir_fov, self._range_max))
 
     def _rx_loop(self):
         sock = None
