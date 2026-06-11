@@ -92,6 +92,9 @@ def read_pings(bag, raw_topic, start, end):
         for ch, samp, st in out:
             if start <= st <= end and ch in chans:
                 chans[ch].append((st, subs.get(ch), samp))
+    for ch, samp, st in asm.flush():           # emit the final accumulated run
+        if start <= st <= end and ch in chans:
+            chans[ch].append((st, subs.get(ch), samp))
     return chans
 
 
@@ -157,6 +160,19 @@ def render(chans, out, max_depth, across, vmin, vmax):
     # bottom: side-scan port|starboard (each side scaled by its own v2)
     fb_side = _median_bin(chans[PORT] + chans[STBD])
     n = min(len(chans[PORT]), len(chans[STBD]))
+    if len(chans[PORT]) != len(chans[STBD]):
+        print(f'warning: port ({len(chans[PORT])}) and starboard '
+              f'({len(chans[STBD])}) ping counts differ — index pairing may drift')
+    a2.set_ylabel('across-track (m)\nPORT <- 0 -> STBD')
+    a2.set_xlabel('time in bag (s)')
+    a1.set_xlim(dt[0], dt[-1])
+    if n == 0:                                  # no side-scan in this window
+        a2.text(0.5, 0.5, 'no side-scan pings in window', ha='center',
+                va='center', transform=a2.transAxes)
+        plt.tight_layout()
+        plt.savefig(out, dpi=100)
+        print(f'saved {out}')
+        return
     NR = 420
     grid = np.linspace(0, across, NR)
     img = np.full((2 * NR, n), np.nan)
@@ -168,9 +184,6 @@ def render(chans, out, max_depth, across, vmin, vmax):
         stimes.append(chans[PORT][i][0])
     _show_raw(a2, img, [stimes[0], stimes[-1], across, -across], 'copper', vmin, vmax)
     a2.axhline(0, color='cyan', lw=0.5, alpha=0.5)
-    a2.set_ylabel('across-track (m)\nPORT <- 0 -> STBD')
-    a2.set_xlabel('time in bag (s)')
-    a1.set_xlim(dt[0], dt[-1])
     plt.tight_layout()
     plt.savefig(out, dpi=100)
     print(f'saved {out}')
