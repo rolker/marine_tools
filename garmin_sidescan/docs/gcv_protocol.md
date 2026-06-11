@@ -167,11 +167,74 @@ authoritative layout. Key sub-header bytes
 |-------:|---------|
 | 8 | render-layer / beam-type byte: `0x0d` down-look (water column), `0x0e`/`0x0f` side-scan |
 | 12 | channel number (GCV-20 map: 0 = port, 1 = stbd, 2 = down) |
-| 13 | generation tag (`0x11` GCV-10 1-byte values / `0x12` GCV-20 2-byte) |
+| 13 | **range/scale index** (small integer, steps with range — see below). NOT a generation tag. |
+| 14–18 | per-ping token: a 2-byte counter at 14–15 (changes every ping) flanked by range-coupled bytes; also appears in the `d807` marker ([pattern D](#d-a-ping-link-token-ties-markers-to-data)) |
 
 Frequency and a per-ping timestamp are **not** carried; the driver takes
 frequency from a parameter and stamps scan lines with receive time (see
 `decode.py` / README).
+
+#### Byte 13 is a range/scale index, not a generation tag
+
+`decode.py` historically read offset 13 as a GCV-10-vs-GCV-20 "generation tag"
+(`0x11`→gcv10, `0x12`→gcv20). **The 2026-06-10 data disproves this** — that
+assertion was an over-eager guess, not a verified fact:
+
+- On a single GCV-20, byte 13 takes **`0x11`, `0x12`, and `0x13`** purely as a
+  function of range — identical on all three channels, stepping at exactly the
+  Cod Rock auto-range transitions (`0x13` deep ~52 m / `0x12` shoal ~31 m /
+  `0x11` shallowest).
+- The **GCV-10** survey fixture reads byte 13 = **`0x13`** — the *same* value a
+  GCV-20 produces in deep water. A value shared across generations cannot be a
+  generation tag.
+
+So byte 13 is a **range/scale step index** (higher = longer range). It is the
+only field we have *read* that tracks range; it is an index, so converting it to
+metres needs a calibrated ladder (only three adjacent steps, `0x11`–`0x13`, are
+in the data so far — a TCP range-sweep would map the rest). The active range is
+otherwise not broadcast as a value (see §3.5 and #32).
+
+Why `decode.py`'s old detection still "worked": its default extractor is GCV-10,
+and its one live rule (`0x12` → switch to GCV-20) happens to fire for the common
+GCV-20 range. But a GCV-20 in deep water (`0x13`, unmapped) falls back to the
+**GCV-10 extractor** until a `0x12` ping arrives — wrong imagery unless the launch
+pins `device:=gcv20`. Tracked as a `marine_tools` decode bug.
+
+#### Generation is recoverable from packet structure (range-independent)
+
+The real GCV-10/GCV-20 difference is **structural**, in the render layers — and
+it is independent of range:
+
+| generation | render layers | later-layer (`SH`/`SHS`) headers | echo | samples |
+|------------|---------------|----------------------------------|------|---------|
+| **GCV-10** | 3 | **2** | last ("dark") layer | 8-bit (`UINT8`) |
+| **GCV-20** | ≤2 | **0 or 1** | first (`FH`) layer | 16-bit LE (`UINT16`) |
+
+Verified: every GCV-10 fixture packet has two later-layer headers `(1,2)`; every
+GCV-20 packet (fixture *and* the 06-10 bag, at **both** byte-13 ranges) has at
+most one `(1,0)`/`(1,1)`. So a packet can be classified **per-packet by counting
+its `SH`/`SHS` headers (≥2 → GCV-10, ≤1 → GCV-20)** — no external generation
+knowledge, and immune to the range-coupling that makes byte 13 unusable for this.
+(GCV-10 evidence is one 16-packet fixture; widen before relying on it.)
+
+#### Deriving range / bin size from the data
+
+Bin count is fixed (~2080 samples) regardless of range, so **bin size** (metres
+per sample) carries the range. It can be derived without decoding any header:
+find the bottom-return index in the down-look (water-column) channel and combine
+with the decoded nadir depth (§3.4):
+
+```
+bin_size = depth / bottom_index          # m per sample (down-look is vertical)
+range    = n_bins * bin_size
+```
+
+2026-06-10: deep ≈ 25 mm/sample → ~52 m range; shoal ≈ 15 mm/sample → ~31 m;
+the bottom sat at a near-constant ~28 % of the display (auto-range rescaling),
+and bin size returned to the same value at each range step. These numbers are
+*derived* (depth + argmax bottom index, both noisy) — e.g. "24.98 mm" is
+consistent with a round 25 mm but not distinguishable from it without a TCP
+range-sweep calibration.
 
 ### 3.2 Channel marker — `d807` (`239.254.2.1:50220`)
 
@@ -313,7 +376,14 @@ applied). Central tendency exact; feet scale unambiguous.
 - **`d107` / `d807` payload bodies** beyond the shared tokens — undecoded; not
   needed (driver relies on the real chartplotter and reassembles by channel
   run).
-- **Imagery sub-header offset 13 tag** — `decode.py` documents `0x11`/`0x12`;
-  reconcile against live GCV-20 frames during the pending wet GCV-20 validation.
+- **Byte 13 (resolved here): a range/scale index, not a generation tag** — see
+  §3.1. Open part: it's an *index*; mapping the full ladder to metres needs a TCP
+  range-sweep (only `0x11`–`0x13` seen so far). `decode.py` should switch its
+  generation detection to the structural (layer-count) test in §3.1 — tracked as
+  a decode bug.
+- **Range value** — the active range is not broadcast as a value on any captured
+  stream; recover it via the down-look bin-size derivation (§3.1) or, once
+  calibrated, the byte-13 index. #32-B (pin range over TCP) remains the way to
+  *hold* a known swath.
 - **Depth datum** — raw transducer bottom-track; draft/tide correction is
   downstream (TF + nav), not in-frame.
