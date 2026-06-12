@@ -47,3 +47,21 @@ Verification: 64/64 tests; ament flake8/pep257 clean; end-to-end UDP replay of t
 
 ### False positives
 - none — all five distinct findings were real
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-12 00:38 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #36 at `5c03d4b` (Copilot round 4; fixes in this commit)
+**Sources**: 2 (Copilot R4 @ `5c03d4b`, prior Integrated Review timeline)
+**Cross-source confirmations**: 0
+**CI**: all-pass
+
+### Findings
+- [x] (valid, Copilot R4) parse_subheader lacked field3==0 / field6-follows invariant checks; corrupt-but-parseable header could yield bogus scale — `garmin_sidescan/decode.py`
+- [x] (valid, Copilot R4) verify tool picked RadarControlSet topic by type only; now namespace-matched to the driver's ~/state — `tools/verify_range_scale.py`
+- [x] (valid, Copilot R4) O(N*M) nadir attach -> searchsorted — `tools/sidescan_waterfall.py`
+
+### False positives
+- (Copilot R4, x4) re-raised rounds-1-3 comments verbatim (xlabel/--start wording, hard-coded extractor, --source typo) — all fixed in 4a060d8 and present at the reviewed head; cited line numbers point at text that no longer exists
