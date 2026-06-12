@@ -88,8 +88,10 @@ def build_nadir_range(depth_m, frame_id, stamp, field_of_view, max_range):
     down -- NOT the water-column ``_down`` frame, which is Z-down (the marine
     convention the down-look ``RawSonarImage`` uses; see ``docs/gcv_protocol.md``).
     ``min_range`` is 0 so a genuinely shallow reading is not flagged invalid;
-    ``max_range`` bounds it at the configured swath maximum.  ``stamp`` is the
-    ping receive time (the imagery stream carries no transmit clock).
+    ``max_range`` is the ping's own observable window -- the caller passes the
+    down-look sub-header v2 water-column extent, NOT a fixed configured bound.
+    ``stamp`` is the ping receive time (the imagery stream carries no transmit
+    clock).
     """
     msg = Range()
     msg.header.stamp = stamp
@@ -809,13 +811,16 @@ class GarminSidescanNode(Node):
         # across channels (the boat's depth), but published once per ping from
         # the down-look -- the beam that actually measures it. max_range is
         # the ping's own water-column extent (v2): the sensor's actual
-        # observable window this ping, NOT the side-scan command clamp -- so a
-        # garbled v1 beyond it is spec-discardable (Range: range > max_range).
-        if side == 'down' and line.subheader and line.subheader.bottom_range_m > 0.0:
-            self._pub_depth.publish(build_nadir_range(
-                line.subheader.bottom_range_m, self._nadir_frame_id,
-                line.stamp.to_msg(), self._nadir_fov,
-                line.subheader.display_range_m))
+        # observable window this ping, NOT the side-scan command clamp. A
+        # parseable-but-implausible v1 (non-positive, or beyond the window)
+        # is not published at all -- a per-ping gap is honest sensor output,
+        # a spec-invalid Range (range > max_range) is just noise downstream.
+        if side == 'down' and line.subheader:
+            v1, v2 = line.subheader.bottom_range_m, line.subheader.display_range_m
+            if 0.0 < v1 <= v2:
+                self._pub_depth.publish(build_nadir_range(
+                    v1, self._nadir_frame_id, line.stamp.to_msg(),
+                    self._nadir_fov, v2))
 
     def _make_sonar_msg(self, side, samples, stamp, sub=None):
         msg = RawSonarImage()

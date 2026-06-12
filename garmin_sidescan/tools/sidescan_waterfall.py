@@ -39,7 +39,8 @@ import argparse
 import collections
 import sys
 
-from garmin_sidescan.decode import D807, EB07, echo_layer, PingAssembler
+from garmin_sidescan.decode import (
+    D807, dark_layer, EB07, echo_layer, generation_from_layers, PingAssembler)
 import numpy as np
 from rclpy.serialization import deserialize_message
 import rosbag2_py
@@ -79,7 +80,8 @@ def read_pings(bag, raw_topic, start, end):
     """
     r = _reader(bag)
     t0 = None
-    asm = PingAssembler(echo_layer)
+    asm = None                    # built once the generation vote resolves
+    gen_votes = []
     chans = {DOWN: [], PORT: [], STBD: []}
     while r.has_next():
         topic, data, ts = r.read_next()
@@ -91,13 +93,23 @@ def read_pings(bag, raw_topic, start, end):
         if rel > end + 2:
             break
         b = bytes(deserialize_message(data, UInt8MultiArray).data)
+        if asm is None:
+            # Pick the echo extractor from the stream itself (GCV-10 dark
+            # layer vs GCV-20 first layer), voted like the driver.
+            g = generation_from_layers(b)
+            if g is not None:
+                gen_votes.append(g)
+            if len(gen_votes) < 5:
+                continue
+            gen = max(set(gen_votes), key=gen_votes.count)
+            asm = PingAssembler(dark_layer if gen == 'gcv10' else echo_layer)
         out = []
         if (b[:2] == EB07 and len(b) > 32) or b[:2] == D807:
             out = asm.feed(b, recv_time=rel)
         for ch, samp, st, sub in out:
             if start <= st <= end and ch in chans:
                 chans[ch].append((st, sub, samp))
-    for ch, samp, st, sub in asm.flush():      # emit the final accumulated run
+    for ch, samp, st, sub in (asm.flush() if asm else []):
         if start <= st <= end and ch in chans:
             chans[ch].append((st, sub, samp))
     return chans
@@ -286,8 +298,8 @@ def main(argv=None):
                     help='raw-value white point (default a global 99.5%% percentile; '
                          'use 65535 for full uint16 range)')
     ap.add_argument('--source', choices=('auto', 'raw', 'messages'), default='auto',
-                    help='input: raw = decode debug/raw with the driver own '
-                         'decoder; messages = render the published '
+                    help='input: raw = decode debug/raw with the same decoder '
+                         'as the driver; messages = render the published '
                          'sonar_image_* (scale from sample_rate, bottom line '
                          'from nadir_depth); auto prefers raw when present')
     args = ap.parse_args(argv)

@@ -25,7 +25,8 @@ Requires a bag recorded with ``debug_raw:=true``. Run in a sourced workspace
 import argparse
 import sys
 
-from garmin_sidescan.decode import D807, EB07, echo_layer, PingAssembler
+from garmin_sidescan.decode import (
+    D807, dark_layer, EB07, echo_layer, generation_from_layers, PingAssembler)
 import numpy as np
 from rclpy.serialization import deserialize_message
 import rosbag2_py
@@ -71,7 +72,8 @@ def read_bag(bag, start, end):
     if raw_topic is None:
         sys.exit('error: no */debug/raw topic in the bag — record with debug_raw:=true')
 
-    asm = PingAssembler(echo_layer)
+    asm = None                    # built once the generation vote resolves
+    gen_votes = []
     decoded = {}
     published = {}
     commanded = []
@@ -90,6 +92,17 @@ def read_bag(bag, start, end):
             break
         if topic == raw_topic:
             b = bytes(deserialize_message(data, UInt8MultiArray).data)
+            if asm is None:
+                # Pick the per-packet echo extractor from the stream itself
+                # (GCV-10 dark layer vs GCV-20 first layer), voted like the
+                # driver so one odd packet can't misclassify the bag.
+                g = generation_from_layers(b)
+                if g is not None:
+                    gen_votes.append(g)
+                if len(gen_votes) < 5:
+                    continue
+                gen = max(set(gen_votes), key=gen_votes.count)
+                asm = PingAssembler(dark_layer if gen == 'gcv10' else echo_layer)
             if (b[:2] == EB07 and len(b) > 32) or b[:2] == D807:
                 for line in asm.feed(b, recv_time=rel):
                     if line.subheader and start <= line.stamp <= end:
@@ -111,7 +124,7 @@ def read_bag(bag, start, end):
                         commanded.append((rel, float(item.value)))
                     except ValueError:
                         pass
-    for line in asm.flush():               # emit the final accumulated run
+    for line in (asm.flush() if asm else []):   # emit the final accumulated run
         if line.subheader and t0 is not None and start <= line.stamp <= end:
             s = line.subheader
             decoded.setdefault(line.channel, []).append(
@@ -160,7 +173,7 @@ def render(decoded, published, commanded, out):
                 label='down-look v1 -> nadir_depth')
     a2.invert_yaxis()
     a2.set_ylabel('bottom range (m)')
-    a2.set_xlabel('time (s, from first bag message)')
+    a2.set_xlabel('time (s, from first raw datagram)')
     a2.legend(loc='lower left', fontsize=8)
 
     fig.tight_layout()
@@ -175,7 +188,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     ap.add_argument('bag', help='path to an mcap bag recorded with debug_raw:=true')
     ap.add_argument('--start', type=float, default=0.0,
-                    help='window start (s, relative to the first bag message)')
+                    help='window start (s, relative to the first raw datagram)')
     ap.add_argument('--end', type=float, default=1e9, help='window end (s)')
     ap.add_argument('--out', default=None,
                     help='write a PNG instead of opening the interactive window')

@@ -348,3 +348,36 @@ def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
     assert abs(1500.0 * 2048 / (2.0 * side_msg.sample_rate) - 50.0) < 1e-6
     # down: no commanded fallback -> 0.0 = unavailable
     assert down_msg.sample_rate == 0.0
+
+
+def test_emit_ping_skips_implausible_nadir_values():
+    from garmin_sidescan.decode import ScanLine, Subheader
+
+    published = []
+
+    def sub(v1, v2):
+        return Subheader(channel=2, layer=0x0d, v1_tag=0x12,
+                         bottom_range_m=v1, display_range_m=v2,
+                         near_field_m=0.1)
+
+    def fake():
+        return types.SimpleNamespace(
+            _chan_side={2: 'down'},
+            _ping_count={'down': 0},
+            _pub_sonar={'down': types.SimpleNamespace(publish=lambda m: None)},
+            _pub_depth=types.SimpleNamespace(publish=published.append),
+            _make_sonar_msg=lambda *a, **k: None,
+            _nadir_frame_id='gs_nadir', _nadir_fov=0.0,
+            _emit_ping=GarminSidescanNode._emit_ping)
+        # _make_sonar_msg stubbed: this test pins only the nadir gate
+
+    stamp = types.SimpleNamespace(to_msg=lambda: None)
+    node = fake()
+    # plausible: 0 < v1 <= v2 -> published with max_range = v2
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(7.5, 21.0)))
+    assert len(published) == 1 and abs(published[0].max_range - 21.0) < 1e-6
+    # corrupt: v1 beyond the observable window -> no spec-invalid Range
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(30.0, 21.0)))
+    # degenerate: non-positive v1 -> skipped
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(0.0, 21.0)))
+    assert len(published) == 1
