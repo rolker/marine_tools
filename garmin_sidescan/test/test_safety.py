@@ -10,6 +10,7 @@ import types
 from diagnostic_msgs.msg import DiagnosticStatus
 from garmin_sidescan.decode import FH, SH
 from garmin_sidescan.node import (
+    build_nadir_range,
     GarminSidescanNode,
     GEN_VOTE_MIN,
     imagery_diag_level,
@@ -303,3 +304,80 @@ def test_status_heartbeat_republishes_control_set():
     node._pub_status = types.SimpleNamespace(publish=lambda msg: None)
     GarminSidescanNode._publish_status(node)
     assert node.publishes == 1
+
+
+# ----- nadir bottom range (sub-header v1 -> sensor_msgs/Range, issue #16) --
+
+def test_build_nadir_range_maps_bottom_range_to_downward_range():
+    from builtin_interfaces.msg import Time
+    from sensor_msgs.msg import Range
+
+    msg = build_nadir_range(14.58, 'gs_nadir', Time(sec=5, nanosec=0),
+                            field_of_view=0.2, max_range=60.0)
+    assert msg.header.frame_id == 'gs_nadir'        # dedicated +X-down frame
+    assert msg.header.stamp.sec == 5                # ping receive-time stamp
+    assert msg.radiation_type == Range.ULTRASOUND
+    assert abs(msg.range - 14.58) < 1e-4            # v1 bottom range -> range
+    assert msg.min_range == 0.0                     # shallow not flagged invalid
+    assert abs(msg.max_range - 60.0) < 1e-4
+    assert abs(msg.field_of_view - 0.2) < 1e-4
+
+
+def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
+    # The commanded range is the side-scan swath; the down-look's true range
+    # is its auto-ranged water-column extent. With no parseable sub-header
+    # (e.g. GCV-10) the side channels may fall back to the commanded range,
+    # but the down channel must publish "unavailable" rather than a
+    # confidently-wrong ~2x scale.
+    from builtin_interfaces.msg import Time
+
+    def fake(side):
+        return types.SimpleNamespace(
+            _frame_id='gs', _freq={side: 0.0},
+            _current_sound_speed=lambda: 1500.0,
+            _controls={'range': '50.0'},
+            _bytes_per_sample=2, _sample_rate=0.0, _sonar_dtype=0,
+            _make_sonar_msg=GarminSidescanNode._make_sonar_msg)
+    samples = bytes(4096)                       # 2048 uint16 bins
+    stamp = types.SimpleNamespace(to_msg=lambda: Time())
+    side_msg = GarminSidescanNode._make_sonar_msg(
+        fake('port'), 'port', samples, stamp, sub=None)
+    down_msg = GarminSidescanNode._make_sonar_msg(
+        fake('down'), 'down', samples, stamp, sub=None)
+    # side: commanded fallback engages -> range round-trips to 50.0
+    assert abs(1500.0 * 2048 / (2.0 * side_msg.sample_rate) - 50.0) < 1e-6
+    # down: no commanded fallback -> 0.0 = unavailable
+    assert down_msg.sample_rate == 0.0
+
+
+def test_emit_ping_skips_implausible_nadir_values():
+    from garmin_sidescan.decode import ScanLine, Subheader
+
+    published = []
+
+    def sub(v1, v2):
+        return Subheader(channel=2, layer=0x0d, v1_tag=0x12,
+                         bottom_range_m=v1, display_range_m=v2,
+                         near_field_m=0.1)
+
+    def fake():
+        return types.SimpleNamespace(
+            _chan_side={2: 'down'},
+            _ping_count={'down': 0},
+            _pub_sonar={'down': types.SimpleNamespace(publish=lambda m: None)},
+            _pub_depth=types.SimpleNamespace(publish=published.append),
+            _make_sonar_msg=lambda *a, **k: None,
+            _nadir_frame_id='gs_nadir', _nadir_fov=0.0,
+            _emit_ping=GarminSidescanNode._emit_ping)
+        # _make_sonar_msg stubbed: this test pins only the nadir gate
+
+    stamp = types.SimpleNamespace(to_msg=lambda: None)
+    node = fake()
+    # plausible: 0 < v1 <= v2 -> published with max_range = v2
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(7.5, 21.0)))
+    assert len(published) == 1 and abs(published[0].max_range - 21.0) < 1e-6
+    # corrupt: v1 beyond the observable window -> no spec-invalid Range
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(30.0, 21.0)))
+    # degenerate: non-positive v1 -> skipped
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(0.0, 21.0)))
+    assert len(published) == 1

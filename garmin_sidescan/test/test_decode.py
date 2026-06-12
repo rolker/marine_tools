@@ -10,11 +10,11 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
+    dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH,
     generation_from_layers, is_water_column, parse_downlook_subheader,
     parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
-    strip_first_layer_trailer, strip_leading_ping_header, subheader_bottom_range_m,
-    TRAILER_MAGIC)
+    strip_first_layer_trailer, strip_leading_ping_header, Subheader,
+    subheader_bottom_range_m, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -57,15 +57,25 @@ def test_real_capture_decodes_to_two_channel_scan_lines():
         pings.extend(assembler.feed(pl))
     pings.extend(assembler.flush())
 
-    channels = {ch for ch, _samples, _stamp in pings}
+    channels = {p.channel for p in pings}
     # GCV-10 survey data streams two side-scan channels (port=3, stbd=1)
     assert channels == {1, 3}
 
     # the two complete runs (7 packets each) form ~2048-bin scan lines
-    full = [len(s) for _ch, s, _t in pings if len(s) > 1000]
+    full = [len(p.samples) for p in pings if len(p.samples) > 1000]
     assert len(full) >= 2
     for width in full:
         assert 2000 <= width <= 2100
+
+    # The GCV-10 sub-header is the same tagged-record grammar (its v3 is a
+    # 1-byte varint, tag 0x29) -- Dan's survey ran at a commanded 20 m range,
+    # so every run's own v2 must read exactly 20.00 m, with a real bottom
+    # range in v1 and the channel matching the run.
+    for p in pings:
+        assert p.subheader is not None
+        assert p.subheader.channel == p.channel
+        assert abs(p.subheader.display_range_m - 20.0) < 0.01
+        assert 7.0 < p.subheader.bottom_range_m < 11.0
 
 
 def test_assembler_stamps_run_with_first_packet_time():
@@ -79,10 +89,11 @@ def test_assembler_stamps_run_with_first_packet_time():
     assert out == []                       # same channel, still accumulating
     out = assembler.feed(bytes([0xd8, 0x07]))   # marker flushes the run
     assert len(out) == 1
-    ch, samples, stamp = out[0]
-    assert ch == 5
-    assert stamp == 100.0                  # first packet's time, not the second
-    assert samples == bytes([10, 20, 30]) * 2
+    line = out[0]
+    assert line.channel == 5
+    assert line.stamp == 100.0             # first packet's time, not the second
+    assert line.samples == bytes([10, 20, 30]) * 2
+    assert line.subheader is None          # synthetic packet: no parseable sub
 
 
 # ----- GCV-20 echo extraction (echo_layer) -------------------------------
@@ -123,7 +134,8 @@ def test_echo_layer_empty_without_first_header():
 def test_generation_from_layers_on_real_fixtures():
     # Range-INDEPENDENT generation: GCV-10 packets carry >=2 SH/SHS later-layer
     # headers (3 layers); GCV-20 carry <=1 (<=2 layers). Validated on the real
-    # capture fixtures (the byte-13 'gen tag' is actually the range bracket).
+    # capture fixtures (byte 13 is field2's tag -- v1 varint length -- which
+    # once masqueraded as a 'gen tag' and then as a 'range bracket').
     g10 = [generation_from_layers(p) for p in load_fixture() if p[:2] == b'\xeb\x07']
     g20 = [generation_from_layers(p) for p in _load_records(GCV20_FIXTURE)
            if p[:2] == b'\xeb\x07']
@@ -138,17 +150,6 @@ def test_generation_from_layers_synthetic():
     assert generation_from_layers(pre + FH + SH + bytes(8) + SH + bytes(8)) == 'gcv10'  # 2 SH
     assert generation_from_layers(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is None    # no FH
     assert generation_from_layers(bytes([0xd8, 0x07]) + bytes(40)) is None          # not eb07
-
-
-def test_generation_tag_byte_discriminates():
-    # sub-header value-width tag at offset 13: 0x11=GCV-10, 0x12=GCV-20
-    g10 = _gcv20_packet(0, bytes(8))
-    g20 = _gcv20_packet(0, bytes(8))
-    g10 = g10[:GEN_TAG_OFFSET] + bytes([0x11]) + g10[GEN_TAG_OFFSET + 1:]
-    g20 = g20[:GEN_TAG_OFFSET] + bytes([0x12]) + g20[GEN_TAG_OFFSET + 1:]
-    assert GEN_BY_TAG.get(g10[GEN_TAG_OFFSET]) == 'gcv10'
-    assert GEN_BY_TAG.get(g20[GEN_TAG_OFFSET]) == 'gcv20'
-    assert GEN_BY_TAG.get(0x99) is None          # unknown tag -> undecided
 
 
 def _img_with_layer(layer):
@@ -223,7 +224,7 @@ def test_parse_downlook_subheader():
     pkt = bytes.fromhex('eb07000000000000') + bytes.fromhex(
         '0d0103090212907f190023acbd012ab20131023fda04d804') + bytes(8)  # + samples
     sub = parse_downlook_subheader(pkt)
-    assert sub.bracket == 0x12
+    assert sub.v1_tag == 0x12   # field2, 2-byte v1
     assert abs(sub.bottom_range_m - 8.136) < 0.01     # v1
     assert abs(sub.display_range_m - 12.118) < 0.01   # v2
     assert abs(sub.near_field_m - 0.089) < 0.01       # v3
@@ -242,6 +243,57 @@ def test_parse_subheader_side_scan_has_own_display_range():
     assert abs(sub.display_range_m - 50.399) < 0.01     # v2 (across-track range)
     # the down-look-only wrapper rejects a side-scan packet
     assert parse_downlook_subheader(port) is None
+
+
+# ----- per-run sub-header attachment + scale derivation (issue #35) --------
+
+def test_assembler_attaches_run_subheader_on_gcv20_capture():
+    # Every scan line assembled from the real GCV-20 capture must carry its
+    # own run's sub-header: matching channel, plausible v1/v2 ranges. This is
+    # what the driver scales sample_rate (v2) and the nadir depth (v1) from.
+    assembler = PingAssembler(echo_layer)
+    pings = []
+    for pl in _load_records(GCV20_FIXTURE):
+        pings.extend(assembler.feed(pl))
+    pings.extend(assembler.flush())
+    assert pings
+    for p in pings:
+        assert p.subheader is not None
+        assert p.subheader.channel == p.channel
+        assert p.subheader.bottom_range_m > 0
+        assert p.subheader.display_range_m > 0
+
+
+def _sub(v2, v1=10.0):
+    return Subheader(channel=2, layer=0x0d, v1_tag=0x12,
+                     bottom_range_m=v1, display_range_m=v2, near_field_m=0.1)
+
+
+def test_derive_sample_rate_uses_own_channel_v2():
+    # A consumer recovers range = sv*bins/(2*rate); each channel's own v2 must
+    # round-trip, so the down-look (water column) and side-scan (slant swath)
+    # get DIFFERENT rates even with identical bins -- the asymmetry that a
+    # single commanded range cannot express.
+    sv, bins = 1500.0, 2048
+    down = derive_sample_rate(_sub(21.0), bins, sv, commanded_range_m=50.0)
+    side = derive_sample_rate(_sub(50.4), bins, sv, commanded_range_m=50.0)
+    assert abs(sv * bins / (2.0 * down) - 21.0) < 1e-9
+    assert abs(sv * bins / (2.0 * side) - 50.4) < 1e-9
+    assert down != side
+
+
+def test_derive_sample_rate_fallback_chain():
+    sv, bins = 1500.0, 2048
+    # no sub-header (garbled packet) -> the commanded range
+    rate = derive_sample_rate(None, bins, sv, commanded_range_m=50.0)
+    assert abs(sv * bins / (2.0 * rate) - 50.0) < 1e-9
+    # no sub-header, nothing commanded -> the configured fallback rate
+    assert derive_sample_rate(None, bins, sv, 0.0, fallback_rate=7.5) == 7.5
+    # ...which defaults to 0.0 = "unavailable" (RawSonarImage convention)
+    assert derive_sample_rate(None, bins, sv, 0.0) == 0.0
+    # a range without a sound speed (or bins) cannot derive a rate
+    assert derive_sample_rate(_sub(21.0), bins, 0.0, 50.0, fallback_rate=7.5) == 7.5
+    assert derive_sample_rate(_sub(21.0), 0, sv, 50.0, fallback_rate=7.5) == 7.5
 
 
 # ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
@@ -300,9 +352,9 @@ def test_gcv20_real_capture_strips_trailer_and_leading_band():
     pings.extend(assembler.flush())
 
     # fixture spans down-look (ch2) + both side-scan (ch0/ch1) runs
-    assert {ch for ch, _s, _t in pings} >= {0, 1, 2}
+    assert {p.channel for p in pings} >= {0, 1, 2}
     assert len(pings) >= 3
-    for ch, samples, _t in pings:
+    for ch, samples, _t, _sub in pings:
         # no per-packet trailer bytes survive into the scan line
         assert TRAILER_MAGIC not in samples, f'trailer leaked into ch{ch}'
         # no long constant leading run (the bright near-range band)
@@ -324,6 +376,50 @@ def test_assembler_uses_supplied_extractor():
     assert assembler.feed(pkt) == []                # accumulating
     out = assembler.feed(bytes([0xd8, 0x07]))       # marker flushes
     assert len(out) == 1
-    ch, samples, _stamp = out[0]
-    assert ch == 7
-    assert samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])
+    assert out[0].channel == 7
+    assert out[0].samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])
+
+
+def test_subheader_grammar_tags_encode_varint_length_on_both_fixtures():
+    # The sub-header is a tagged record: tag = (field# << 3) | L where L is
+    # the value's LEB128 byte length -- verified with zero exceptions on 697k+
+    # frames across five captures and both generations (gcv_protocol.md
+    # section 3). Pin the invariant on every fixture packet.
+    from garmin_sidescan.decode import V1_TAG_OFFSET
+
+    checked = 0
+    for fixture in (FIXTURE, GCV20_FIXTURE):
+        for pl in _load_records(fixture):
+            if pl[:2] != b'\xeb\x07' or len(pl) <= 32:
+                continue
+            i = V1_TAG_OFFSET
+            for want_field in (2, 3, 4, 5):
+                tag = pl[i]
+                assert tag >> 3 == want_field
+                value, end = decode_leb128(pl, i + 1)
+                assert value is not None
+                assert end - (i + 1) == tag & 0x07   # low bits = varint length
+                i = end
+            checked += 1
+    assert checked >= 60                  # both fixtures contribute
+
+
+def test_d807_marker_tags_an_adjacent_run_channel():
+    # Markers bracket channel runs in close/open pairs; each tags an adjacent
+    # run's channel in its trailing `19 <channel>` bytes (gcv_protocol.md
+    # section 3.C -- 94% verified with bracket+v1 on the 2026-06-11 capture).
+    # Pin the structure on the real GCV-20 fixture window.
+    records = _load_records(GCV20_FIXTURE)
+    run_ch = [pl[12] if pl[:2] == b'\xeb\x07' and len(pl) > 32 else None
+              for pl in records]
+    checked = 0
+    for i, pl in enumerate(records):
+        if pl[:2] != b'\xd8\x07' or len(pl) < 10:
+            continue
+        assert pl[8] == 0x02                  # constant record opener
+        assert pl[-2] == 0x19                 # channel tag marker
+        prev_ch = next((c for c in reversed(run_ch[:i]) if c is not None), None)
+        next_ch = next((c for c in run_ch[i + 1:] if c is not None), None)
+        assert pl[-1] in {prev_ch, next_ch} - {None}   # tags an adjacent run
+        checked += 1
+    assert checked >= 2                       # fixture spans multiple runs

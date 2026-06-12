@@ -3,9 +3,12 @@
 ## `sidescan_waterfall.py` — offline waterfall image (QA)
 
 Renders a two-panel waterfall (down-look depth-corrected on top, side-scan
-port|starboard below, shared time axis) from a bag, using the **same decoder as
-the driver** (`garmin_sidescan.decode`). Self-contained — needs only the sidescan
-`debug/raw` topic (record with `debug_raw:=true`); no external nav/sonar. The
+port|starboard below, shared time axis) from a bag. Two sources (`--source`,
+default auto): `raw` decodes `debug/raw` with the **same decoder as the
+driver** (`garmin_sidescan.decode`); `messages` renders the published
+`sonar_image_*` topics (per-ping scale from `sample_rate`, bottom line from
+`nadir_depth` — needs a bag recorded by the #35+ driver). Self-contained
+either way; no external nav/sonar. The
 metres-per-sample scale is self-derived per channel from the device's per-ping
 **display-range varint** (sub-header `v2`); no hard-coded calibration. Sample
 values are shown raw on a single global brightness scale (no per-ping
@@ -18,6 +21,39 @@ python3 tools/sidescan_waterfall.py BAG --start 100 --end 620 --out wf.png
 
 Needs a sourced workspace (for `garmin_sidescan` on the path) plus numpy +
 matplotlib.
+
+## `verify_range_scale.py` — interactive range-scale + nadir-depth check
+
+Plots, from a `debug/raw` bag on a shared time axis: each channel's per-ping
+sub-header **v2 display range** (the scale the driver publishes via
+`sample_rate`, issue #35) with byte-13 bracket transitions marked, the
+down-look **v1 bottom range** (published as `nadir_depth`, issue #16), and —
+for before/after comparison — the implied range actually recorded in the bag's
+`sonar_image_*` messages plus the `state` topic's commanded-range mirror.
+Interactive matplotlib window by default (zoom into the auto-range
+transitions); `--out FILE` renders a PNG headless.
+
+```bash
+python3 tools/verify_range_scale.py BAG [--start S --end S] [--out check.png]
+```
+
+## `replay_debug_raw.py` — replay a bag onto the imagery multicast
+
+Hardware-free end-to-end driver testing: re-sends a bag's `debug/raw`
+datagrams to the GCV multicast group, paced by bag timestamps, so the **actual
+driver node** (socket layer up) processes a real capture live. Defaults to
+loopback (`--iface-ip 127.0.0.1`, TTL 0) so nothing leaves the host.
+
+```bash
+# terminal 1 — the driver under test
+ros2 run garmin_sidescan garmin_sidescan --ros-args \
+    -p iface_ip:=127.0.0.1 -p filter_src:=false -p require_sound_speed:=false
+# terminal 2 — the replay
+python3 tools/replay_debug_raw.py BAG --start 100 --end 300
+# terminal 3 — watch the output (sensor topics are best-effort; a
+# default-reliable echo silently shows nothing)
+ros2 topic echo --qos-reliability best_effort /garmin_sidescan/nadir_depth
+```
 
 ---
 

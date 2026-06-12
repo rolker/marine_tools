@@ -30,7 +30,15 @@ with their receive time (see node.py).
 """
 from collections import namedtuple
 
+# Frame ids (low half of the u32-LE message id; the high half is 0x0000 on
+# every bus frame, so they read as "<magic> 00 00" -- see docs/gcv_protocol.md
+# section 1 for the envelope).
 EB07 = b'\xeb\x07'
+# Channel marker. Payload `02 <field2 tag + v1 varint> 19 <channel>` -- a
+# two-field record tagging an adjacent run's channel and carrying that run's
+# bottom range (markers bracket runs in close/open pairs; see gcv_protocol.md
+# section 3.C). The assembler only uses it as a flush signal: the run's own
+# eb07 sub-headers carry the same fields authoritatively.
 D807 = b'\xd8\x07'
 STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # The :50050 stream multiplexes two 34-byte sub-types, discriminated by the
@@ -49,8 +57,14 @@ STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # showed it is a HELD, coarse value that does NOT track depth (it lags by tens
 # of seconds and sits metres off the M3 nadir) -- so its meaning is unconfirmed
 # (a candidate mode/status field) and the driver does NOT decode or publish it.
-# A real nadir depth, if wanted, comes from bottom-tracking the down-look
-# imagery in a downstream node, not from this field.
+# The real per-ping bottom range is instead carried in the imagery sub-header
+# (v1, :func:`parse_subheader`) -- M3-validated -- and the driver publishes it
+# as ``~/nadir_depth``.
+#
+# The 2026-06-11 capture also shows RARE one-shot sub-types (0x09, 0x1f, 0xed
+# -- one frame each; meanings unknown, see gcv_protocol.md section 4.4).
+# status_transmitting() returns None for every sub-type other than 0x00/0x01,
+# so unknown sub-types can never flap the transmit flag.
 STATUS_SUBTYPE_OFFSET = 9
 STATUS_TX_OFFSET = STATUS_SUBTYPE_OFFSET     # legacy alias (tx flag == sub-type byte)
 STATUS_SUBTYPE_SETTINGS = 0x00
@@ -121,19 +135,13 @@ LEADING_RUN_MIN_BYTES = 24           # >=12 repeated uint16 samples
 
 CHANNEL_OFFSET = 12
 # Render-layer byte at offset 8 also encodes the beam TYPE: the
-# down-look ("water column") beam is 0x0d on both generations, while side-scan
+# down-look ("water column") beam is 0x0d on both generations (verified on the
+# GCV-20 wet captures AND the 2026-06-05 GCV-10 bench capture, where the
+# auto-ranging down channel reads 0x0d), while side-scan
 # (sidescan) is 0x0e (GCV-20) / 0x0f (GCV-10). So the down-look stream is
 # identifiable intrinsically, independent of channel number or packet size.
 LAYER_OFFSET = 8
 WATER_COLUMN_LAYER = 0x0d
-# DEPRECATED: byte 13 was once read as a generation tag (0x11=GCV-10, 0x12=GCV-20),
-# but the 2026-06-10 capture disproved that -- it is the RANGE BRACKET
-# (:data:`RANGE_BRACKET_OFFSET` below; a GCV-20 shows 0x11/0x12/0x13 by range,
-# and the GCV-10 fixture shows 0x13 too). Generation is detected structurally
-# instead -- see :func:`generation_from_layers`. These constants are retained only
-# for reference / back-compat; do NOT use them to detect generation.
-GEN_TAG_OFFSET = 13             # == RANGE_BRACKET_OFFSET (range bracket, not gen)
-GEN_BY_TAG = {0x11: 'gcv10', 0x12: 'gcv20'}
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data
 # A real scan line is ~2048 bins; cap the accumulator so a degenerate stream
 # (one channel forever, no markers) can't grow it without bound.
@@ -269,8 +277,10 @@ def is_water_column(payload):
 
 
 # eb07 sub-header range fields (see docs/gcv_protocol.md).
-RANGE_BRACKET_OFFSET = 13         # coarse range-bracket index (shared by all channels)
-RANGE_VARINT_OFFSET = 14          # down-look per-ping bottom-range LEB128 varint
+# The sub-header is a tagged record: tag byte = (field# << 3) | varint_length,
+# fields 2..5 in order after the field-1 channel tag (0x09) at offset 11.
+V1_TAG_OFFSET = 13                # field-2 tag (0x10 | len(v1)); ex-"range bracket"
+RANGE_VARINT_OFFSET = 14          # per-ping bottom-range LEB128 varint (v1)
 RANGE_UNIT_M = 0.0005             # 0.5 mm units (matches the TCP range command)
 
 
@@ -313,45 +323,72 @@ def subheader_bottom_range_m(payload):
     return raw * RANGE_UNIT_M
 
 
-# Imagery sub-header: three LEB128 varints (0.5 mm units) with fixed markers,
-# the same layout on every channel --
-#   <layer> 01 03 09 <chan> <bracket> | v1 | 19 00 23 | v2 | 2a | v3 | 31 02 3f | FH…
-# (verified on 29k+ packets; see docs/gcv_protocol.md).
-#   v1 = measured bottom range/depth -- SHARED across channels (the boat's depth);
-#   v2 = this channel's display range/scan extent -- down-look = water-column
-#        depth range, side-scan = across-track slant range (~2x), so
-#        bin_size = v2 / n_bins is PER CHANNEL;
-#   v3 = a small near-field/start term (~0.1 m), per channel, meaning unconfirmed.
+# Imagery sub-header: a tagged record (docs/gcv_protocol.md section 3):
+#
+#   tag byte = (field# << 3) | L,  L = the value's LEB128 byte length
+#
+#   <layer> 01 03 | 09 <chan> | 0x10|L v1 | 0x18|L f3 | 0x20|L v2 | 0x28|L v3 | 31 02 3f | FH…
+#            └ field0 = 3 ┘ field1      field2       field3      field4      field5     field6
+#
+# Grammar verified with zero exceptions on 697k+ frames across five captures
+# and both generations (the byte once read as a "range bracket" -- and before
+# that as a "generation tag" -- is field2's tag: its low bits step when the
+# bottom range crosses the 1/2/3-byte varint boundaries at 4.10 m / 8.19 m).
+#   v1 (field2) = measured bottom range -- SHARED across channels;
+#   v2 (field4) = this channel's display range/scan extent -- down-look =
+#        water-column depth range (always auto), side-scan = across-track
+#        slant range (= the commanded range when one is set, verified against
+#        an operator range sweep), so bin_size = v2 / n_bins is PER CHANNEL;
+#   v3 (field5) = a small near-field/start term (~0.1 m), meaning unconfirmed.
 Subheader = namedtuple(
-    'Subheader', 'channel layer bracket bottom_range_m display_range_m near_field_m')
+    'Subheader', 'channel layer v1_tag bottom_range_m display_range_m near_field_m')
 
 
 def parse_subheader(payload):
     """
-    Parse an eb07 imagery sub-header (any channel), or return None.
+    Parse an eb07 imagery sub-header (any channel, any generation), or None.
 
-    Returns a :class:`Subheader`. ``display_range_m`` (v2) is this channel's own
-    scan extent -- water-column depth range on the down-look, across-track slant
-    range on the side-scan -- so bin size = ``display_range_m / n_bins`` must use
-    the matching channel. ``bottom_range_m`` (v1) is the shared bottom depth.
-    Validates the fixed markers (``01 03 09`` / ``19 00 23`` / ``2a``) so a
-    garbled payload yields None.
+    Walks the tagged-record grammar: each field is ``(field# << 3) | L`` with
+    an L-byte LEB128 value; fields 2..5 must appear in order with matching
+    lengths, so a garbled payload yields None. Returns a :class:`Subheader`:
+    ``display_range_m`` (v2) is this channel's own scan extent -- water-column
+    depth range on the down-look, across-track slant range on the side-scan --
+    so bin size = ``display_range_m / n_bins`` must use the matching channel;
+    ``bottom_range_m`` (v1) is the shared bottom range; ``v1_tag`` is field2's
+    raw tag byte (``0x10 | len(v1)``, the ex-"range bracket").
     """
     if (payload[:2] != EB07 or len(payload) < 33
             or payload[9:12] != b'\x01\x03\x09'):
         return None
-    v1, o = decode_leb128(payload, RANGE_VARINT_OFFSET)
-    if v1 is None or payload[o:o + 3] != b'\x19\x00\x23':
-        return None
-    v2, o = decode_leb128(payload, o + 3)
-    if v2 is None or o >= len(payload) or payload[o] != 0x2a:
-        return None
-    v3, _ = decode_leb128(payload, o + 1)
-    if v3 is None:
+    vals = {}
+    i = V1_TAG_OFFSET
+    for want_field in (2, 3, 4, 5):
+        if i >= len(payload):
+            return None
+        tag = payload[i]
+        length = tag & 0x07
+        if tag >> 3 != want_field or not 1 <= length <= 6:
+            return None
+        value, end = decode_leb128(payload, i + 1)
+        if value is None or end - (i + 1) != length:
+            return None
+        vals[want_field] = value
+        i = end
+    # Two further invariants, empirically universal on every imagery frame of
+    # five captures / both generations (549k+ frames, zero exceptions):
+    # field3's value is 0 (it carries a channel only in d807 markers), and
+    # the exact constant ``31 02 3f`` (field6 = 2 + tail byte) immediately
+    # follows field5.  Rejecting on them keeps a partially corrupted header
+    # from "parsing" into bogus v1/v2 -- a missing scale is safe (fallback
+    # chain), a wrong scale silently corrupts everything downstream.  The
+    # slice compare is bounds-safe: a truncated payload yields a short slice,
+    # which fails the equality and parses as None.
+    if vals[3] != 0 or payload[i:i + 3] != b'\x31\x02\x3f':
         return None
     return Subheader(payload[CHANNEL_OFFSET], payload[LAYER_OFFSET],
-                     payload[RANGE_BRACKET_OFFSET],
-                     v1 * RANGE_UNIT_M, v2 * RANGE_UNIT_M, v3 * RANGE_UNIT_M)
+                     payload[V1_TAG_OFFSET],
+                     vals[2] * RANGE_UNIT_M, vals[4] * RANGE_UNIT_M,
+                     vals[5] * RANGE_UNIT_M)
 
 
 def parse_downlook_subheader(payload):
@@ -361,16 +398,52 @@ def parse_downlook_subheader(payload):
     return parse_subheader(payload)
 
 
+def derive_sample_rate(sub, n_bins, sound_speed, commanded_range_m=0.0,
+                       fallback_rate=0.0):
+    """
+    Return the ``RawSonarImage.sample_rate`` (Hz) for one assembled ping.
+
+    The scale source, in priority order:
+
+    1. **The ping's own sub-header v2** (``sub.display_range_m``) -- the
+       device's per-ping, per-channel display range, which tracks hardware
+       auto-range (verified across the 2026-06-10 Cod Rock transitions).
+    2. **The commanded range** (``commanded_range_m``) -- correct only while
+       the device honours it, and never correct for the down-look (whose v2
+       is the water-column range, not the commanded swath); kept as a
+       fallback for garbled packets whose sub-header fails to parse.
+    3. **``fallback_rate``** -- a manually configured rate, or 0.0 =
+       "unavailable" (the ``RawSonarImage`` convention).
+
+    With a range ``R`` the rate is ``sound_speed * n_bins / (2 * R)``, so a
+    consumer recovers ``R = sound_speed * n_bins / (2 * rate)``.
+    """
+    range_m = sub.display_range_m if sub is not None else 0.0
+    if range_m <= 0.0:
+        range_m = commanded_range_m
+    if range_m > 0.0 and sound_speed > 0.0 and n_bins > 0:
+        return sound_speed * n_bins / (2.0 * range_m)
+    return fallback_rate
+
+
+# One assembled scan line.  ``stamp`` is the ``recv_time`` of the run's first
+# packet; ``subheader`` is that run's parsed :class:`Subheader` (None when no
+# packet of the run parsed -- both generations parse; see test fixtures).
+ScanLine = namedtuple('ScanLine', 'channel samples stamp subheader')
+
+
 class PingAssembler:
     """
     Reassemble GCV imagery datagrams into per-channel scan lines.
 
     Feed each UDP payload to :meth:`feed`; it returns a list of completed
-    ``(channel, samples, stamp)`` tuples (usually empty, occasionally one when
-    a channel's run ends).  ``stamp`` is the ``recv_time`` passed with the
+    :class:`ScanLine` tuples (usually empty, occasionally one when a
+    channel's run ends).  ``stamp`` is the ``recv_time`` passed with the
     first packet of that run, so callers can timestamp a scan line by the
-    arrival of its first packet.  Call :meth:`flush` at end of stream to emit
-    any trailing accumulation.
+    arrival of its first packet; ``subheader`` is the run's own parsed
+    sub-header (per-ping v1 bottom range / v2 display range), so callers can
+    scale and depth-tag each ping.  Call :meth:`flush` at end of stream to
+    emit any trailing accumulation.
     """
 
     def __init__(self, extractor=dark_layer):
@@ -380,11 +453,14 @@ class PingAssembler:
         self._cur_ch = None
         self._acc = bytearray()
         self._t0 = 0.0
+        self._cur_sub = None
 
     def _emit(self, out):
         if self._cur_ch is not None and self._acc:
-            out.append((self._cur_ch, bytes(self._acc), self._t0))
+            out.append(ScanLine(self._cur_ch, bytes(self._acc), self._t0,
+                                self._cur_sub))
         self._acc = bytearray()
+        self._cur_sub = None
 
     def feed(self, payload, recv_time=0.0):
         """Consume one datagram payload; return any completed scan lines."""
@@ -403,12 +479,18 @@ class PingAssembler:
                 # scan line, and only on the GCV-20 (echo_layer) stream.
                 if self._extract is echo_layer:
                     block = strip_leading_ping_header(block)
+            if self._cur_sub is None:
+                # Every packet of a run repeats the same sub-header values, so
+                # the first packet that parses tags the whole run (a garbled
+                # first packet falls through to the next).
+                self._cur_sub = parse_subheader(payload)
             self._acc.extend(block)
             if len(self._acc) > MAX_SCAN_BYTES:
                 # Degenerate stream (no channel change, no marker): drop the
                 # runaway accumulation rather than grow without bound.
                 self._acc = bytearray()
                 self._cur_ch = None
+                self._cur_sub = None
         return out
 
     def flush(self):
