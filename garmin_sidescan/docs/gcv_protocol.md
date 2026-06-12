@@ -293,8 +293,10 @@ keepalives — it relies on the real chartplotter).
 ### 4.4 Status — `8e03` (`239.254.2.2:50050`)
 
 Fixed 34 bytes **from the GCV**. (The chartplotter broadcasts its own
-**70-byte** `8e03` variant on the same group — see §4.7; boat-side bags have
-only ever shown the 34-byte GCV frames.) The stream multiplexes
+**70-byte** `8e03` variant on the same group — see §4.7; boat-side bags never
+show it because the Marine-Network **proxy deliberately filters `:50050` to
+the GCV's source IP** — `tools/garmin_marine_network_proxy.py`. Relaying the
+chartplotter frames too would need a proxy option.) The stream multiplexes
 **sub-types**, discriminated by the payload byte at **offset 9**. Shared
 frame:
 

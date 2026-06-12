@@ -3,9 +3,12 @@
 ## `sidescan_waterfall.py` — offline waterfall image (QA)
 
 Renders a two-panel waterfall (down-look depth-corrected on top, side-scan
-port|starboard below, shared time axis) from a bag, using the **same decoder as
-the driver** (`garmin_sidescan.decode`). Self-contained — needs only the sidescan
-`debug/raw` topic (record with `debug_raw:=true`); no external nav/sonar. The
+port|starboard below, shared time axis) from a bag. Two sources (`--source`,
+default auto): `raw` decodes `debug/raw` with the **same decoder as the
+driver** (`garmin_sidescan.decode`); `messages` renders the published
+`sonar_image_*` topics (per-ping scale from `sample_rate`, bottom line from
+`nadir_depth` — needs a bag recorded by the #35+ driver). Self-contained
+either way; no external nav/sonar. The
 metres-per-sample scale is self-derived per channel from the device's per-ping
 **display-range varint** (sub-header `v2`); no hard-coded calibration. Sample
 values are shown raw on a single global brightness scale (no per-ping
