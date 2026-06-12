@@ -27,3 +27,23 @@ issue: 35
 - Copilot claim that replay t0 anchors to any topic: false positive (loop continues on non-raw topics before t0 is set)
 
 Verification: 64/64 tests; ament flake8/pep257 clean; end-to-end UDP replay of the 2026-06-10 Cod Rock bag through the real node — consumer recovered port/stbd {47.8, 30.4} m across the auto-range step, down {10.8, 11.2} m, nadir_depth 7.62–7.76 m on the shoal.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-12 00:18 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #36 at `4d7ebfe` (fixes landed in `4a060d8`)
+**Sources**: 4 (Copilot R1 @ `655f779`, R2 @ `c1b72cb`, R3 @ `4d7ebfe`, Local Review (Pre-Push) timeline)
+**Cross-source confirmations**: 1
+**CI**: all-pass (build-and-test, copilot-reviewer)
+
+### Findings
+- [x] (cross-confirmed: Copilot R1+R2+R3; consequence of Local-Review remediation) build_nadir_range docstring said max_range = "configured swath maximum" but caller passes the ping's own v2 — `garmin_sidescan/node.py:92`
+- [x] (valid, Copilot R2+R3) nadir_depth could publish spec-invalid Range (range > max_range) on corrupt-but-parseable v1; now gated 0 < v1 <= v2 + test — `garmin_sidescan/node.py:818`
+- [x] (valid, Copilot R1 x2) verify tool xlabel + --start help said "first bag message"; anchor is first raw datagram — `tools/verify_range_scale.py`
+- [x] (valid, Copilot R2) tools hard-coded echo_layer so GCV-10 bags rendered nothing; now generation-voted like the driver (waterfall had the same unflagged flaw, fixed too) — `tools/verify_range_scale.py`, `tools/sidescan_waterfall.py`
+- [x] (valid, Copilot R3) --source help typo — `tools/sidescan_waterfall.py`
+
+### False positives
+- none — all five distinct findings were real
