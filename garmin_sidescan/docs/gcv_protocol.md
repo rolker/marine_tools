@@ -20,6 +20,7 @@ decodes and the structural analysis here come from the wet captures below.
 | GCV-10 survey pcap (Dan, `dumpcap_file.pcap`) | imagery, 2 channels (1/3), 20 m commanded range | render-layer model, GCV-10 fixtures, grammar + v2=20.00 m validation |
 | `gcv10_20260605-050008.pcap` (bench) | imagery, 3 channels (0/2/5) | GCV-10 grammar validation; down-look beam byte `0x0d` confirmed on GCV-10 |
 | `gcv20_rangesweep_20260605-024550.pcap` (bucket) | all planes, **operator range sweep 3→15 m in 1 m steps + ramp to 50 m** | v2 = the commanded range (exact integers, staircase matches operator actions); config/status behavior under manual range changes |
+| `gcv20_settings_20260605-031143.pcap` (bucket) | all planes, TVG steps + preset/mode toggles + power-cycle | chartplotter-side stream inventory (§4.7), `cdp_current_preset_tab` record, beam gating |
 | 2026-06-05/09 GCV-20 bench/wet | imagery | GCV-20 echo layer, trailer fix (#26), fixtures |
 | `bag_2026-06-10T15.54.41` | all 4 streams, 20 min, **2 Cod Rock auto-range transitions**, M3 in same bag | sub-header varints (M3-validated), status/config decode, auto-range behavior |
 | `bag_2026-06-11T15.35.08` | all 4 streams, 30 min | independent re-verification sweep: envelope 100%, rates/lengths, d807 channel tag, rare status sub-types |
@@ -291,8 +292,11 @@ keepalives — it relies on the real chartplotter).
 
 ### 4.4 Status — `8e03` (`239.254.2.2:50050`)
 
-Fixed 34 bytes. The stream multiplexes **sub-types**, discriminated by the
-payload byte at **offset 9**. Shared frame:
+Fixed 34 bytes **from the GCV**. (The chartplotter broadcasts its own
+**70-byte** `8e03` variant on the same group — see §4.7; boat-side bags have
+only ever shown the 34-byte GCV frames.) The stream multiplexes
+**sub-types**, discriminated by the payload byte at **offset 9**. Shared
+frame:
 
 | offset | bytes | meaning |
 |-------:|-------|---------|
@@ -348,6 +352,13 @@ bus):
   `2f 08`-tagged LEB128 timestamp. Four record kinds seen
   (`yutl-port/stbd/cntr-port/cntr-stbd-engn-sched`), each carrying nested keys
   `yutl-engn-sched-type`, `stnd-sched`, `opt-sched-1/2/3`.
+- **`e508` event record `cdp_current_preset_tab_v1:<NN>` (59/61 B)** —
+  broadcast only when the chartplotter's active preset tab changes (which is
+  why steady-state captures never show it). The 06-05 settings capture shows
+  tab `:48`↔`:49` switches correlating exactly with **which beams stream**
+  (all three ↔ down-only ↔ subsets) — the preset tab gates the transmitted
+  arrays. The rangesweep capture announces `:49` just before the operator's
+  sweep begins.
 
 **Important (issues #32/#35):** across the full 06-10 capture the **only**
 changing bytes in any config frame are the port/stbd string label and the
@@ -376,6 +387,27 @@ The driver's control path (from `commands.py`; envelope in §1). Builders:
 **Gap (issue #32 deliverable B):** there is **no** auto-range-disable /
 force-manual-range builder — needed only to hold a fixed swath against the
 chartplotter's auto-range.
+
+### 4.7 Chartplotter-side streams (bench inventory; not consumed by the driver)
+
+The 06-05 bucket captures show the chartplotter (`172.16.6.64`) broadcasting
+on several groups beyond `:51000`. Inventoried for completeness — none
+carries the range (checked against the operator range sweep) and the driver
+consumes none of them:
+
+| Stream | id | Len | Rate | Content |
+|---|----|----|------|---------|
+| `239.254.2.2:50050` | `8e03` | **70** | 0.2/s | chartplotter status: nine-entry `<u8 key> 00 <u16 value>` settings table (keys `1a/03/16/08/43/17/45/44/15`; static through the TVG/preset session — not TVG), the same cycling ASCII-fragment window at 17–19 as the GCV frames, device id + counter tail |
+| `239.254.2.4:8322` | — | 108 | 0.5/s | **position broadcast**: lat/lon as float64 radians at offsets 20–35 (reads 43°N, −71°W on the bench), plus undecoded floats |
+| `239.254.2.18:51400` | `050a` | 14/16 | 0.5/s | constant pair (record grammar; field values static) |
+| `239.254.2.22:51950` | `4719`/`4819` | 33/26 | 0.4/s | heartbeats — only a u16 counter changes |
+| `239.254.2.14:50615` | `fd09` | 16 | 4 every 10 s | periodic 4-frame enumeration burst, constant pattern |
+| `224.0.0.1:50030`, `233.89.188.1:10001`, SSDP `:1900` | — | — | — | discovery/beacon traffic |
+
+**Capture-topology caveat:** the 06-05 sniff port saw only switch-flooded
+traffic — these captures contain **zero unicast** between chartplotter and
+GCV, so the actual command sessions (range, settings) are invisible in them.
+A port-mirror or inline tap is required to capture those (§6, #32-B).
 
 ---
 
@@ -407,11 +439,16 @@ bottom range and v2 scaling (§4.1) and disproved the `0xe4`-as-depth reading
   TCP experiment (send a `0x0000`-high command); don't test on a live survey
   unit.
 - **The chartplotter→GCV range-command path.** Range is not re-broadcast on
-  `:51000` (auto or manual) nor `:50050`; the chartplotter presumably commands
-  over TCP `:50227`. The 06-05 `gcv20_rangesweep` / `gcv20_settings` pcaps
-  were sniffed while the operator changed range/settings — **if they captured
-  that TCP session, the auto-range-disable / force-manual frames (#32
-  deliverable B) are sitting in them.** Next RE target.
+  `:51000` (auto or manual) nor `:50050`. The 06-05 pcaps were checked for
+  the command session (2026-06-11): they contain **zero TCP and zero
+  GCV↔chartplotter unicast** — the sniff port only saw switch-flooded
+  (multicast/broadcast) traffic, so the unicast command session is invisible
+  at that capture point. **#32 deliverable B therefore needs a port-mirror /
+  inline-tap capture** of the chartplotter↔GCV link; nothing more can be
+  extracted passively from the existing captures.
+- **The 70-byte chartplotter `8e03` key-value table** (§4.7): nine keys,
+  static through the TVG/preset session — meanings unknown. A mirrored or
+  longer capture across more setting changes would map them.
 - **Gain steps at the field2 tag-length transitions** (the ex-"bracket", i.e.
   when the bottom range crosses 4.10 m / 8.19 m, and at auto-range changes) —
   a range/depth-coupled TVG/AGC applied before sending samples. Whether a
