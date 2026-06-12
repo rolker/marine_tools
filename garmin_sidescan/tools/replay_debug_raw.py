@@ -116,6 +116,8 @@ def main(argv=None):
     ap.add_argument('--end', type=float, default=1e9, help='window end (s)')
     args = ap.parse_args(argv)
 
+    if args.rate <= 0:
+        sys.exit('error: --rate must be > 0 (it divides the pacing deadline)')
     raw_topic = find_raw_topic(args.bag)
     if raw_topic is None:
         sys.exit('error: no */debug/raw topic in the bag — record with debug_raw:=true')

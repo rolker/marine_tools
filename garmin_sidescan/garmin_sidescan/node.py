@@ -807,11 +807,15 @@ class GarminSidescanNode(Node):
             self._make_sonar_msg(side, line.samples, line.stamp, line.subheader))
         # Nadir bottom range: the per-ping sub-header v1 varint. It is shared
         # across channels (the boat's depth), but published once per ping from
-        # the down-look -- the beam that actually measures it.
+        # the down-look -- the beam that actually measures it. max_range is
+        # the ping's own water-column extent (v2): the sensor's actual
+        # observable window this ping, NOT the side-scan command clamp -- so a
+        # garbled v1 beyond it is spec-discardable (Range: range > max_range).
         if side == 'down' and line.subheader and line.subheader.bottom_range_m > 0.0:
             self._pub_depth.publish(build_nadir_range(
                 line.subheader.bottom_range_m, self._nadir_frame_id,
-                line.stamp.to_msg(), self._nadir_fov, self._range_max))
+                line.stamp.to_msg(), self._nadir_fov,
+                line.subheader.display_range_m))
 
     def _make_sonar_msg(self, side, samples, stamp, sub=None):
         msg = RawSonarImage()
@@ -825,10 +829,15 @@ class GarminSidescanNode(Node):
         # The range source is the ping's OWN sub-header v2 (per channel, tracks
         # hardware auto-range), falling back to the commanded-range mirror and
         # then the sample_rate_hz parameter -- see decode.derive_sample_rate.
+        # The commanded fallback applies to the side-scan only: the down-look's
+        # range is its auto-ranged water-column extent, never the commanded
+        # swath, so a wrong-but-confident ~2x scale must not be published --
+        # better "unavailable" than wrong.
         bins = len(samples) // self._bytes_per_sample
+        commanded = (0.0 if side == 'down'
+                     else float(self._controls.get('range') or 0.0))
         msg.sample_rate = derive_sample_rate(
-            sub, bins, sv,
-            commanded_range_m=float(self._controls.get('range') or 0.0),
+            sub, bins, sv, commanded_range_m=commanded,
             fallback_rate=self._sample_rate)
         msg.samples_per_beam = bins
         msg.sample0 = 0

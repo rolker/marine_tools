@@ -321,3 +321,30 @@ def test_build_nadir_range_maps_bottom_range_to_downward_range():
     assert msg.min_range == 0.0                     # shallow not flagged invalid
     assert abs(msg.max_range - 60.0) < 1e-4
     assert abs(msg.field_of_view - 0.2) < 1e-4
+
+
+def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
+    # The commanded range is the side-scan swath; the down-look's true range
+    # is its auto-ranged water-column extent. With no parseable sub-header
+    # (e.g. GCV-10) the side channels may fall back to the commanded range,
+    # but the down channel must publish "unavailable" rather than a
+    # confidently-wrong ~2x scale.
+    from builtin_interfaces.msg import Time
+
+    def fake(side):
+        return types.SimpleNamespace(
+            _frame_id='gs', _freq={side: 0.0},
+            _current_sound_speed=lambda: 1500.0,
+            _controls={'range': '50.0'},
+            _bytes_per_sample=2, _sample_rate=0.0, _sonar_dtype=0,
+            _make_sonar_msg=GarminSidescanNode._make_sonar_msg)
+    samples = bytes(4096)                       # 2048 uint16 bins
+    stamp = types.SimpleNamespace(to_msg=lambda: Time())
+    side_msg = GarminSidescanNode._make_sonar_msg(
+        fake('port'), 'port', samples, stamp, sub=None)
+    down_msg = GarminSidescanNode._make_sonar_msg(
+        fake('down'), 'down', samples, stamp, sub=None)
+    # side: commanded fallback engages -> range round-trips to 50.0
+    assert abs(1500.0 * 2048 / (2.0 * side_msg.sample_rate) - 50.0) < 1e-6
+    # down: no commanded fallback -> 0.0 = unavailable
+    assert down_msg.sample_rate == 0.0

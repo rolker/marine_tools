@@ -61,7 +61,10 @@ def read_bag(bag, start, end):
     for t in r.get_all_topics_and_types():
         if t.name.endswith('debug/raw'):
             raw_topic = t.name
-        elif t.type == 'marine_acoustic_msgs/msg/RawSonarImage':
+        elif (t.type == 'marine_acoustic_msgs/msg/RawSonarImage'
+              and 'sonar_image_' in t.name):
+            # name-filtered to the driver's own publishers: the same bag may
+            # carry other RawSonarImage sources (e.g. the M3 multibeam)
             img_topics[t.name] = t.name.rsplit('_', 1)[-1]
         elif t.type == 'marine_radar_control_msgs/msg/RadarControlSet':
             state_topic = t.name
@@ -75,7 +78,12 @@ def read_bag(bag, start, end):
     t0 = None
     while r.has_next():
         topic, data, ts = r.read_next()
+        # Anchor the window to the first raw datagram (same convention as
+        # sidescan_waterfall / replay_debug_raw, so windows are portable);
+        # messages before it are skipped.
         if t0 is None:
+            if topic != raw_topic:
+                continue
             t0 = ts
         rel = (ts - t0) / 1e9
         if rel > end + 2:
@@ -103,6 +111,11 @@ def read_bag(bag, start, end):
                         commanded.append((rel, float(item.value)))
                     except ValueError:
                         pass
+    for line in asm.flush():               # emit the final accumulated run
+        if line.subheader and t0 is not None and start <= line.stamp <= end:
+            s = line.subheader
+            decoded.setdefault(line.channel, []).append(
+                (line.stamp, s.bottom_range_m, s.display_range_m, s.bracket))
     return decoded, published, commanded
 
 
