@@ -65,3 +65,19 @@ Verification: 64/64 tests; ament flake8/pep257 clean; end-to-end UDP replay of t
 
 ### False positives
 - (Copilot R4, x4) re-raised rounds-1-3 comments verbatim (xlabel/--start wording, hard-coded extractor, --source typo) — all fixed in 4a060d8 and present at the reviewed head; cited line numbers point at text that no longer exists
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-06-12 00:47 -0400
+**By**: Claude Code Agent (Claude Opus 4.8 (1M context))
+
+**PR**: #36 at `710f275` (Copilot round 5; fix in this commit)
+**Sources**: 2 (Copilot R5 @ `710f275`, prior Integrated Review timeline)
+**Cross-source confirmations**: 0
+**CI**: all-pass
+
+### Findings
+- [x] (valid, Copilot R5) round-4 field6 check (tag>>3==6) accepted any 0x30-0x37 byte; now exact-bytes 31 02 3f, bounds-safe, fail-closed; full-bag regression 100% — `garmin_sidescan/decode.py`
+
+### False positives
+- (Copilot R5, x3) re-raised stale comments: verify-tool xlabel/--start wording (fixed in 4a060d8, present at reviewed head) and the field3/field6-missing claim (added in 710f275, the very head it reviewed — only the exact-bytes refinement was new)
