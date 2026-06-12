@@ -15,6 +15,7 @@
   <depend>marine_interfaces</depend>
   <depend>marine_radar_control_msgs</depend>
   <depend>diagnostic_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <exec_depend>rcl_interfaces</exec_depend>

@@ -10,6 +10,7 @@ import types
 from diagnostic_msgs.msg import DiagnosticStatus
 from garmin_sidescan.decode import FH, SH
 from garmin_sidescan.node import (
+    build_nadir_range,
     GarminSidescanNode,
     GEN_VOTE_MIN,
     imagery_diag_level,
@@ -303,3 +304,20 @@ def test_status_heartbeat_republishes_control_set():
     node._pub_status = types.SimpleNamespace(publish=lambda msg: None)
     GarminSidescanNode._publish_status(node)
     assert node.publishes == 1
+
+
+# ----- nadir bottom range (sub-header v1 -> sensor_msgs/Range, issue #16) --
+
+def test_build_nadir_range_maps_bottom_range_to_downward_range():
+    from builtin_interfaces.msg import Time
+    from sensor_msgs.msg import Range
+
+    msg = build_nadir_range(14.58, 'gs_nadir', Time(sec=5, nanosec=0),
+                            field_of_view=0.2, max_range=60.0)
+    assert msg.header.frame_id == 'gs_nadir'        # dedicated +X-down frame
+    assert msg.header.stamp.sec == 5                # ping receive-time stamp
+    assert msg.radiation_type == Range.ULTRASOUND
+    assert abs(msg.range - 14.58) < 1e-4            # v1 bottom range -> range
+    assert msg.min_range == 0.0                     # shallow not flagged invalid
+    assert abs(msg.max_range - 60.0) < 1e-4
+    assert abs(msg.field_of_view - 0.2) < 1e-4

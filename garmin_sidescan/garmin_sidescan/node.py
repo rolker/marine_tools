@@ -4,7 +4,10 @@ Garmin GCV-10/20 sidescan sonar driver node.
 Receives the GCV imagery multicast, decodes per-ping sidescan scan lines (see
 :mod:`garmin_sidescan.decode`) and publishes them as
 ``marine_acoustic_msgs/RawSonarImage`` (one publisher per channel, single
-beam).  Controls transmit on/off and range over the GCV TCP command port
+beam) with the metric scale (``sample_rate``) derived from each ping's own
+sub-header display range (v2), plus the per-ping nadir bottom range
+(sub-header v1) as a ``sensor_msgs/Range`` on ``~/nadir_depth``.  Controls
+transmit on/off and range over the GCV TCP command port
 (see :mod:`garmin_sidescan.commands`).  Rendering is left to downstream tools
 (``rqt_sonar_waterfall``); a ``debug_raw`` parameter can publish the raw UDP
 payloads on ``~/debug/raw`` for offline re-decode.
@@ -28,6 +31,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
+from sensor_msgs.msg import Range
 from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import SetBool
 
@@ -40,12 +44,13 @@ from .commands import (
     TRANSMIT_ON,
 )
 from .decode import (
-    CHANNEL_OFFSET, dark_layer, EB07, echo_layer, generation_from_layers,
-    is_water_column, MIN_DATA_LEN, PingAssembler, status_transmitting)
+    CHANNEL_OFFSET, dark_layer, derive_sample_rate, EB07, echo_layer,
+    generation_from_layers, is_water_column, MIN_DATA_LEN, PingAssembler,
+    status_transmitting)
 
 # Auxiliary GCV multicast streams the driver can listen to. The imagery group
 # is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
-STATUS_GROUP, STATUS_PORT = '239.254.2.2', 50050    # 8e03 status (tx flag + depth)
+STATUS_GROUP, STATUS_PORT = '239.254.2.2', 50050    # 8e03 status (tx flag)
 CONFIG_GROUP, CONFIG_PORT = '239.254.2.11', 51000   # chartplotter CDP config (debug-capture only)
 GEN_VOTE_MIN = 5                # packets to vote before latching the generation
 
@@ -72,6 +77,29 @@ SIDES = ('port', 'stbd', 'down')
 # URDF/TF tree orients it (side + downward tilt). Mounting -- including a
 # non-traditional/backwards install -- lives entirely in TF, never here.
 FRAME_SUFFIX = {'port': 'port', 'stbd': 'starboard', 'down': 'down'}
+
+
+def build_nadir_range(depth_m, frame_id, stamp, field_of_view, max_range):
+    """
+    Build a ``sensor_msgs/Range`` for a nadir bottom-range reading.
+
+    Per ``sensor_msgs/Range`` the range is measured along the **+X axis** of
+    ``frame_id``, so ``frame_id`` must be a dedicated nadir frame whose +X points
+    down -- NOT the water-column ``_down`` frame, which is Z-down (the marine
+    convention the down-look ``RawSonarImage`` uses; see ``docs/gcv_protocol.md``).
+    ``min_range`` is 0 so a genuinely shallow reading is not flagged invalid;
+    ``max_range`` bounds it at the configured swath maximum.  ``stamp`` is the
+    ping receive time (the imagery stream carries no transmit clock).
+    """
+    msg = Range()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.radiation_type = Range.ULTRASOUND
+    msg.field_of_view = float(field_of_view)
+    msg.min_range = 0.0
+    msg.max_range = float(max_range)
+    msg.range = float(depth_m)
+    return msg
 
 
 def transmit_state_after(commanded_on, send_ok, prior):
@@ -151,6 +179,14 @@ class GarminSidescanNode(Node):
         self.declare_parameter('freq_down_hz', 0.0)
         self.declare_parameter('sample_rate_hz', 0.0)
 
+        # Nadir bottom range (sensor_msgs/Range from the per-ping sub-header
+        # v1 varint, M3-validated). The Range beam axis is +X, so this needs
+        # its own frame whose +X points down -- distinct from the Z-down
+        # water-column _down frame. Empty -> derive '<frame_id>_nadir'; the
+        # platform URDF supplies the TF.
+        self.declare_parameter('nadir_frame_id', '')
+        self.declare_parameter('nadir_beam_width_rad', 0.0)   # Range.field_of_view
+
         # device generation. 'auto' detects from the render-layer structure
         # (GCV-10 = 3 layers, GCV-20 <= 2; see decode.generation_from_layers),
         # which is range-independent and picks the right per-packet echo
@@ -208,6 +244,8 @@ class GarminSidescanNode(Node):
             'down': float(self._p('freq_down_hz')),
         }
         self._sample_rate = float(self._p('sample_rate_hz'))
+        self._nadir_frame_id = self._p('nadir_frame_id') or f'{self._frame_id}_nadir'
+        self._nadir_fov = float(self._p('nadir_beam_width_rad'))
         self._chan_beamtype = {}      # ch -> 'sidescan'|'down' from pl[8]
         self._device = str(self._p('device')).lower()
         if self._device not in ('auto', 'gcv20', 'gcv10'):
@@ -274,9 +312,14 @@ class GarminSidescanNode(Node):
             'stbd': self.create_publisher(RawSonarImage, '~/sonar_image_starboard', img_qos),
             'down': self.create_publisher(RawSonarImage, '~/sonar_image_down', img_qos),
         }
+        # Nadir bottom range decoded from the down-look sub-header (per-ping
+        # v1 varint, M3-validated to ~1%), as a downward sensor_msgs/Range
+        # (see build_nadir_range / the _nadir frame). Per-ping sensor data, so
+        # the imagery QoS, not latched.
+        self._pub_depth = self.create_publisher(Range, '~/nadir_depth', img_qos)
         # Raw-payload debug capture (only published when debug_raw is true) --
         # one topic per GCV multicast stream so a single bag is fully
-        # re-decodable offline (imagery + status/depth + chartplotter config).
+        # re-decodable offline (imagery + status + chartplotter config).
         u8 = UInt8MultiArray
         self._pub_raw = self.create_publisher(u8, '~/debug/raw', img_qos)
         self._pub_raw_status = self.create_publisher(u8, '~/debug/raw_status', img_qos)
@@ -681,11 +724,11 @@ class GarminSidescanNode(Node):
                     f'device={self._device} but packet geometry looks like '
                     f'{detected}; imagery decode is likely wrong')
             now = self.get_clock().now()
-            for ch, samples, stamp in self._assembler.feed(payload, now):
-                self._emit_ping(ch, samples, stamp)
+            for line in self._assembler.feed(payload, now):
+                self._emit_ping(line)
         if self._assembler is not None:
-            for ch, samples, stamp in self._assembler.flush():
-                self._emit_ping(ch, samples, stamp)
+            for line in self._assembler.flush():
+                self._emit_ping(line)
         if sock is not None:
             sock.close()
 
@@ -754,15 +797,23 @@ class GarminSidescanNode(Node):
                 f'stream reports {observed} (render-layer byte); check the '
                 f'port/stbd/down channel map')
 
-    def _emit_ping(self, ch, samples, stamp):
-        side = self._chan_side.get(ch)
-        if side is None or not samples:
+    def _emit_ping(self, line):
+        side = self._chan_side.get(line.channel)
+        if side is None or not line.samples:
             return
         self._ping_count[side] += 1
         self._last_ping_t = time.monotonic()
-        self._pub_sonar[side].publish(self._make_sonar_msg(side, samples, stamp))
+        self._pub_sonar[side].publish(
+            self._make_sonar_msg(side, line.samples, line.stamp, line.subheader))
+        # Nadir bottom range: the per-ping sub-header v1 varint. It is shared
+        # across channels (the boat's depth), but published once per ping from
+        # the down-look -- the beam that actually measures it.
+        if side == 'down' and line.subheader and line.subheader.bottom_range_m > 0.0:
+            self._pub_depth.publish(build_nadir_range(
+                line.subheader.bottom_range_m, self._nadir_frame_id,
+                line.stamp.to_msg(), self._nadir_fov, self._range_max))
 
-    def _make_sonar_msg(self, side, samples, stamp):
+    def _make_sonar_msg(self, side, samples, stamp, sub=None):
         msg = RawSonarImage()
         msg.header.stamp = stamp.to_msg()
         # Per-channel frame so TF orients each transducer (see FRAME_SUFFIX).
@@ -770,17 +821,15 @@ class GarminSidescanNode(Node):
         msg.ping_info.frequency = self._freq[side]
         sv = self._current_sound_speed()
         msg.ping_info.sound_speed = sv
-        # Derive sample_rate so a consumer recovers range_max = sv*bins/(2*rate)
-        # = the commanded range. The GCV carries no rate/range in the payload,
-        # but the driver knows the range it commanded (mirrored in _controls).
-        # Only when we actually commanded a range (>0); else leave the manual
-        # override (default 0 = "unavailable", per RawSonarImage convention).
-        range_m = float(self._controls.get('range') or 0.0)
+        # Derive sample_rate so a consumer recovers range = sv*bins/(2*rate).
+        # The range source is the ping's OWN sub-header v2 (per channel, tracks
+        # hardware auto-range), falling back to the commanded-range mirror and
+        # then the sample_rate_hz parameter -- see decode.derive_sample_rate.
         bins = len(samples) // self._bytes_per_sample
-        if range_m > 0.0 and sv > 0.0 and bins > 0:
-            msg.sample_rate = float(sv) * bins / (2.0 * range_m)
-        else:
-            msg.sample_rate = self._sample_rate
+        msg.sample_rate = derive_sample_rate(
+            sub, bins, sv,
+            commanded_range_m=float(self._controls.get('range') or 0.0),
+            fallback_rate=self._sample_rate)
         msg.samples_per_beam = bins
         msg.sample0 = 0
         # rx_angles/tx_angles are the *steering* angle applied to the beam

@@ -333,9 +333,10 @@ The offset-20 `u16` is **not a depth**: it is **held** (one value for tens of
 seconds), lags the M3 nadir by 2–7 m, and does not track the bottom (it only
 *looked* depth-like because its mean and Cod-Rock dips happened to align). Its
 meaning is unconfirmed — likely a mode/status field. The driver does **not**
-decode or publish it. A real per-ping bottom range is instead in the **down-look
-imagery sub-header** (§3.1, offset-14 varint); for a nadir *depth*, bottom-track
-the down-look in a downstream node (issue #16).
+decode or publish it. The real per-ping bottom range is instead the **down-look
+imagery sub-header v1** (§3.1, offset-14 varint, M3-validated), which the
+driver publishes as `~/nadir_depth` (issues #16/#35); draft/tide/offset
+correction is a downstream concern.
 
 **Sub-type `0x00` — settings echo (NOT the active range):**
 
@@ -358,13 +359,19 @@ bus). Two frames:
   `yutl-engn-sched-type`, `stnd-sched`, `opt-sched-1/2/3` and a trailing
   `2f 08 <LEB128 timestamp>`.
 
-**Important (issue #32):** across the full capture the **only** changing bytes
-in any config frame are the port/stbd string label and the per-frame timestamp
-tail. **No range field, nothing steps at the Cod Rock auto-range transitions.**
-The active range is *not* on this stream — the GCV auto-range derives the swath
-from depth and never re-broadcasts the resulting range as a value. Reporting a
-true active range therefore needs auto-range pinned/disabled over the command
-port (#32 deliverable B), not a passive decode.
+**Important (issues #32/#35):** across the full capture the **only** changing
+bytes in any config frame are the port/stbd string label and the per-frame
+timestamp tail. **No range field, nothing steps at the Cod Rock auto-range
+transitions.** The active range is *not* on this stream — but it **is**
+passively available after all: each channel's per-ping sub-header **v2**
+(§3.1) is that channel's true active display range, verified to track both
+Cod Rock auto-range transitions in lockstep with the byte-13 bracket
+(side-scan 47.8 → 30.4 → 50.4 → 29.8 → 48.9 m at t≈153/202/561/592 s) while
+the driver's commanded mirror held `60.0`. The driver derives the published
+``RawSonarImage.sample_rate`` from it (#35), so consumers recover the true
+per-ping range. Pinning/disabling auto-range over the command port (#32
+deliverable B) remains open as an optional survey-ops capability — for
+*holding* a fixed swath, no longer for *knowing* it.
 
 ### 3.6 Command — `d2 07 ef be` (TCP `172.16.3.0:50227`, outbound)
 
@@ -418,6 +425,9 @@ disproved the `0xe4`-as-depth reading (§3.4).
 - **Node id bodies** (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`), **`e508` value
   records**, and the **`0x00`-status settings block** (`ae 05 c0 …`) — field
   decodes unknown; not yet needed.
-- **Nadir depth** — not reported usably by the device. If wanted, a downstream
-  node bottom-tracks `sonar_image_down`; draft/tide/transducer-offset correction
-  is that node's concern, not the driver's.
+- ~~**Nadir depth**~~ — **resolved (#16/#35)**: the device *does* report a real
+  per-ping bottom range — the sub-header **v1** varint (§3.1, M3-validated to
+  ~1%) — and the driver publishes it as a downward `sensor_msgs/Range` on
+  `~/nadir_depth`. (The earlier `0xe4`-status reading remains disproven, §3.4.)
+  Draft/tide/transducer-offset correction is a downstream concern, not the
+  driver's.

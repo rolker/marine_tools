@@ -55,9 +55,10 @@ Published (relative to the node namespace):
 
 | Topic | Type | Notes |
 |-------|------|-------|
-| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | side-scan port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10). `rx_angles`/`tx_angles` = `0` (a fixed beam has no steering); side/orientation is carried by the per-channel `frame_id` + TF |
+| `sonar_image_port` | `marine_acoustic_msgs/RawSonarImage` | side-scan port, single beam; `DTYPE_UINT16` (GCV-20, little-endian) / `DTYPE_UINT8` (GCV-10). `rx_angles`/`tx_angles` = `0` (a fixed beam has no steering); side/orientation is carried by the per-channel `frame_id` + TF. `sample_rate` is derived from the ping's **own sub-header display range (v2)** — per channel, tracks hardware auto-range — so a consumer recovers `range = sound_speed·bins/(2·sample_rate)`; falls back to the commanded range, then `sample_rate_hz` (see `decode.derive_sample_rate`) |
 | `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | side-scan starboard |
-| `sonar_image_down` | `marine_acoustic_msgs/RawSonarImage` | down-look (water-column) beam |
+| `sonar_image_down` | `marine_acoustic_msgs/RawSonarImage` | down-look (water-column) beam; its v2 is the water-column range (≠ the side-scan swath) |
+| `nadir_depth` | `sensor_msgs/Range` | per-ping bottom range from the down-look sub-header **v1** (M3-validated to ~1%); beam axis = `+X` of the dedicated `<frame_id>_nadir` frame (point it down in the URDF). Uncorrected for draft/tide/offsets |
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
@@ -132,7 +133,9 @@ imagery stream because they are not reliably present there:
 | `iface_ip` | `''` | local NIC IP for the multicast join (set on multi-homed hosts) |
 | `port_channels` / `stbd_channels` / `down_channels` | `[0]` / `[1]` / `[2]` | GCV-20 map; GCV-10 survey data used port=`[3]`, stbd=`[1]` |
 | `freq_port_hz` / `freq_stbd_hz` / `freq_down_hz` | `0.0` | set per transducer; 0 = unavailable |
-| `sample_rate_hz` | `0.0` | 0 = unavailable |
+| `sample_rate_hz` | `0.0` | last-resort fallback when neither the sub-header v2 nor a commanded range gives a scale; 0 = unavailable |
+| `nadir_frame_id` | `''` | frame for `nadir_depth` (+X down); empty derives `<frame_id>_nadir` |
+| `nadir_beam_width_rad` | `0.0` | `Range.field_of_view` for `nadir_depth` |
 | `transmit_on_startup` | `false` | safe default |
 | `sound_speed_safety_enabled` | `true` | dynamic master switch |
 | `require_sound_speed` | `true` | refuse transmit unless a valid SV is fresh; `false` for bench tests |
