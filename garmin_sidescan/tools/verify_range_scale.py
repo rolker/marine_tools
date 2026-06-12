@@ -6,8 +6,8 @@ Decodes a ``debug/raw`` stream with the SAME code the driver uses
 (``PingAssembler`` + per-run sub-header) and plots, on a shared time axis:
 
   * per channel, the **sub-header v2 display range** -- the metric scale the
-    driver now publishes via ``sample_rate`` (issue #35); bracket (byte 13)
-    transitions are marked, so auto-range events are visible;
+    driver now publishes via ``sample_rate`` (issue #35); v1 tag-length
+    transitions (the ex-"bracket", where device gain steps) are marked;
   * the **v1 bottom range** the driver now publishes as ``nadir_depth``
     (issue #16);
   * what the bag's recorded ``sonar_image_*`` messages actually carried
@@ -47,7 +47,7 @@ def read_bag(bag, start, end):
     Collect everything the figure needs, in one pass.
 
     Returns ``(decoded, published, commanded)``:
-    ``decoded[ch] = [(t, v1, v2, bracket)]`` from the raw stream (driver-path
+    ``decoded[ch] = [(t, v1, v2, v1_tag)]`` from the raw stream (driver-path
     decode); ``published[side] = [(t, implied_range)]`` from the recorded
     ``sonar_image_*`` messages; ``commanded = [(t, range_m)]`` from ``state``.
     """
@@ -96,7 +96,7 @@ def read_bag(bag, start, end):
                         s = line.subheader
                         decoded.setdefault(line.channel, []).append(
                             (line.stamp, s.bottom_range_m, s.display_range_m,
-                             s.bracket))
+                             s.v1_tag))
         elif topic in img_topics and start <= rel <= end:
             m = deserialize_message(data, RawSonarImage)
             sv, rate = m.ping_info.sound_speed, m.sample_rate
@@ -115,7 +115,7 @@ def read_bag(bag, start, end):
         if line.subheader and t0 is not None and start <= line.stamp <= end:
             s = line.subheader
             decoded.setdefault(line.channel, []).append(
-                (line.stamp, s.bottom_range_m, s.display_range_m, s.bracket))
+                (line.stamp, s.bottom_range_m, s.display_range_m, s.v1_tag))
     return decoded, published, commanded
 
 
@@ -149,7 +149,7 @@ def render(decoded, published, commanded, out):
     a1.set_ylabel('range (m)')
     a1.legend(loc='upper right', fontsize=8)
     a1.set_title('per-channel display range: driver-path decode vs recorded '
-                 'messages (gray = byte-13 bracket transitions)')
+                 'messages (gray = v1 tag-length transitions; gain steps)')
 
     # bottom: the nadir depth source (down-look v1; shared across channels)
     for ch in sorted(decoded):

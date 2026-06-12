@@ -10,12 +10,11 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH, GEN_BY_TAG,
-    GEN_TAG_OFFSET, generation_from_layers, is_water_column,
-    parse_downlook_subheader, parse_subheader, PingAssembler, SH,
-    status_subtype, status_transmitting, strip_first_layer_trailer,
-    strip_leading_ping_header, Subheader, subheader_bottom_range_m,
-    TRAILER_MAGIC)
+    dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH,
+    generation_from_layers, is_water_column, parse_downlook_subheader,
+    parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
+    strip_first_layer_trailer, strip_leading_ping_header, Subheader,
+    subheader_bottom_range_m, TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -68,10 +67,15 @@ def test_real_capture_decodes_to_two_channel_scan_lines():
     for width in full:
         assert 2000 <= width <= 2100
 
-    # The GCV-10 sub-header does not match the GCV-20 varint layout, so the
-    # assembler attaches no sub-header -- the driver's fallback chain (the
-    # commanded-range mirror) is load-bearing for this generation.
-    assert all(p.subheader is None for p in pings)
+    # The GCV-10 sub-header is the same tagged-record grammar (its v3 is a
+    # 1-byte varint, tag 0x29) -- Dan's survey ran at a commanded 20 m range,
+    # so every run's own v2 must read exactly 20.00 m, with a real bottom
+    # range in v1 and the channel matching the run.
+    for p in pings:
+        assert p.subheader is not None
+        assert p.subheader.channel == p.channel
+        assert abs(p.subheader.display_range_m - 20.0) < 0.01
+        assert 7.0 < p.subheader.bottom_range_m < 11.0
 
 
 def test_assembler_stamps_run_with_first_packet_time():
@@ -130,7 +134,8 @@ def test_echo_layer_empty_without_first_header():
 def test_generation_from_layers_on_real_fixtures():
     # Range-INDEPENDENT generation: GCV-10 packets carry >=2 SH/SHS later-layer
     # headers (3 layers); GCV-20 carry <=1 (<=2 layers). Validated on the real
-    # capture fixtures (the byte-13 'gen tag' is actually the range bracket).
+    # capture fixtures (byte 13 is field2's tag -- v1 varint length -- which
+    # once masqueraded as a 'gen tag' and then as a 'range bracket').
     g10 = [generation_from_layers(p) for p in load_fixture() if p[:2] == b'\xeb\x07']
     g20 = [generation_from_layers(p) for p in _load_records(GCV20_FIXTURE)
            if p[:2] == b'\xeb\x07']
@@ -145,17 +150,6 @@ def test_generation_from_layers_synthetic():
     assert generation_from_layers(pre + FH + SH + bytes(8) + SH + bytes(8)) == 'gcv10'  # 2 SH
     assert generation_from_layers(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is None    # no FH
     assert generation_from_layers(bytes([0xd8, 0x07]) + bytes(40)) is None          # not eb07
-
-
-def test_generation_tag_byte_discriminates():
-    # sub-header value-width tag at offset 13: 0x11=GCV-10, 0x12=GCV-20
-    g10 = _gcv20_packet(0, bytes(8))
-    g20 = _gcv20_packet(0, bytes(8))
-    g10 = g10[:GEN_TAG_OFFSET] + bytes([0x11]) + g10[GEN_TAG_OFFSET + 1:]
-    g20 = g20[:GEN_TAG_OFFSET] + bytes([0x12]) + g20[GEN_TAG_OFFSET + 1:]
-    assert GEN_BY_TAG.get(g10[GEN_TAG_OFFSET]) == 'gcv10'
-    assert GEN_BY_TAG.get(g20[GEN_TAG_OFFSET]) == 'gcv20'
-    assert GEN_BY_TAG.get(0x99) is None          # unknown tag -> undecided
 
 
 def _img_with_layer(layer):
@@ -230,7 +224,7 @@ def test_parse_downlook_subheader():
     pkt = bytes.fromhex('eb07000000000000') + bytes.fromhex(
         '0d0103090212907f190023acbd012ab20131023fda04d804') + bytes(8)  # + samples
     sub = parse_downlook_subheader(pkt)
-    assert sub.bracket == 0x12
+    assert sub.v1_tag == 0x12   # field2, 2-byte v1
     assert abs(sub.bottom_range_m - 8.136) < 0.01     # v1
     assert abs(sub.display_range_m - 12.118) < 0.01   # v2
     assert abs(sub.near_field_m - 0.089) < 0.01       # v3
@@ -271,7 +265,7 @@ def test_assembler_attaches_run_subheader_on_gcv20_capture():
 
 
 def _sub(v2, v1=10.0):
-    return Subheader(channel=2, layer=0x0d, bracket=0x12,
+    return Subheader(channel=2, layer=0x0d, v1_tag=0x12,
                      bottom_range_m=v1, display_range_m=v2, near_field_m=0.1)
 
 
@@ -290,7 +284,7 @@ def test_derive_sample_rate_uses_own_channel_v2():
 
 def test_derive_sample_rate_fallback_chain():
     sv, bins = 1500.0, 2048
-    # no sub-header (e.g. GCV-10) -> the commanded range
+    # no sub-header (garbled packet) -> the commanded range
     rate = derive_sample_rate(None, bins, sv, commanded_range_m=50.0)
     assert abs(sv * bins / (2.0 * rate) - 50.0) < 1e-9
     # no sub-header, nothing commanded -> the configured fallback rate
@@ -384,6 +378,30 @@ def test_assembler_uses_supplied_extractor():
     assert len(out) == 1
     assert out[0].channel == 7
     assert out[0].samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])
+
+
+def test_subheader_grammar_tags_encode_varint_length_on_both_fixtures():
+    # The sub-header is a tagged record: tag = (field# << 3) | L where L is
+    # the value's LEB128 byte length -- verified with zero exceptions on 697k+
+    # frames across five captures and both generations (gcv_protocol.md
+    # section 3). Pin the invariant on every fixture packet.
+    from garmin_sidescan.decode import V1_TAG_OFFSET
+
+    checked = 0
+    for fixture in (FIXTURE, GCV20_FIXTURE):
+        for pl in _load_records(fixture):
+            if pl[:2] != b'\xeb\x07' or len(pl) <= 32:
+                continue
+            i = V1_TAG_OFFSET
+            for want_field in (2, 3, 4, 5):
+                tag = pl[i]
+                assert tag >> 3 == want_field
+                value, end = decode_leb128(pl, i + 1)
+                assert value is not None
+                assert end - (i + 1) == tag & 0x07   # low bits = varint length
+                i = end
+            checked += 1
+    assert checked >= 60                  # both fixtures contribute
 
 
 def test_d807_marker_tags_an_adjacent_run_channel():

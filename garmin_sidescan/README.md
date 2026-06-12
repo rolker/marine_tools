@@ -145,7 +145,7 @@ imagery stream because they are not reliably present there:
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
 | `expose_gcv10_controls` | `true` | include TVG / interference controls |
-| `device` | `auto` | `auto` detects GCV-10 vs GCV-20 by the sub-header tag byte (picks the echo extractor); `gcv20`/`gcv10` force it |
+| `device` | `auto` | `auto` detects GCV-10 vs GCV-20 structurally from the render-layer count (picks the echo extractor); `gcv20`/`gcv10` force it |
 | `debug_raw` | `false` | publish raw UDP payloads on `debug/raw` for offline re-decode; settable at runtime |
 
 ## Run

@@ -17,7 +17,9 @@ decodes and the structural analysis here come from the wet captures below.
 
 | Capture | Contents | Used for |
 |---|---|---|
-| GCV-10 survey pcap (Dan) | imagery, 2 channels | render-layer model, GCV-10 fixtures |
+| GCV-10 survey pcap (Dan, `dumpcap_file.pcap`) | imagery, 2 channels (1/3), 20 m commanded range | render-layer model, GCV-10 fixtures, grammar + v2=20.00 m validation |
+| `gcv10_20260605-050008.pcap` (bench) | imagery, 3 channels (0/2/5) | GCV-10 grammar validation; down-look beam byte `0x0d` confirmed on GCV-10 |
+| `gcv20_rangesweep_20260605-024550.pcap` (bucket) | all planes, **operator range sweep 3→15 m in 1 m steps + ramp to 50 m** | v2 = the commanded range (exact integers, staircase matches operator actions); config/status behavior under manual range changes |
 | 2026-06-05/09 GCV-20 bench/wet | imagery | GCV-20 echo layer, trailer fix (#26), fixtures |
 | `bag_2026-06-10T15.54.41` | all 4 streams, 20 min, **2 Cod Rock auto-range transitions**, M3 in same bag | sub-header varints (M3-validated), status/config decode, auto-range behavior |
 | `bag_2026-06-11T15.35.08` | all 4 streams, 30 min | independent re-verification sweep: envelope 100%, rates/lengths, d807 channel tag, rare status sub-types |
@@ -66,12 +68,12 @@ imagery/command, `0x08` = config; status sits on its own):
 
 All multicast streams are listen-only; the TCP command path is the only thing
 the driver sends. Lengths and rates are measured (2026-06-10 + 2026-06-11
-captures); imagery sizes and rates vary with the range bracket and ping rate.
+captures); imagery sizes and rates vary with depth/range and ping rate.
 
 | Message | id | Transport | Dir | Len (B) | Rate | Purpose | Decode |
 |---------|-----|-----------|:---:|---------|------|---------|--------|
 | Imagery data | `eb07` | `239.254.2.1:50220` UDP | in | 544–956 | ~200/s pinging | side/down scan-line sample packets | ✅ `decode.py` |
-| Channel marker | `d807` | same | in | 14–16 | 3 × ping rate | delimits one channel's packet run; carries channel tag + current bracket/bottom-range (§3.C) | ✅ |
+| Channel marker | `d807` | same | in | 14–16 | 3 × ping rate | delimits one channel's packet run; two-field record: channel tag + that run's bottom range (§3.C) | ✅ |
 | Keepalive | `d107` | same | in | 22 | 1/s | chartplotter-master keepalive that sustains pinging | ⚠️ envelope only |
 | Status | `8e03` | `239.254.2.2:50050` UDP | in | 34 | 0.2/s | tx flag / settings echo + held `0xe4` value (NOT depth) + rare one-shot sub-types | ◐ §4.4 |
 | Config heartbeat | `e708` | `239.254.2.11:51000` UDP | in | 19 | 1/s | device-id heartbeat (static) | ✅ static |
@@ -84,51 +86,76 @@ Decode legend: ✅ understood · ◐ partial · ⚠️ envelope only.
 
 ## 3. Shared patterns
 
-### A. Node descriptor: `<n> 01 03 0d <5-byte node id>`
+### A. The record grammar: tagged fields
 
-The config and keepalive payloads open with the same shape:
+Payloads are **tagged records**, one grammar across every frame type:
 
 ```
-e7 08 (heartbeat) payload:  03 01 03 0d  90 db a2 88 0b  11 01
-e5 08 (record)    payload:  05 01 03 0d  90 db a2 88 0b  1f 15 …key…
-d1 07 (keepalive) payload:  04 01 03 0d  d5 a7 f2 8b 0d  12 8a 18 19 03
-                            ▲  └ tag ┘  └─ node id ──┘
-                            leading count?
+record :=  <field count>  field*
+field  :=  <tag byte> <value>
+tag    :=  (field# << 3) | L     L = 1..6 → value is an L-byte LEB128 varint
+                                 L = 7    → next byte is an explicit length,
+                                            then that many value bytes
 ```
 
-- `01 03 0d` is a fixed descriptor tag.
-- The **5-byte node id** differs by source — `90 db a2 88 0b` on the config
-  plane vs `d5 a7 f2 8b 0d` on the keepalive — i.e. **two devices** announcing
-  on the bus (GCV vs chartplotter master). Re-verified 2026-06-11: both
-  payloads byte-identical across every frame of the capture (1788 / 1799).
+Verified with **zero exceptions on 697k+ frames across five captures and both
+generations** (every eb07 sub-header, every d807 marker, and the
+d107/e708/e508 payloads walk it exactly). Worked examples:
+
+```
+d107 keepalive:  04 | 01 03 | 0d <5-byte id> | 12 8a 18 | 19 03
+                 cnt  f0=3    f1 = node id     f2 (2 B)    f3 = 3
+e708 heartbeat:  03 | 01 03 | 0d <5-byte id> | 11 01
+                 cnt  f0=3    f1 = node id     f2 = 1
+e508 record:     05 | 01 03 | 0d <5-byte id> | 1f 15 <21-B name> | 27 74 <116-B body> | 2f 08 <8-B timestamp>
+                 cnt  f0=3    f1 = node id     f3, L=7 escape      f4, L=7 escape       f5, L=7 escape
+d807 marker:     02 | 0x10|L <v1> | 19 <channel>
+                 cnt  f2 = bottom   f3 = channel
+```
+
+Consequences worth naming:
+
+- The infamous **eb07 byte 13** — read first as a "generation tag", then as a
+  "coarse range bracket" — is **field 2's tag**: `0x11/0x12/0x13` is just the
+  v1 varint's byte length, stepping when the bottom range crosses the LEB128
+  length boundaries at **4.10 m and 8.19 m**. There is no bracket ladder.
+- The "node descriptor" opening `<n> 01 03 0d <5 bytes>` is the grammar:
+  count `n`, field0 = 3 (a protocol version?), field1 = the sender's **5-byte
+  node id** (`0x0d` = field1, length 5). Two ids on the bus — `90 db a2 88 0b`
+  (GCV, config plane) vs `d5 a7 f2 8b 0d` (chartplotter, keepalive) —
+  byte-identical across every frame of the 2026-06-11 capture (1788 / 1799).
+- Field numbers are scoped **per message type** (field2 is v1 in imagery
+  frames, a 2-byte unknown in the keepalive).
 
 ### B. LEB128 varints, 0.5 mm range unit
 
 Unsigned base-128 varints are the protocol's number format: the TCP range
-command value, the imagery sub-header's three range fields (§4.1), and the
+command value, the imagery sub-header's range fields (§4.1), and the
 `e508` record timestamps all use them. Range-like values are in **0.5 mm
 units** (the TCP range command's unit).
 
 ### C. The `d807` marker: channel tag + that run's range fields
 
-The common marker payload (14–15 B total frame) is:
+The common marker payload (14–15 B total frame) is a two-field record:
 
 ```
-02  <bracket>  <v1 varint>  19  <channel>
+02  |  0x10|L <v1 varint>  |  19 <channel>
+cnt    field2 = bottom range   field3 = channel
 ```
 
 Markers **bracket** channel runs — they appear in close/open pairs at run
 boundaries (visible in the GCV-20 fixture: `…19 02`, `…19 01` between a ch2
-and a ch1 run). Each marker **tags an adjacent run's channel** (the trailing
-byte after the `0x19` tag, cycling `00`/`01`/`02` in exactly equal thirds —
-20,330/20,329/20,331 in the 2026-06-11 capture) and carries **that run's**
-byte-13 bracket + bottom-range varint (§4.1). Verified per-marker against
-both neighbours on the full 2026-06-11 capture: **94 %** match the preceding
-(79 %, close) or following (15 %, open) run's channel *and* v1 exactly; the
-residual is packet loss plus the sub-form below parsed as if common-form.
+and a ch1 run). Each marker **tags an adjacent run's channel** (field3,
+cycling `00`/`01`/`02` in exactly equal thirds — 20,330/20,329/20,331 in the
+2026-06-11 capture) and carries **that run's** v1 bottom range (§4.1).
+Verified per-marker against both neighbours on the full 2026-06-11 capture:
+**94 %** match the preceding (79 %, close) or following (15 %, open) run's
+channel *and* v1 exactly; the residual is packet loss plus the sub-form below
+parsed as if common-form.
 
-- A 16-byte sub-form (`02 0c … 41 19 <channel>`, 780 frames ≈ 1.2 %) carries
-  a different inner layout — **undecoded** (§6).
+- A 16-byte sub-form (`02 0c <4-byte field1 value> 19 <channel>`, 780 frames
+  ≈ 1.2 %, in channel triplets ~every 1.4 s) carries **field1 with a 4-byte
+  value instead of field2** — the value's meaning is open (§6).
 
 The assembler treats any `d807` as "flush the current channel's
 accumulation"; the channel tag and range fields are not needed for assembly
@@ -150,53 +177,51 @@ after the 8-byte envelope):
 
 | offset | meaning |
 |-------:|---------|
-| 8 | render-layer / beam-type byte: `0x0d` down-look (water column), `0x0e`/`0x0f` side-scan |
-| 12 | channel number (GCV-20 map: 0 = port, 1 = stbd, 2 = down) |
-| 13 | **range/scale index** — the coarse display bracket; steps with range (`0x11`/`0x12`/`0x13` seen), shared by all channels. NOT a generation tag (see below). |
-| 14… | three LEB128 varints with fixed markers — see below |
+| 8 | render-layer / beam-type byte: `0x0d` down-look (water column) on **both generations** (GCV-20 wet + GCV-10 bench verified), `0x0e` (GCV-20) / `0x0f` (GCV-10) side-scan |
+| 9–10 | `01 03` — field0 = 3 (grammar §3.A) |
+| 11–12 | `09 <channel>` — field1 = channel number (maps vary by unit/config: GCV-20 0/1/2; GCV-10 survey 1/3; GCV-10 bench 0/2/5) |
+| 13… | fields 2–6 of the record grammar — see below |
 
 Frequency and a per-ping timestamp are **not** carried; the driver takes
 frequency from a parameter and stamps scan lines with receive time.
 
-#### The sub-header varints: v1 bottom range, v2 display range, v3
+#### The sub-header fields: v1 bottom range, v2 display range, v3
 
-The full sub-header is three LEB128 varints (all in **0.5 mm** units)
-bracketed by fixed markers. Structure verified byte-for-byte on **29,267
-packets, 0 mismatches** (`parse_subheader`); the same layout is present on
-every channel:
+The sub-header continues the record grammar (§3.A); range values are LEB128
+varints in **0.5 mm** units. `parse_subheader` walks it field-by-field —
+verified with zero exceptions on every eb07 frame of five captures (697k+):
 
 ```
-08: 0d 01 03 09   beam (0d=down) + const
-12: <channel>
-13: <bracket>     coarse range index (byte 13, above)
-14: v1  ───────── BOTTOM RANGE   (depth; 7.1–19.9 m; corr 1.00 / ratio 1.013 vs M3)
-    19 00 23      marker
-    v2  ───────── DISPLAY RANGE  (scan extent; tracks hardware auto-range)
-    2a            marker
-    v3  ───────── ~88–99 mm      (near-field / start range?; corr 0.94; meaning TBD)
-    31 02 3f      const
-    da 04 d8 04   FH header → samples begin
+field2  (tag 0x10|L):  v1  BOTTOM RANGE   (M3: corr 1.00 / ratio 1.013; bucket: 0.38 m)
+field3  (tag 0x19):    value 0 in imagery frames (the channel in d807 markers)
+field4  (tag 0x20|L):  v2  DISPLAY RANGE  (this channel's scan extent)
+field5  (tag 0x28|L):  v3  ~64–100 mm     (near-field / start range?; corr 0.94; meaning TBD)
+field6  (tag 0x31):    value 2
+3f  da 04 d8 04        FH header → samples begin
 ```
 
 - **v1 = measured bottom range**, per ping, **shared across all channels**
-  (the boat's depth; near-exact vs M3). The driver publishes it as
-  `~/nadir_depth` (issues #16/#35).
-- **v2 = this channel's own display range** — the auto-ranged scan extent,
-  **per channel**: on the down-look it is the water-column depth range; on the
-  side-scan it is the across-track slant range (~2×). So
-  **`bin_size = v2 / n_bins`** must use the matching channel's v2 — no bottom
-  detection, no calibration ladder, no M3. Verified to track **both** Cod Rock
-  auto-range transitions (side-scan 47.8 → 30.4 → 50.4 → 29.8 → 48.9 m at
-  t≈153/202/561/592 s, 2026-06-10) in lockstep with the byte-13 bracket while
-  the driver's commanded mirror held `60.0`. The driver derives the published
+  (the boat's depth; near-exact vs M3 at 7–20 m, and 0.38 m in the bucket
+  test). The driver publishes it as `~/nadir_depth` (issues #16/#35).
+- **v2 = this channel's own display range**, and it is **the real range under
+  every control regime**, verified three ways: it tracks both Cod Rock
+  **auto-range** transitions (side-scan 47.8 → 30.4 → 50.4 → 29.8 → 48.9 m,
+  2026-06-10) while the driver's commanded mirror held `60.0`; it reads the
+  **operator's chartplotter range steps as exact integers** (5→4→3,
+  4,5,…,15 m staircase then the ramp to 50 m — the 06-05 bucket sweep); and
+  Dan's survey reads a flat **20.00 m**. Per channel: side-scan = the
+  across-track slant range (= commanded range when one is set); **down-look =
+  the water-column depth range, always auto** (it ignored the bucket sweep,
+  holding its own 1.84 m). So **`bin_size = v2 / n_bins`** must use the
+  matching channel's v2. The driver derives the published
   `RawSonarImage.sample_rate` from it (#35).
-- **v3 ≈ 96 mm**, weakly depth-correlated — a candidate near-field/blanking or
-  start-range term (§6).
+- **v3** small (~64–100 mm), weakly depth-correlated — a candidate
+  near-field/blanking or start-range term (§6). GCV-10 encodes it as a 1-byte
+  varint (tag `0x29`), GCV-20 typically 2-byte (`0x2a`) — same field, just the
+  length bits.
 
-byte 13 is the coarse bracket that gates which range band v2 lives in; v2 is
-the actual per-ping range. `n_bins` (~2034) is **not** a range control — its
-short values (848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly
-artifacts.
+`n_bins` (~2034) is **not** a range control — its short values
+(848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly artifacts.
 
 #### Distinguishing the beams (down / port / starboard)
 
@@ -206,9 +231,9 @@ Diffing the three channels' sub-headers within one range/time window
 | offset | port (ch0) | stbd (ch1) | down (ch2) | note |
 |-------:|:----------:|:----------:|:----------:|------|
 | 8 | `0e` | `0e` | **`0d`** | beam type — separates **down vs side-scan** only |
-| 9–11 | `01 03 09` | `01 03 09` | `01 03 09` | constant |
-| **12** | **`00`** | **`01`** | **`02`** | **channel number** |
-| 13 | `13` | `13` | `13` | range index (same on all channels) |
+| 9–11 | `01 03 09` | `01 03 09` | `01 03 09` | field0 = 3, field1 tag |
+| **12** | **`00`** | **`01`** | **`02`** | **channel number** (field1 value) |
+| 13 | `13` | `13` | `13` | field2 tag — same on all channels because v1 is shared |
 
 - **Down vs side-scan** is intrinsic at **offset 8** (`0x0d` down vs
   `0x0e`/`0x0f` side; the `0x0e`/`0x0f` split is generation, not side).
@@ -216,19 +241,20 @@ Diffing the three channels' sub-headers within one range/time window
   identical in the sub-header **except the channel number at offset 12**, so
   the driver maps side from the channel number via the `port_channels` /
   `stbd_channels` params. Whether an intrinsic side marker exists elsewhere is
-  **not established**; the channel→side mapping differs by generation (GCV-20
-  `0/1/2` vs the GCV-10 survey `3/1`).
+  **not established**; the channel→side mapping varies by unit/config (GCV-20
+  `0/1/2`; GCV-10 survey `3/1`; GCV-10 bench `0/2/5`).
 
-#### Byte 13 is a range/scale index, not a generation tag
+#### Byte 13: a generation tag that wasn't, then a range bracket that wasn't
 
 `decode.py` historically read offset 13 as a GCV-10-vs-GCV-20 "generation
-tag". The 2026-06-10 data disproves this: on a single GCV-20, byte 13 takes
-`0x11`/`0x12`/`0x13` purely as a function of range — identical on all three
-channels, stepping at the auto-range transitions — and the GCV-10 survey
-fixture reads `0x13`, the same value a GCV-20 produces in deep water. A value
-shared across generations cannot be a generation tag. It is the **coarse range
-bracket** (higher = longer range); converting it to metres would need a
-calibrated ladder (only `0x11`–`0x13` seen; §6).
+tag"; the 2026-06-10 capture disproved that and recast it as a "coarse range
+bracket" (`0x11`–`0x13`, stepping with range). The record grammar (§3.A)
+dissolves the bracket too: byte 13 is **field2's tag**, and its low bits are
+the **v1 varint's byte length** — it "steps with range" only because the
+bottom range crosses the LEB128 length boundaries at **4.10 m / 8.19 m**
+(1→2→3 bytes). Both prior readings were correlates of depth. Note device
+**gain steps at these same transitions** (§6) — the only observable that
+still keys on this byte.
 
 #### Generation is recoverable from packet structure (range-independent)
 
@@ -241,7 +267,7 @@ independent of range:
 | **GCV-20** | ≤2 | **0 or 1** | first (`FH`) layer | 16-bit LE (`UINT16`) |
 
 Verified: every GCV-10 fixture packet has two later-layer headers; every
-GCV-20 packet (fixtures *and* the 06-10 bag, at both byte-13 ranges) has at
+GCV-20 packet (fixtures *and* the 06-10 bag, across depth/range changes) has at
 most one. So a packet is classified **per-packet by counting its `SH`/`SHS`
 headers (≥2 → GCV-10, ≤1 → GCV-20)** — implemented as
 `decode.generation_from_layers()`, voted over a few packets by the node's
@@ -251,7 +277,7 @@ relying on it.)
 ### 4.2 Channel marker — `d807`
 
 14–16 byte delimiter emitted between channel runs; payload decoded in
-[§3.C](#c-the-d807-marker-channel-tag--current-range-measurement). The
+[§3.C](#c-the-d807-marker-channel-tag--that-runs-range-fields). The
 assembler treats it as "flush the current channel's accumulation."
 
 ### 4.3 Keepalive — `d107`
@@ -286,9 +312,13 @@ captures (215 + 359 frames).
 **Sub-type `0x00` / `0x01` — settings echo and transmit flag.** `0x00` =
 transmitting, `0x01` = off (the only sub-types the driver reads —
 `decode.status_transmitting`; all others return "unknown" so they cannot flap
-the flag). Offsets 17–23 = `ae 05 c0 75 ae 05 c0`, **constant** through both
-captures including the auto-range transitions — a stale commanded/configured
-echo, NOT the active range. Field decode unconfirmed and not needed.
+the flag). Offsets 17–23: `ae 05 c0 75 ae 05 c0`, **constant** through both
+wet captures including the auto-range transitions — a stale
+commanded/configured echo, NOT the active range. On the 06-05 **bench**
+captures, though, this region cycles through many values including
+ASCII-looking fragments (`",13"`, `"nit"`, `"7,R"`, zeros…) — possibly a
+windowed text/diagnostic stream. Field decode open (§6) and not needed by the
+driver.
 
 **Sub-type `0xe4` — a held value of unconfirmed meaning (NOT depth).** A u16
 LE at offset 20 (offsets 17–19/22–23 zero). Cross-checked against the M3: it
@@ -322,7 +352,10 @@ bus):
 **Important (issues #32/#35):** across the full 06-10 capture the **only**
 changing bytes in any config frame are the port/stbd string label and the
 per-frame timestamp tail. **No range field, nothing steps at the Cod Rock
-auto-range transitions.** The active range is *not* on this stream — but it
+auto-range transitions — and the record bodies stayed byte-identical through
+the entire 06-05 operator range sweep too**, so range is not on this stream
+under auto OR manual control (the chartplotter must command the GCV by
+another path, presumably its own TCP `:50227` session). The active range
 **is** passively available: each channel's per-ping sub-header **v2** (§4.1)
 is that channel's true active display range. The driver derives the published
 `RawSonarImage.sample_rate` from it (#35). Pinning/disabling auto-range over
@@ -360,23 +393,31 @@ bottom range and v2 scaling (§4.1) and disproved the `0xe4`-as-depth reading
 
 ## 6. Open questions
 
-- **v3** (~0.1 m, weakly depth-coupled) — near-field/blanking/start-range?
-- **Byte 13 → metres.** Only `0x11`–`0x13` seen; a TCP range-sweep would map
-  the full bracket ladder.
+- **v3** (~0.06–0.1 m, weakly depth-coupled) — near-field/blanking/start-range?
 - **`0xe4` value** — held, not depth; meaning open. **New 2026-06-11:**
   one-shot sub-types `0x09`/`0x1f` (float-pair-like) and `0xed` (same shape as
   `0xe4`) — a `:50050` capture across known device state changes (transmit
   on/off, range commands, frequency switch) would decipher the family.
-- **`d807` 16-byte sub-form** (`02 0c … 41 19 <ch>`, ~1.2 % of markers) —
-  inner layout unknown.
+- **`0x00`-status offsets 17–23**: constant `ae 05 c0 75 ae 05 c0` on the
+  boat, but cycling values with ASCII fragments on the bench — windowed
+  text/diagnostic stream? Sequence-reassemble the 06-05 bench frames.
+- **`d807` field1 sub-form** (`02 0c <4 raw bytes> 19 <ch>`, ~1.2 % of
+  markers, periodic ~0.7 Hz per channel) — the 4-byte value's meaning.
 - **`0xBEEF` command high half** — required by the device, or cosmetic? One
   TCP experiment (send a `0x0000`-high command); don't test on a live survey
   unit.
-- **Gain coupled to the range bracket.** Raw sample brightness *steps* at each
-  byte-13 transition (higher gain at short range) — a range-coupled TVG/AGC
-  applied before sending samples. Whether a separate gain field exists is
-  open. The driver publishes samples as-is; gain normalization is a
-  downstream concern.
-- **Node id bodies** (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`), **`e508` value
-  records**, and the **`0x00`-status settings block** (`ae 05 c0 …`) — field
-  decodes unknown; not yet needed.
+- **The chartplotter→GCV range-command path.** Range is not re-broadcast on
+  `:51000` (auto or manual) nor `:50050`; the chartplotter presumably commands
+  over TCP `:50227`. The 06-05 `gcv20_rangesweep` / `gcv20_settings` pcaps
+  were sniffed while the operator changed range/settings — **if they captured
+  that TCP session, the auto-range-disable / force-manual frames (#32
+  deliverable B) are sitting in them.** Next RE target.
+- **Gain steps at the field2 tag-length transitions** (the ex-"bracket", i.e.
+  when the bottom range crosses 4.10 m / 8.19 m, and at auto-range changes) —
+  a range/depth-coupled TVG/AGC applied before sending samples. Whether a
+  separate gain field exists is open. The driver publishes samples as-is;
+  gain normalization is a downstream concern.
+- **Field semantics not yet needed**: keepalive field2 (`8a 18`) and
+  field3 = 3; e708 field2 = 1; field0 = 3 everywhere (version?); node-id
+  bodies (`90 db a2 88 0b`, `d5 a7 f2 8b 0d`); the `e508` nested body values
+  (mechanically walkable now via the §3.A grammar).
