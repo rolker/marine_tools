@@ -384,3 +384,24 @@ def test_assembler_uses_supplied_extractor():
     assert len(out) == 1
     assert out[0].channel == 7
     assert out[0].samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])
+
+
+def test_d807_marker_tags_an_adjacent_run_channel():
+    # Markers bracket channel runs in close/open pairs; each tags an adjacent
+    # run's channel in its trailing `19 <channel>` bytes (gcv_protocol.md
+    # section 3.C -- 94% verified with bracket+v1 on the 2026-06-11 capture).
+    # Pin the structure on the real GCV-20 fixture window.
+    records = _load_records(GCV20_FIXTURE)
+    run_ch = [pl[12] if pl[:2] == b'\xeb\x07' and len(pl) > 32 else None
+              for pl in records]
+    checked = 0
+    for i, pl in enumerate(records):
+        if pl[:2] != b'\xd8\x07' or len(pl) < 10:
+            continue
+        assert pl[8] == 0x02                  # constant record opener
+        assert pl[-2] == 0x19                 # channel tag marker
+        prev_ch = next((c for c in reversed(run_ch[:i]) if c is not None), None)
+        next_ch = next((c for c in run_ch[i + 1:] if c is not None), None)
+        assert pl[-1] in {prev_ch, next_ch} - {None}   # tags an adjacent run
+        checked += 1
+    assert checked >= 2                       # fixture spans multiple runs

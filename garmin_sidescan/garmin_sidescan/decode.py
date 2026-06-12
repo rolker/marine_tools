@@ -30,7 +30,15 @@ with their receive time (see node.py).
 """
 from collections import namedtuple
 
+# Frame ids (low half of the u32-LE message id; the high half is 0x0000 on
+# every bus frame, so they read as "<magic> 00 00" -- see docs/gcv_protocol.md
+# section 1 for the envelope).
 EB07 = b'\xeb\x07'
+# Channel marker. Payload `02 <bracket> <v1 varint> 19 <channel>` -- it names
+# the channel whose run it delimits and carries the current range measurement
+# (verified 2026-06-11; see gcv_protocol.md section 3.C). The assembler only
+# uses it as a flush signal: the run's own eb07 sub-headers carry the same
+# fields authoritatively.
 D807 = b'\xd8\x07'
 STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # The :50050 stream multiplexes two 34-byte sub-types, discriminated by the
@@ -52,6 +60,11 @@ STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # The real per-ping bottom range is instead carried in the imagery sub-header
 # (v1, :func:`parse_subheader`) -- M3-validated -- and the driver publishes it
 # as ``~/nadir_depth``.
+#
+# The 2026-06-11 capture also shows RARE one-shot sub-types (0x09, 0x1f, 0xed
+# -- one frame each; meanings unknown, see gcv_protocol.md section 4.4).
+# status_transmitting() returns None for every sub-type other than 0x00/0x01,
+# so unknown sub-types can never flap the transmit flag.
 STATUS_SUBTYPE_OFFSET = 9
 STATUS_TX_OFFSET = STATUS_SUBTYPE_OFFSET     # legacy alias (tx flag == sub-type byte)
 STATUS_SUBTYPE_SETTINGS = 0x00
