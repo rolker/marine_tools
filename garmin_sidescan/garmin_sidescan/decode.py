@@ -374,6 +374,15 @@ def parse_subheader(payload):
             return None
         vals[want_field] = value
         i = end
+    # Two further invariants, empirically universal on every imagery frame of
+    # five captures / both generations (549k+ frames, zero exceptions):
+    # field3's value is 0 (it carries a channel only in d807 markers), and
+    # field6 (tag 0x31) immediately follows field5.  Rejecting on them keeps a
+    # partially corrupted header from "parsing" into bogus v1/v2 -- a missing
+    # scale is safe (fallback chain), a wrong scale silently corrupts
+    # everything downstream.
+    if vals[3] != 0 or i >= len(payload) or payload[i] >> 3 != 6:
+        return None
     return Subheader(payload[CHANNEL_OFFSET], payload[LAYER_OFFSET],
                      payload[V1_TAG_OFFSET],
                      vals[2] * RANGE_UNIT_M, vals[4] * RANGE_UNIT_M,

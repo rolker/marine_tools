@@ -57,7 +57,7 @@ def read_bag(bag, start, end):
 
     raw_topic = None
     img_topics = {}
-    state_topic = None
+    state_candidates = []
     r = _reader(bag)
     for t in r.get_all_topics_and_types():
         if t.name.endswith('debug/raw'):
@@ -68,9 +68,14 @@ def read_bag(bag, start, end):
             # carry other RawSonarImage sources (e.g. the M3 multibeam)
             img_topics[t.name] = t.name.rsplit('_', 1)[-1]
         elif t.type == 'marine_radar_control_msgs/msg/RadarControlSet':
-            state_topic = t.name
+            state_candidates.append(t.name)
     if raw_topic is None:
         sys.exit('error: no */debug/raw topic in the bag — record with debug_raw:=true')
+    # The commanded-range mirror must be THIS driver's ~/state -- a bag can
+    # carry other RadarControlSet publishers (e.g. the radar). Match by the
+    # raw topic's own namespace.
+    ns = raw_topic[:-len('debug/raw')]
+    state_topic = next((n for n in state_candidates if n == ns + 'state'), None)
 
     asm = None                    # built once the generation vote resolves
     gen_votes = []

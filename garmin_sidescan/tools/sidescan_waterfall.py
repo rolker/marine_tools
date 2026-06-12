@@ -179,14 +179,19 @@ def read_pings_messages(bag, start, end):
     if unscaled:
         print(f'warning: {unscaled}/{total} pings carry no scale '
               f'(sample_rate = 0); they fall back to the median bin size')
-    # attach the published nadir line to the down-look pings (nearest-in-time)
+    # attach the published nadir line to the down-look pings: nearest-in-time
+    # via searchsorted on the (time-ordered) series -- O(N log M), not O(N*M)
     if nadir and chans[DOWN]:
         times = np.array([t for t, _r in nadir])
         vals = np.array([r for _t, r in nadir])
+        ping_t = np.array([t for t, _s, _x in chans[DOWN]])
+        hi = np.searchsorted(times, ping_t).clip(0, len(times) - 1)
+        lo = np.maximum(hi - 1, 0)
+        nearest = np.where(
+            np.abs(times[lo] - ping_t) <= np.abs(times[hi] - ping_t), lo, hi)
         chans[DOWN] = [
-            (t, MsgScale(sub.display_range_m,
-                         float(vals[np.argmin(np.abs(times - t))])), samp)
-            for t, sub, samp in chans[DOWN]]
+            (t, MsgScale(sub.display_range_m, float(vals[k])), samp)
+            for (t, sub, samp), k in zip(chans[DOWN], nearest)]
     return chans
 
 
