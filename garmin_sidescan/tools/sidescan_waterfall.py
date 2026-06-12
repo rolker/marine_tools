@@ -35,8 +35,7 @@ Requires a bag recorded with ``debug_raw:=true``. Run in a sourced workspace
 import argparse
 import sys
 
-from garmin_sidescan.decode import (
-    D807, EB07, echo_layer, parse_subheader, PingAssembler)
+from garmin_sidescan.decode import D807, EB07, echo_layer, PingAssembler
 import numpy as np
 from rclpy.serialization import deserialize_message
 import rosbag2_py
@@ -65,13 +64,13 @@ def read_pings(bag, raw_topic, start, end):
     """
     Assemble pings in ``[start, end]``.
 
-    Returns ``{channel: [(t, sub, samples)]}`` where ``sub`` is the parsed
-    sub-header for that channel (None if it failed to parse).
+    Returns ``{channel: [(t, sub, samples)]}`` where ``sub`` is the run's own
+    parsed sub-header, attached by the assembler (None if no packet of the
+    run parsed) -- the same per-ping sub-header the driver scales from.
     """
     r = _reader(bag)
     t0 = None
     asm = PingAssembler(echo_layer)
-    subs = {}                         # channel -> latest parsed Subheader
     chans = {DOWN: [], PORT: [], STBD: []}
     while r.has_next():
         topic, data, ts = r.read_next()
@@ -84,19 +83,14 @@ def read_pings(bag, raw_topic, start, end):
             break
         b = bytes(deserialize_message(data, UInt8MultiArray).data)
         out = []
-        if b[:2] == EB07 and len(b) > 32:
-            s = parse_subheader(b)
-            if s is not None:
-                subs[s.channel] = s
+        if (b[:2] == EB07 and len(b) > 32) or b[:2] == D807:
             out = asm.feed(b, recv_time=rel)
-        elif b[:2] == D807:
-            out = asm.feed(b, recv_time=rel)
-        for ch, samp, st in out:
+        for ch, samp, st, sub in out:
             if start <= st <= end and ch in chans:
-                chans[ch].append((st, subs.get(ch), samp))
-    for ch, samp, st in asm.flush():           # emit the final accumulated run
+                chans[ch].append((st, sub, samp))
+    for ch, samp, st, sub in asm.flush():      # emit the final accumulated run
         if start <= st <= end and ch in chans:
-            chans[ch].append((st, subs.get(ch), samp))
+            chans[ch].append((st, sub, samp))
     return chans
 
 

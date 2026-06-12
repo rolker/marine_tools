@@ -10,10 +10,11 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, decode_leb128, echo_layer, FH, GEN_BY_TAG, GEN_TAG_OFFSET,
-    generation_from_layers, is_water_column, parse_downlook_subheader,
-    parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
-    strip_first_layer_trailer, strip_leading_ping_header, subheader_bottom_range_m,
+    dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH, GEN_BY_TAG,
+    GEN_TAG_OFFSET, generation_from_layers, is_water_column,
+    parse_downlook_subheader, parse_subheader, PingAssembler, SH,
+    status_subtype, status_transmitting, strip_first_layer_trailer,
+    strip_leading_ping_header, Subheader, subheader_bottom_range_m,
     TRAILER_MAGIC)
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
@@ -57,15 +58,20 @@ def test_real_capture_decodes_to_two_channel_scan_lines():
         pings.extend(assembler.feed(pl))
     pings.extend(assembler.flush())
 
-    channels = {ch for ch, _samples, _stamp in pings}
+    channels = {p.channel for p in pings}
     # GCV-10 survey data streams two side-scan channels (port=3, stbd=1)
     assert channels == {1, 3}
 
     # the two complete runs (7 packets each) form ~2048-bin scan lines
-    full = [len(s) for _ch, s, _t in pings if len(s) > 1000]
+    full = [len(p.samples) for p in pings if len(p.samples) > 1000]
     assert len(full) >= 2
     for width in full:
         assert 2000 <= width <= 2100
+
+    # The GCV-10 sub-header does not match the GCV-20 varint layout, so the
+    # assembler attaches no sub-header -- the driver's fallback chain (the
+    # commanded-range mirror) is load-bearing for this generation.
+    assert all(p.subheader is None for p in pings)
 
 
 def test_assembler_stamps_run_with_first_packet_time():
@@ -79,10 +85,11 @@ def test_assembler_stamps_run_with_first_packet_time():
     assert out == []                       # same channel, still accumulating
     out = assembler.feed(bytes([0xd8, 0x07]))   # marker flushes the run
     assert len(out) == 1
-    ch, samples, stamp = out[0]
-    assert ch == 5
-    assert stamp == 100.0                  # first packet's time, not the second
-    assert samples == bytes([10, 20, 30]) * 2
+    line = out[0]
+    assert line.channel == 5
+    assert line.stamp == 100.0             # first packet's time, not the second
+    assert line.samples == bytes([10, 20, 30]) * 2
+    assert line.subheader is None          # synthetic packet: no parseable sub
 
 
 # ----- GCV-20 echo extraction (echo_layer) -------------------------------
@@ -244,6 +251,57 @@ def test_parse_subheader_side_scan_has_own_display_range():
     assert parse_downlook_subheader(port) is None
 
 
+# ----- per-run sub-header attachment + scale derivation (issue #35) --------
+
+def test_assembler_attaches_run_subheader_on_gcv20_capture():
+    # Every scan line assembled from the real GCV-20 capture must carry its
+    # own run's sub-header: matching channel, plausible v1/v2 ranges. This is
+    # what the driver scales sample_rate (v2) and the nadir depth (v1) from.
+    assembler = PingAssembler(echo_layer)
+    pings = []
+    for pl in _load_records(GCV20_FIXTURE):
+        pings.extend(assembler.feed(pl))
+    pings.extend(assembler.flush())
+    assert pings
+    for p in pings:
+        assert p.subheader is not None
+        assert p.subheader.channel == p.channel
+        assert p.subheader.bottom_range_m > 0
+        assert p.subheader.display_range_m > 0
+
+
+def _sub(v2, v1=10.0):
+    return Subheader(channel=2, layer=0x0d, bracket=0x12,
+                     bottom_range_m=v1, display_range_m=v2, near_field_m=0.1)
+
+
+def test_derive_sample_rate_uses_own_channel_v2():
+    # A consumer recovers range = sv*bins/(2*rate); each channel's own v2 must
+    # round-trip, so the down-look (water column) and side-scan (slant swath)
+    # get DIFFERENT rates even with identical bins -- the asymmetry that a
+    # single commanded range cannot express.
+    sv, bins = 1500.0, 2048
+    down = derive_sample_rate(_sub(21.0), bins, sv, commanded_range_m=50.0)
+    side = derive_sample_rate(_sub(50.4), bins, sv, commanded_range_m=50.0)
+    assert abs(sv * bins / (2.0 * down) - 21.0) < 1e-9
+    assert abs(sv * bins / (2.0 * side) - 50.4) < 1e-9
+    assert down != side
+
+
+def test_derive_sample_rate_fallback_chain():
+    sv, bins = 1500.0, 2048
+    # no sub-header (e.g. GCV-10) -> the commanded range
+    rate = derive_sample_rate(None, bins, sv, commanded_range_m=50.0)
+    assert abs(sv * bins / (2.0 * rate) - 50.0) < 1e-9
+    # no sub-header, nothing commanded -> the configured fallback rate
+    assert derive_sample_rate(None, bins, sv, 0.0, fallback_rate=7.5) == 7.5
+    # ...which defaults to 0.0 = "unavailable" (RawSonarImage convention)
+    assert derive_sample_rate(None, bins, sv, 0.0) == 0.0
+    # a range without a sound speed (or bins) cannot derive a rate
+    assert derive_sample_rate(_sub(21.0), bins, 0.0, 50.0, fallback_rate=7.5) == 7.5
+    assert derive_sample_rate(_sub(21.0), 0, sv, 50.0, fallback_rate=7.5) == 7.5
+
+
 # ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
 
 def test_strip_first_layer_trailer_removes_delimited_trailer():
@@ -300,9 +358,9 @@ def test_gcv20_real_capture_strips_trailer_and_leading_band():
     pings.extend(assembler.flush())
 
     # fixture spans down-look (ch2) + both side-scan (ch0/ch1) runs
-    assert {ch for ch, _s, _t in pings} >= {0, 1, 2}
+    assert {p.channel for p in pings} >= {0, 1, 2}
     assert len(pings) >= 3
-    for ch, samples, _t in pings:
+    for ch, samples, _t, _sub in pings:
         # no per-packet trailer bytes survive into the scan line
         assert TRAILER_MAGIC not in samples, f'trailer leaked into ch{ch}'
         # no long constant leading run (the bright near-range band)
@@ -324,6 +382,5 @@ def test_assembler_uses_supplied_extractor():
     assert assembler.feed(pkt) == []                # accumulating
     out = assembler.feed(bytes([0xd8, 0x07]))       # marker flushes
     assert len(out) == 1
-    ch, samples, _stamp = out[0]
-    assert ch == 7
-    assert samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])
+    assert out[0].channel == 7
+    assert out[0].samples == bytes([10, 1, 20, 2, 30, 3, 40, 4])

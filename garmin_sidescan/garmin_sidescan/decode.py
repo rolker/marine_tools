@@ -49,8 +49,9 @@ STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # showed it is a HELD, coarse value that does NOT track depth (it lags by tens
 # of seconds and sits metres off the M3 nadir) -- so its meaning is unconfirmed
 # (a candidate mode/status field) and the driver does NOT decode or publish it.
-# A real nadir depth, if wanted, comes from bottom-tracking the down-look
-# imagery in a downstream node, not from this field.
+# The real per-ping bottom range is instead carried in the imagery sub-header
+# (v1, :func:`parse_subheader`) -- M3-validated -- and the driver publishes it
+# as ``~/nadir_depth``.
 STATUS_SUBTYPE_OFFSET = 9
 STATUS_TX_OFFSET = STATUS_SUBTYPE_OFFSET     # legacy alias (tx flag == sub-type byte)
 STATUS_SUBTYPE_SETTINGS = 0x00
@@ -361,16 +362,52 @@ def parse_downlook_subheader(payload):
     return parse_subheader(payload)
 
 
+def derive_sample_rate(sub, n_bins, sound_speed, commanded_range_m=0.0,
+                       fallback_rate=0.0):
+    """
+    Return the ``RawSonarImage.sample_rate`` (Hz) for one assembled ping.
+
+    The scale source, in priority order:
+
+    1. **The ping's own sub-header v2** (``sub.display_range_m``) -- the
+       device's per-ping, per-channel display range, which tracks hardware
+       auto-range (verified across the 2026-06-10 Cod Rock transitions).
+    2. **The commanded range** (``commanded_range_m``) -- correct only while
+       the device honours it, and never correct for the down-look (whose v2
+       is the water-column range, not the commanded swath); kept as a
+       fallback for streams whose sub-header does not parse (e.g. GCV-10).
+    3. **``fallback_rate``** -- a manually configured rate, or 0.0 =
+       "unavailable" (the ``RawSonarImage`` convention).
+
+    With a range ``R`` the rate is ``sound_speed * n_bins / (2 * R)``, so a
+    consumer recovers ``R = sound_speed * n_bins / (2 * rate)``.
+    """
+    range_m = sub.display_range_m if sub is not None else 0.0
+    if range_m <= 0.0:
+        range_m = commanded_range_m
+    if range_m > 0.0 and sound_speed > 0.0 and n_bins > 0:
+        return sound_speed * n_bins / (2.0 * range_m)
+    return fallback_rate
+
+
+# One assembled scan line.  ``stamp`` is the ``recv_time`` of the run's first
+# packet; ``subheader`` is that run's parsed :class:`Subheader` (None when no
+# packet of the run parsed -- e.g. the GCV-10 layout, see test fixtures).
+ScanLine = namedtuple('ScanLine', 'channel samples stamp subheader')
+
+
 class PingAssembler:
     """
     Reassemble GCV imagery datagrams into per-channel scan lines.
 
     Feed each UDP payload to :meth:`feed`; it returns a list of completed
-    ``(channel, samples, stamp)`` tuples (usually empty, occasionally one when
-    a channel's run ends).  ``stamp`` is the ``recv_time`` passed with the
+    :class:`ScanLine` tuples (usually empty, occasionally one when a
+    channel's run ends).  ``stamp`` is the ``recv_time`` passed with the
     first packet of that run, so callers can timestamp a scan line by the
-    arrival of its first packet.  Call :meth:`flush` at end of stream to emit
-    any trailing accumulation.
+    arrival of its first packet; ``subheader`` is the run's own parsed
+    sub-header (per-ping v1 bottom range / v2 display range), so callers can
+    scale and depth-tag each ping.  Call :meth:`flush` at end of stream to
+    emit any trailing accumulation.
     """
 
     def __init__(self, extractor=dark_layer):
@@ -380,11 +417,14 @@ class PingAssembler:
         self._cur_ch = None
         self._acc = bytearray()
         self._t0 = 0.0
+        self._cur_sub = None
 
     def _emit(self, out):
         if self._cur_ch is not None and self._acc:
-            out.append((self._cur_ch, bytes(self._acc), self._t0))
+            out.append(ScanLine(self._cur_ch, bytes(self._acc), self._t0,
+                                self._cur_sub))
         self._acc = bytearray()
+        self._cur_sub = None
 
     def feed(self, payload, recv_time=0.0):
         """Consume one datagram payload; return any completed scan lines."""
@@ -403,12 +443,18 @@ class PingAssembler:
                 # scan line, and only on the GCV-20 (echo_layer) stream.
                 if self._extract is echo_layer:
                     block = strip_leading_ping_header(block)
+            if self._cur_sub is None:
+                # Every packet of a run repeats the same sub-header values, so
+                # the first packet that parses tags the whole run (a garbled
+                # first packet falls through to the next).
+                self._cur_sub = parse_subheader(payload)
             self._acc.extend(block)
             if len(self._acc) > MAX_SCAN_BYTES:
                 # Degenerate stream (no channel change, no marker): drop the
                 # runaway accumulation rather than grow without bound.
                 self._acc = bytearray()
                 self._cur_ch = None
+                self._cur_sub = None
         return out
 
     def flush(self):
