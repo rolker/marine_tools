@@ -154,13 +154,23 @@ Verified per-marker against both neighbours on the full 2026-06-11 capture:
 channel *and* v1 exactly; the residual is packet loss plus the sub-form below
 parsed as if common-form.
 
-- A 16-byte sub-form (`02 0c <4-byte field1 value> 19 <channel>`, 780 frames
-  ≈ 1.2 %, in channel triplets ~every 1.4 s) carries **field1 with a 4-byte
-  value instead of field2** — the value's meaning is open (§6).
+- A 16-byte **telemetry** sub-form (`02 0c <float32 LE> 19 <channel>`,
+  ≈ 1.2 % of markers, in channel triplets ~0.7 Hz) carries **field1 as an
+  IEEE-754 float32 = the transducer surface water temperature (°C)**. The same
+  value appears on all three channels of a triplet (a device-wide scalar).
+  Validated two ways, each within one water body / day: against an AML CTD cast
+  (2026-06-10 pier, 020c 15.5 °C vs cast surface 16.0–16.5 °C) and against the
+  boat's own sound-velocity sensor (2026-06-12, the temperature predicts the
+  measured sound speed within 1–3 m/s). It reads the warm surface skin the
+  hull transducer sits in, not the bulk water.
 
-The assembler treats any `d807` as "flush the current channel's
-accumulation"; the channel tag and range fields are not needed for assembly
-(the run's own `eb07` sub-headers carry the same fields authoritatively).
+The delimiter sub-form ends a channel run; the telemetry sub-form does **not** —
+it is interleaved mid-run, so flushing on any `d807` (the original behaviour)
+split single pings into two fragments. The assembler now flushes only on the
+delimiter sub-form (`decode.is_run_delimiter`) and decodes the telemetry
+temperature (`decode.marker_temperature_c`); the run's own `eb07` sub-headers
+carry the channel/range authoritatively, and the next channel's first packet
+backstops a dropped delimiter (the stream cycles channels). See issue #37.
 
 ---
 
@@ -435,8 +445,9 @@ bottom range and v2 scaling (§4.1) and disproved the `0xe4`-as-depth reading
 - **`0x00`-status offsets 17–23**: constant `ae 05 c0 75 ae 05 c0` on the
   boat, but cycling values with ASCII fragments on the bench — windowed
   text/diagnostic stream? Sequence-reassemble the 06-05 bench frames.
-- **`d807` field1 sub-form** (`02 0c <4 raw bytes> 19 <ch>`, ~1.2 % of
-  markers, periodic ~0.7 Hz per channel) — the 4-byte value's meaning.
+- ~~**`d807` field1 sub-form** (`02 0c <4 raw bytes> 19 <ch>`) — the 4-byte
+  value's meaning.~~ **Resolved (issue #37): float32 surface water temperature
+  (°C).** See §3.C.
 - **`0xBEEF` command high half** — required by the device, or cosmetic? One
   TCP experiment (send a `0x0000`-high command); don't test on a live survey
   unit.
