@@ -15,6 +15,7 @@ from garmin_sidescan.node import (
     GEN_VOTE_MIN,
     imagery_diag_level,
     range_in_bounds,
+    temperature_plausible,
     temperature_publish_due,
     transmit_state_after,
     watchdog_action,
@@ -27,6 +28,15 @@ def test_imagery_diag_level():
     assert imagery_diag_level(True, None)[0] == err      # transmitting, never received
     assert imagery_diag_level(True, 10.0)[0] == err      # transmitting, stale
     assert imagery_diag_level(True, 0.5)[0] == ok        # transmitting, fresh
+
+
+def test_temperature_plausible():
+    assert temperature_plausible(15.5) is True
+    assert temperature_plausible(28.9) is True
+    assert temperature_plausible(-5.0) is True       # boundary inclusive
+    assert temperature_plausible(50.0) is True
+    assert temperature_plausible(-40.0) is False      # corrupt-frame garbage
+    assert temperature_plausible(1e6) is False
 
 
 def test_temperature_publish_due():

@@ -156,6 +156,18 @@ def range_in_bounds(meters, range_min, range_max):
     return range_min <= meters <= range_max
 
 
+# Plausible surface-water-temperature window (deg C). A finite-but-absurd
+# float from a corrupt telemetry frame (decode already drops non-finite) is
+# gated out before publishing, mirroring the nadir-range validity gate -- a
+# per-cycle gap is honest, a wild value is noise downstream.
+WATER_TEMP_MIN_C, WATER_TEMP_MAX_C = -5.0, 50.0
+
+
+def temperature_plausible(temp_c):
+    """Return whether a water-temperature reading (deg C) is within sane bounds."""
+    return WATER_TEMP_MIN_C <= temp_c <= WATER_TEMP_MAX_C
+
+
 def temperature_publish_due(temp_c, last_c, elapsed_s, heartbeat_s=2.0):
     """
     Whether a water-temperature reading should be published.
@@ -854,6 +866,10 @@ class GarminSidescanNode(Node):
                     self._nadir_fov, v2))
 
     def _emit_temperature(self, temp_c, stamp):
+        # A corrupt frame can decode to a finite-but-absurd value (decode drops
+        # non-finite already); gate it out rather than publish noise.
+        if not temperature_plausible(temp_c):
+            return
         # Collapse a per-channel triplet to one message; heartbeat a steady
         # value (see temperature_publish_due).
         elapsed = (float('inf') if self._last_temp_t is None
