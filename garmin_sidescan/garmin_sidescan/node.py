@@ -6,7 +6,9 @@ Receives the GCV imagery multicast, decodes per-ping sidescan scan lines (see
 ``marine_acoustic_msgs/RawSonarImage`` (one publisher per channel, single
 beam) with the metric scale (``sample_rate``) derived from each ping's own
 sub-header display range (v2), plus the per-ping nadir bottom range
-(sub-header v1) as a ``sensor_msgs/Range`` on ``~/nadir_depth``.  Controls
+(sub-header v1) as a ``sensor_msgs/Range`` on ``~/nadir_depth`` and the
+transducer surface water temperature (the d807 telemetry marker) as a
+``sensor_msgs/Temperature`` on ``~/water_temperature``.  Controls
 transmit on/off and range over the GCV TCP command port
 (see :mod:`garmin_sidescan.commands`).  Rendering is left to downstream tools
 (``rqt_sonar_waterfall``); a ``debug_raw`` parameter can publish the raw UDP
@@ -31,7 +33,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
-from sensor_msgs.msg import Range
+from sensor_msgs.msg import Range, Temperature
 from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import SetBool
 
@@ -45,8 +47,8 @@ from .commands import (
 )
 from .decode import (
     CHANNEL_OFFSET, dark_layer, derive_sample_rate, EB07, echo_layer,
-    generation_from_layers, is_water_column, MIN_DATA_LEN, PingAssembler,
-    status_transmitting)
+    generation_from_layers, is_water_column, marker_temperature_c, MIN_DATA_LEN,
+    PingAssembler, status_transmitting)
 
 # Auxiliary GCV multicast streams the driver can listen to. The imagery group
 # is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
@@ -152,6 +154,37 @@ def watchdog_action(*, safety_enabled, transmitting, has_sv_topic,
 def range_in_bounds(meters, range_min, range_max):
     """Return whether a requested range (m) is within the configured limits."""
     return range_min <= meters <= range_max
+
+
+# Plausible surface-water-temperature window (deg C). A finite-but-absurd
+# float from a corrupt telemetry frame (decode already drops non-finite) is
+# gated out before publishing, mirroring the nadir-range validity gate -- a
+# per-cycle gap is honest, a wild value is noise downstream.
+WATER_TEMP_MIN_C, WATER_TEMP_MAX_C = -5.0, 50.0
+
+
+def temperature_plausible(temp_c):
+    """Return whether a water-temperature reading (deg C) is within sane bounds."""
+    return WATER_TEMP_MIN_C <= temp_c <= WATER_TEMP_MAX_C
+
+
+def temperature_publish_due(temp_c, last_c, elapsed_s, heartbeat_s=2.0):
+    """
+    Whether a water-temperature reading should be published.
+
+    The d807 telemetry marker repeats the same value on each channel of a
+    ~0.7 Hz triplet, so a changed value publishes immediately (collapsing the
+    triplet to one message), and an unchanged value publishes on the first
+    reading whose arrival is at least ``heartbeat_s`` after the last publish so
+    the topic still ticks for consumers.  Because this is evaluated only when a
+    frame arrives (~every 1.4 s for a steady reading), the effective steady-state
+    cadence is the next triplet past ``heartbeat_s``, not exactly ``heartbeat_s``.
+    ``last_c`` is None before the first reading (always due); ``elapsed_s`` is the
+    time since the last publish (``inf`` for the first reading).
+    """
+    if last_c is None or temp_c != last_c:
+        return True
+    return elapsed_s >= heartbeat_s
 
 
 class GarminSidescanNode(Node):
@@ -294,6 +327,11 @@ class GarminSidescanNode(Node):
         self._detected_gen = None
         self._gen_votes = {}          # structural generation votes (see _detect_generation)
         self._geom_warned = False
+        # Water-temperature dedup: the d807 telemetry marker repeats the same
+        # reading on each channel of a triplet; publish one per distinct value,
+        # with a heartbeat so a steady reading still ticks (see _emit_temperature).
+        self._last_temp_c = None
+        self._last_temp_t = None
         # Sample format, set when the assembler is built from the generation
         # (GCV-20 = 16-bit uint16-LE, GCV-10 = 8-bit). Defaults are harmless
         # until then; no pings are emitted before the assembler exists.
@@ -319,6 +357,11 @@ class GarminSidescanNode(Node):
         # (see build_nadir_range / the _nadir frame). Per-ping sensor data, so
         # the imagery QoS, not latched.
         self._pub_depth = self.create_publisher(Range, '~/nadir_depth', img_qos)
+        # Transducer surface water temperature decoded from the d807 telemetry
+        # marker (per-channel triplet ~0.7 Hz; deduplicated to one reading per
+        # cycle). Validated against an AML CTD cast + the boat's SVS (issue #37).
+        self._pub_temperature = self.create_publisher(
+            Temperature, '~/water_temperature', img_qos)
         # Raw-payload debug capture (only published when debug_raw is true) --
         # one topic per GCV multicast stream so a single bag is fully
         # re-decodable offline (imagery + status + chartplotter config).
@@ -712,6 +755,13 @@ class GarminSidescanNode(Node):
                 # Full UDP payload (magic + channel + all layers) so the bag is
                 # re-decodable offline. Published as-is; bag timestamps give timing.
                 self._pub_raw.publish(UInt8MultiArray(data=payload))
+            now = self.get_clock().now()
+            # Water-temperature telemetry has no dependency on the imagery
+            # assembler, so decode it before the generation-detect gate below --
+            # otherwise the topic stays silent through auto-detect warmup.
+            temp_c = marker_temperature_c(payload)
+            if temp_c is not None:
+                self._emit_temperature(temp_c, now)
             detected = self._detect_generation(payload)
             self._classify_beam(payload)
             if self._assembler is None:
@@ -725,7 +775,6 @@ class GarminSidescanNode(Node):
                 self.get_logger().warn(
                     f'device={self._device} but packet geometry looks like '
                     f'{detected}; imagery decode is likely wrong')
-            now = self.get_clock().now()
             for line in self._assembler.feed(payload, now):
                 self._emit_ping(line)
         if self._assembler is not None:
@@ -821,6 +870,29 @@ class GarminSidescanNode(Node):
                 self._pub_depth.publish(build_nadir_range(
                     v1, self._nadir_frame_id, line.stamp.to_msg(),
                     self._nadir_fov, v2))
+
+    def _emit_temperature(self, temp_c, stamp):
+        # A corrupt frame can decode to a finite-but-absurd value (decode drops
+        # non-finite already); gate it out rather than publish noise.
+        if not temperature_plausible(temp_c):
+            return
+        # Collapse a per-channel triplet to one message; heartbeat a steady
+        # value (see temperature_publish_due). On a backward clock jump (sim
+        # reset / bag loop) elapsed goes negative: a changed value still
+        # publishes, a steady one resumes heartbeating once the clock recovers.
+        elapsed = (float('inf') if self._last_temp_t is None
+                   else (stamp - self._last_temp_t).nanoseconds * 1e-9)
+        if not temperature_publish_due(temp_c, self._last_temp_c, elapsed):
+            return
+        self._last_temp_c = temp_c
+        self._last_temp_t = stamp
+        msg = Temperature()
+        msg.header.stamp = stamp.to_msg()
+        # The transducer's own sensor -- tag it with the base sensor frame.
+        msg.header.frame_id = self._frame_id
+        msg.temperature = float(temp_c)
+        msg.variance = 0.0          # unknown (0 = "variance unknown" per the spec)
+        self._pub_temperature.publish(msg)
 
     def _make_sonar_msg(self, side, samples, stamp, sub=None):
         msg = RawSonarImage()

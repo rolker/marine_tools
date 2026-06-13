@@ -11,10 +11,24 @@ import struct
 
 from garmin_sidescan.decode import (
     dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH,
-    generation_from_layers, is_water_column, parse_downlook_subheader,
+    generation_from_layers, is_run_delimiter, is_water_column,
+    marker_temperature_c, parse_downlook_subheader,
     parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
     strip_first_layer_trailer, strip_leading_ping_header, Subheader,
     subheader_bottom_range_m, TRAILER_MAGIC)
+
+
+def _d807_telemetry(temp_c, channel):
+    """Build a 16-byte d807 telemetry frame: 02 0c <f32 LE> 19 <ch>."""
+    return (bytes([0xd8, 0x07, 0, 0]) + struct.pack('<I', 8)
+            + b'\x02\x0c' + struct.pack('<f', temp_c) + b'\x19' + bytes([channel]))
+
+
+def _d807_delimiter(v1, channel):
+    """Build a d807 run delimiter: 02 <0x10|len(v1)> <v1 varint> 19 <ch>."""
+    body = b'\x02' + bytes([0x10 | len(v1)]) + v1 + b'\x19' + bytes([channel])
+    return bytes([0xd8, 0x07, 0, 0]) + struct.pack('<I', len(body)) + body
+
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bin')
 # Real GCV-20 capture (2026-06-09 wet test, issue #26): a contiguous window of
@@ -402,6 +416,70 @@ def test_subheader_grammar_tags_encode_varint_length_on_both_fixtures():
                 i = end
             checked += 1
     assert checked >= 60                  # both fixtures contribute
+
+
+def test_marker_temperature_c_decodes_float32():
+    # 020c telemetry sub-form carries a float32 LE water temperature (deg C).
+    frame = _d807_telemetry(28.94, channel=2)
+    assert len(frame) == 16
+    assert abs(marker_temperature_c(frame) - 28.94) < 1e-3
+    # the channel byte does not affect the reading (device-wide scalar)
+    assert abs(marker_temperature_c(_d807_telemetry(28.94, channel=0)) - 28.94) < 1e-3
+    # non-telemetry payloads yield None
+    assert marker_temperature_c(_d807_delimiter(b'\xce\x57', channel=2)) is None
+    assert marker_temperature_c(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is None
+    assert marker_temperature_c(bytes([0xd8, 0x07])) is None        # truncated
+
+
+def test_marker_temperature_c_decodes_real_capture_frame():
+    # A telemetry frame captured verbatim from bag_2026-06-12T16.06.52 (pins the
+    # real byte layout, not just the synthetic builder): 02 0c <f32> 19 <ch>.
+    real = bytes.fromhex('d80700000800000002 0c057fe741 1900'.replace(' ', ''))
+    assert len(real) == 16
+    assert abs(marker_temperature_c(real) - 28.937) < 1e-2
+
+
+def test_marker_temperature_c_rejects_non_finite():
+    # A corrupt telemetry frame decoding to NaN/inf is not a usable reading --
+    # None keeps it off the wire and out of the publisher's change-detection.
+    nan_frame = (bytes([0xd8, 0x07, 0, 0]) + struct.pack('<I', 8)
+                 + b'\x02\x0c' + b'\xff\xff\xff\xff' + b'\x19' + bytes([0]))
+    assert marker_temperature_c(nan_frame) is None
+    # ...but it is still structurally telemetry, so it must NOT flush the run.
+    assert is_run_delimiter(nan_frame) is False
+
+
+def test_is_run_delimiter_distinguishes_subforms():
+    # The delimiter sub-form ends a run; the telemetry sub-form does not.
+    assert is_run_delimiter(_d807_delimiter(b'\xce\x57', channel=2)) is True
+    assert is_run_delimiter(_d807_telemetry(15.5, channel=1)) is False
+    # an unrecognised/bare d807 still flushes (conservative); eb07 never does
+    assert is_run_delimiter(bytes([0xd8, 0x07])) is True
+    assert is_run_delimiter(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is False
+    # a *truncated* telemetry frame (tag matches but too short for the float)
+    # falls through to a flush rather than being silently swallowed
+    truncated = bytes([0xd8, 0x07, 0, 0]) + struct.pack('<I', 8) + b'\x02\x0c\x05'
+    assert is_run_delimiter(truncated) is True
+    assert marker_temperature_c(truncated) is None
+
+
+def test_assembler_keeps_ping_whole_across_telemetry_marker():
+    # Regression for issue #37: a 020c temperature marker interleaved mid-run
+    # must NOT split the ping. Build one channel's run as 4 packets + a telemetry
+    # marker + 3 more packets, then a delimiter; expect ONE scan line of all 7.
+    assembler = PingAssembler()
+    pkt = bytes([0xeb, 0x07, 0, 0]) + bytes(8) + bytes([5]) + bytes(20) \
+        + bytes([174, 2, 172, 2]) + bytes([10, 20, 30])
+    out = []
+    for _ in range(4):
+        out += assembler.feed(pkt, recv_time=100.0)
+    out += assembler.feed(_d807_telemetry(15.5, channel=2))   # must not flush
+    for _ in range(3):
+        out += assembler.feed(pkt, recv_time=100.0)
+    out += assembler.feed(_d807_delimiter(b'\xce\x57', channel=5))  # real boundary
+    assert len(out) == 1                       # one whole ping, not two fragments
+    assert out[0].channel == 5
+    assert out[0].samples == bytes([10, 20, 30]) * 7
 
 
 def test_d807_marker_tags_an_adjacent_run_channel():
