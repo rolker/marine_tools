@@ -29,6 +29,7 @@ sub-header, so the driver takes frequency from configuration and stamps pings
 with their receive time (see node.py).
 """
 from collections import namedtuple
+import math
 import struct
 
 # Frame ids (low half of the u32-LE message id; the high half is 0x0000 on
@@ -106,17 +107,31 @@ def status_transmitting(payload):
     return None
 
 
+def _is_telemetry_marker(payload):
+    """
+    Return whether a ``d807`` frame is a complete telemetry sub-form.
+
+    Structural test only (tag + enough bytes to hold the float32); independent
+    of whether the decoded value is sane.  A *truncated* telemetry frame fails
+    this, so it falls through to a flush in :func:`is_run_delimiter` rather than
+    being silently swallowed.
+    """
+    return (payload[:2] == D807
+            and len(payload) >= D807_ENVELOPE + 6
+            and payload[D807_ENVELOPE:D807_ENVELOPE + 2] == D807_TELEMETRY_TAG)
+
+
 def is_run_delimiter(payload):
     """
     Return whether a ``d807`` frame ends the current channel's packet run.
 
     Both ``d807`` sub-forms (delimiter, telemetry) carry the magic, but only the
     delimiter is a run boundary.  Returns True for the delimiter and for any
-    unrecognised ``d807`` sub-form (conservative: an unknown marker flushes, as
-    it always did); False only for the known temperature-telemetry sub-form.
+    unrecognised or truncated ``d807`` sub-form (conservative: an unknown marker
+    flushes, as it always did); False only for a complete temperature-telemetry
+    sub-form.
     """
-    return (payload[:2] == D807
-            and payload[D807_ENVELOPE:D807_ENVELOPE + 2] != D807_TELEMETRY_TAG)
+    return payload[:2] == D807 and not _is_telemetry_marker(payload)
 
 
 def marker_temperature_c(payload):
@@ -127,13 +142,14 @@ def marker_temperature_c(payload):
     field1 carries an IEEE-754 float32 surface water temperature.  Validated
     against an AML CTD cast (same water/day, within ~1 deg C) and the boat's own
     sound-velocity sensor (predicted vs measured sound speed within 1-3 m/s);
-    see issue #37 and gcv_protocol.md section 3.C.
+    see issue #37 and gcv_protocol.md section 3.C.  A non-finite value (a
+    corrupt frame) returns None -- it is not a usable reading, and NaN would
+    otherwise defeat the publisher's change-detection (``nan != nan``).
     """
-    if (payload[:2] != D807
-            or len(payload) < D807_ENVELOPE + 6
-            or payload[D807_ENVELOPE:D807_ENVELOPE + 2] != D807_TELEMETRY_TAG):
+    if not _is_telemetry_marker(payload):
         return None
-    return struct.unpack_from('<f', payload, D807_ENVELOPE + 2)[0]
+    value = struct.unpack_from('<f', payload, D807_ENVELOPE + 2)[0]
+    return value if math.isfinite(value) else None
 
 
 # Render-layer header signatures (little-endian sample pairs).
@@ -506,10 +522,12 @@ class PingAssembler:
         if payload[:2] == D807:
             # The delimiter sub-form ends the run; the temperature-telemetry
             # sub-form is interleaved mid-run and must NOT flush, or one ping
-            # is split into two fragments (issue #37). The next channel's first
-            # packet (channel change, below) independently flushes the run, so a
-            # dropped delimiter can't merge two consecutive pings -- the stream
-            # cycles channels, so the same channel never repeats back-to-back.
+            # is split into two fragments (issue #37). A dropped delimiter is
+            # backstopped by the next channel's first packet (channel change,
+            # below) -- the stream is observed to cycle channels, so consecutive
+            # runs differ in channel; if a future firmware ran the same channel
+            # back-to-back, a dropped delimiter between them would merge two
+            # pings (the MAX_SCAN_BYTES guard then caps the runaway).
             if is_run_delimiter(payload):
                 self._emit(out)
                 self._cur_ch = None

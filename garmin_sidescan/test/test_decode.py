@@ -431,6 +431,24 @@ def test_marker_temperature_c_decodes_float32():
     assert marker_temperature_c(bytes([0xd8, 0x07])) is None        # truncated
 
 
+def test_marker_temperature_c_decodes_real_capture_frame():
+    # A telemetry frame captured verbatim from bag_2026-06-12T16.06.52 (pins the
+    # real byte layout, not just the synthetic builder): 02 0c <f32> 19 <ch>.
+    real = bytes.fromhex('d80700000800000002 0c057fe741 1900'.replace(' ', ''))
+    assert len(real) == 16
+    assert abs(marker_temperature_c(real) - 28.937) < 1e-2
+
+
+def test_marker_temperature_c_rejects_non_finite():
+    # A corrupt telemetry frame decoding to NaN/inf is not a usable reading --
+    # None keeps it off the wire and out of the publisher's change-detection.
+    nan_frame = (bytes([0xd8, 0x07, 0, 0]) + struct.pack('<I', 8)
+                 + b'\x02\x0c' + b'\xff\xff\xff\xff' + b'\x19' + bytes([0]))
+    assert marker_temperature_c(nan_frame) is None
+    # ...but it is still structurally telemetry, so it must NOT flush the run.
+    assert is_run_delimiter(nan_frame) is False
+
+
 def test_is_run_delimiter_distinguishes_subforms():
     # The delimiter sub-form ends a run; the telemetry sub-form does not.
     assert is_run_delimiter(_d807_delimiter(b'\xce\x57', channel=2)) is True
@@ -438,6 +456,11 @@ def test_is_run_delimiter_distinguishes_subforms():
     # an unrecognised/bare d807 still flushes (conservative); eb07 never does
     assert is_run_delimiter(bytes([0xd8, 0x07])) is True
     assert is_run_delimiter(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) is False
+    # a *truncated* telemetry frame (tag matches but too short for the float)
+    # falls through to a flush rather than being silently swallowed
+    truncated = bytes([0xd8, 0x07, 0, 0]) + struct.pack('<I', 8) + b'\x02\x0c\x05'
+    assert is_run_delimiter(truncated) is True
+    assert marker_temperature_c(truncated) is None
 
 
 def test_assembler_keeps_ping_whole_across_telemetry_marker():
