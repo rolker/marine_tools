@@ -174,10 +174,13 @@ def temperature_publish_due(temp_c, last_c, elapsed_s, heartbeat_s=2.0):
 
     The d807 telemetry marker repeats the same value on each channel of a
     ~0.7 Hz triplet, so a changed value publishes immediately (collapsing the
-    triplet to one message), and an unchanged value publishes only once per
-    ``heartbeat_s`` so the topic still ticks for consumers.  ``last_c`` is None
-    before the first reading (always due); ``elapsed_s`` is the time since the
-    last publish.
+    triplet to one message), and an unchanged value publishes on the first
+    reading whose arrival is at least ``heartbeat_s`` after the last publish so
+    the topic still ticks for consumers.  Because this is evaluated only when a
+    frame arrives (~every 1.4 s for a steady reading), the effective steady-state
+    cadence is the next triplet past ``heartbeat_s``, not exactly ``heartbeat_s``.
+    ``last_c`` is None before the first reading (always due); ``elapsed_s`` is the
+    time since the last publish (``inf`` for the first reading).
     """
     if last_c is None or temp_c != last_c:
         return True
@@ -752,6 +755,13 @@ class GarminSidescanNode(Node):
                 # Full UDP payload (magic + channel + all layers) so the bag is
                 # re-decodable offline. Published as-is; bag timestamps give timing.
                 self._pub_raw.publish(UInt8MultiArray(data=payload))
+            now = self.get_clock().now()
+            # Water-temperature telemetry has no dependency on the imagery
+            # assembler, so decode it before the generation-detect gate below --
+            # otherwise the topic stays silent through auto-detect warmup.
+            temp_c = marker_temperature_c(payload)
+            if temp_c is not None:
+                self._emit_temperature(temp_c, now)
             detected = self._detect_generation(payload)
             self._classify_beam(payload)
             if self._assembler is None:
@@ -765,10 +775,6 @@ class GarminSidescanNode(Node):
                 self.get_logger().warn(
                     f'device={self._device} but packet geometry looks like '
                     f'{detected}; imagery decode is likely wrong')
-            now = self.get_clock().now()
-            temp_c = marker_temperature_c(payload)
-            if temp_c is not None:
-                self._emit_temperature(temp_c, now)
             for line in self._assembler.feed(payload, now):
                 self._emit_ping(line)
         if self._assembler is not None:
@@ -871,7 +877,9 @@ class GarminSidescanNode(Node):
         if not temperature_plausible(temp_c):
             return
         # Collapse a per-channel triplet to one message; heartbeat a steady
-        # value (see temperature_publish_due).
+        # value (see temperature_publish_due). On a backward clock jump (sim
+        # reset / bag loop) elapsed goes negative: a changed value still
+        # publishes, a steady one resumes heartbeating once the clock recovers.
         elapsed = (float('inf') if self._last_temp_t is None
                    else (stamp - self._last_temp_t).nanoseconds * 1e-9)
         if not temperature_publish_due(temp_c, self._last_temp_c, elapsed):
