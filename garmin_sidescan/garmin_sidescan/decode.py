@@ -29,17 +29,25 @@ sub-header, so the driver takes frequency from configuration and stamps pings
 with their receive time (see node.py).
 """
 from collections import namedtuple
+import struct
 
 # Frame ids (low half of the u32-LE message id; the high half is 0x0000 on
 # every bus frame, so they read as "<magic> 00 00" -- see docs/gcv_protocol.md
 # section 1 for the envelope).
 EB07 = b'\xeb\x07'
-# Channel marker. Payload `02 <field2 tag + v1 varint> 19 <channel>` -- a
-# two-field record tagging an adjacent run's channel and carrying that run's
-# bottom range (markers bracket runs in close/open pairs; see gcv_protocol.md
-# section 3.C). The assembler only uses it as a flush signal: the run's own
-# eb07 sub-headers carry the same fields authoritatively.
+# Channel marker. Two sub-forms share the d807 magic (see gcv_protocol.md
+# section 3.C):
+#   * delimiter (`02 | 0x10|L v1 | 19 <channel>`) -- ends a channel's packet
+#     run; markers bracket runs in close/open pairs.  The run's own eb07
+#     sub-headers carry the channel/range authoritatively, so the assembler
+#     uses this only as a flush signal.
+#   * telemetry (`02 0c <float32 LE> 19 <channel>`, 16-byte frame) -- the
+#     transducer water temperature, interleaved as a per-channel triplet
+#     ~0.7 Hz.  It is NOT a run boundary: treating it as one tore single pings
+#     into two fragments (issue #37).  See :func:`marker_temperature_c`.
 D807 = b'\xd8\x07'
+D807_ENVELOPE = 8                # d8 07 00 00 <u32-LE payload len>, then record
+D807_TELEMETRY_TAG = b'\x02\x0c'  # record header of the temperature sub-form
 STATUS_MAGIC = b'\x8e\x03'       # GCV status broadcast (239.254.2.2:50050)
 # The :50050 stream multiplexes two 34-byte sub-types, discriminated by the
 # payload byte at offset 9 (see docs/gcv_protocol.md):
@@ -96,6 +104,36 @@ def status_transmitting(payload):
     if sub == 0x01:
         return False
     return None
+
+
+def is_run_delimiter(payload):
+    """
+    Return whether a ``d807`` frame ends the current channel's packet run.
+
+    Both ``d807`` sub-forms (delimiter, telemetry) carry the magic, but only the
+    delimiter is a run boundary.  Returns True for the delimiter and for any
+    unrecognised ``d807`` sub-form (conservative: an unknown marker flushes, as
+    it always did); False only for the known temperature-telemetry sub-form.
+    """
+    return (payload[:2] == D807
+            and payload[D807_ENVELOPE:D807_ENVELOPE + 2] != D807_TELEMETRY_TAG)
+
+
+def marker_temperature_c(payload):
+    """
+    Return the ``d807`` telemetry water temperature (deg C), or None otherwise.
+
+    The telemetry sub-form is the 16-byte frame ``02 0c <float32 LE> 19 <ch>``:
+    field1 carries an IEEE-754 float32 surface water temperature.  Validated
+    against an AML CTD cast (same water/day, within ~1 deg C) and the boat's own
+    sound-velocity sensor (predicted vs measured sound speed within 1-3 m/s);
+    see issue #37 and gcv_protocol.md section 3.C.
+    """
+    if (payload[:2] != D807
+            or len(payload) < D807_ENVELOPE + 6
+            or payload[D807_ENVELOPE:D807_ENVELOPE + 2] != D807_TELEMETRY_TAG):
+        return None
+    return struct.unpack_from('<f', payload, D807_ENVELOPE + 2)[0]
 
 
 # Render-layer header signatures (little-endian sample pairs).
@@ -466,8 +504,15 @@ class PingAssembler:
         """Consume one datagram payload; return any completed scan lines."""
         out = []
         if payload[:2] == D807:
-            self._emit(out)
-            self._cur_ch = None
+            # The delimiter sub-form ends the run; the temperature-telemetry
+            # sub-form is interleaved mid-run and must NOT flush, or one ping
+            # is split into two fragments (issue #37). The next channel's first
+            # packet (channel change, below) independently flushes the run, so a
+            # dropped delimiter can't merge two consecutive pings -- the stream
+            # cycles channels, so the same channel never repeats back-to-back.
+            if is_run_delimiter(payload):
+                self._emit(out)
+                self._cur_ch = None
         elif payload[:2] == EB07 and len(payload) > MIN_DATA_LEN:
             ch = payload[CHANNEL_OFFSET]
             block = self._extract(payload)
