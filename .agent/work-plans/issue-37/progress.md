@@ -34,3 +34,24 @@ bag_2026-06-12T16.06.52 drops short pings from 140/82/122 to 2/0/0 per channel
 flake8 + ament_pep257 clean; pytest 73 tests, 0 failures (new: real-capture-frame
 decode, non-finite rejection, truncated-flush, temperature_plausible,
 temperature_publish_due, telemetry-mid-run assembles whole).
+
+## Local Review (Pre-Push, 2nd pass)
+**Status**: complete
+**When**: 2026-06-13 10:05 -04:00
+**By**: Claude Code Agent (Claude Fable 5)
+**Verdict**: approved
+**Branch**: feature/issue-37 at `ea7f561`
+**Depth**: Standard, concurrency/lifecycle focus (sole gate — Copilot quota exhausted until end of June 2026)
+**Must-fix**: 0 | **Suggestions**: 3 (addressed)
+
+Second independent fresh-context adversarial pass (no must-fix). Confirmed: no
+intra-node race (single rx thread mutates the dedup state; publisher built before
+thread start), telemetry frame no-ops the assembler cleanly, sub-form tags
+unambiguous, variance=0.0 is the spec "unknown" sentinel.
+
+### Findings
+- [x] (suggestion) telemetry dropped during generation-detect warmup — hoisted the decode above the assembler-None gate
+- [x] (suggestion) heartbeat cadence coarser than documented (evaluated on arrival) — softened docstring
+- [x] (suggestion) backward clock jump (sim/bag-loop) briefly suppresses heartbeat — added an awareness comment
+
+Tests: 73 pass, 0 failures.
