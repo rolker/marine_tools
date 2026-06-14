@@ -12,6 +12,7 @@
 
   <depend>rclpy</depend>
   <depend>marine_acoustic_msgs</depend>
+  <depend>marine_control_py</depend>
   <depend>marine_interfaces</depend>
   <depend>marine_radar_control_msgs</depend>
   <depend>diagnostic_msgs</depend>

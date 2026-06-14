@@ -5,6 +5,7 @@ The critical invariant: a transmit-OFF command whose TCP send FAILED must not
 be recorded as OFF, or the watchdog would stop retrying and a dry transducer
 could keep pinging while everything reports OFF.
 """
+import threading
 import types
 
 from diagnostic_msgs.msg import DiagnosticStatus
@@ -150,7 +151,7 @@ class _FakeLogger:
 class _FakeNode:
     """Minimal stand-in exposing only the attributes _on_param_set touches."""
 
-    def __init__(self, send_ok=True, static_params=()):
+    def __init__(self, send_ok=True, static_params=(), tx_achieves=True):
         self._send_ok = send_ok
         self.sends = []
         self._static = set(static_params)
@@ -159,6 +160,12 @@ class _FakeNode:
         self._controls = {}
         self._safety_enabled = True
         self.publishes = 0
+        # transmit-control adoption
+        self._tx_sync = False
+        self._transmitting = False
+        self._tx_achieves = tx_achieves   # does _request_transmit reach the goal?
+        self._tx_force = None             # (ok, transmitting_after) override
+        self.transmit_requests = []
 
     def get_logger(self):
         return _FakeLogger()
@@ -172,6 +179,16 @@ class _FakeNode:
 
     def _publish_control_set(self):
         self.publishes += 1
+
+    def _request_transmit(self, on):
+        self.transmit_requests.append(on)
+        if self._tx_force is not None:
+            ok, self._transmitting = self._tx_force
+            return ok, 'forced'
+        if self._tx_achieves:
+            self._transmitting = on
+            return True, 'ok'
+        return False, 'refused'   # guard refused: actual state unchanged
 
 
 def _param(name, value):
@@ -219,6 +236,100 @@ def test_range_send_failure_rejects_without_mirroring():
     assert result.successful is False
     assert len(node.sends) == 1          # attempted
     assert 'range' not in node._controls  # but not mirrored on failure
+
+
+# ----- transmit-control adoption (marine_control) ------------------------
+
+def test_transmit_request_applied_when_achieved():
+    node = _FakeNode()
+    result = _on_param_set(node, [_param('transmit', True)])
+    assert result.successful is True
+    assert node.transmit_requests == [True]
+    assert node._transmitting is True
+
+
+def test_transmit_request_rejected_when_refused():
+    # The watchdog guard refuses ON: reject the set so the param stays at the
+    # actual (off) transmit state rather than falsely reporting on.
+    node = _FakeNode(tx_achieves=False)
+    result = _on_param_set(node, [_param('transmit', True)])
+    assert result.successful is False
+    assert node.transmit_requests == [True]
+    assert node._transmitting is False
+
+
+def test_transmit_off_applied_when_achieved():
+    node = _FakeNode()
+    node._transmitting = True
+    result = _on_param_set(node, [_param('transmit', False)])
+    assert result.successful is True
+    assert node.transmit_requests == [False]
+    assert node._transmitting is False
+
+
+def test_transmit_off_send_failure_rejected():
+    # Safety-critical branch: an OFF whose send failed leaves the sonar possibly
+    # still pinging (_transmitting stays True). _request_transmit returns ok=False
+    # there, so the set must be REJECTED -- the param must not claim 'off'.
+    node = _FakeNode()
+    node._transmitting = True
+    node._tx_force = (False, True)   # ok=False, still transmitting
+    result = _on_param_set(node, [_param('transmit', False)])
+    assert result.successful is False
+    assert node.transmit_requests == [False]
+    assert node._transmitting is True
+
+
+def test_transmit_sync_write_skips_command():
+    # A reconcile (mirror) write must NOT re-issue a transmit command.
+    node = _FakeNode()
+    node._tx_sync = True
+    result = _on_param_set(node, [_param('transmit', True)])
+    assert result.successful is True
+    assert node.transmit_requests == []
+
+
+class _FakeReconcileNode:
+    """Stand-in exposing only what _reconcile_transmit_param touches."""
+
+    def __init__(self, param_value, transmitting):
+        self._params = {'transmit': types.SimpleNamespace(value=param_value)}
+        self._transmitting = transmitting
+        self._tx_sync = False
+        self._tx_lock = threading.Lock()
+        self.set_calls = []
+        self.published = False
+        self._control_server = types.SimpleNamespace(
+            publish_state=lambda: setattr(self, 'published', True))
+
+    def has_parameter(self, name):
+        return name in self._params
+
+    def get_parameter(self, name):
+        return self._params[name]
+
+    def set_parameters(self, params):
+        for p in params:
+            self.set_calls.append((p.name, p.value))
+            # the guard must be set while the write happens
+            assert self._tx_sync is True
+            self._params[p.name] = types.SimpleNamespace(value=p.value)
+        return [types.SimpleNamespace(successful=True)]
+
+
+def test_reconcile_writes_param_when_out_of_sync():
+    node = _FakeReconcileNode(param_value=False, transmitting=True)
+    GarminSidescanNode._reconcile_transmit_param(node)
+    assert node.set_calls == [('transmit', True)]
+    assert node._tx_sync is False        # guard reset after the write
+    assert node.published is True         # panel refreshed promptly
+
+
+def test_reconcile_noop_when_in_sync():
+    node = _FakeReconcileNode(param_value=True, transmitting=True)
+    GarminSidescanNode._reconcile_transmit_param(node)
+    assert node.set_calls == []
+    assert node.published is False
 
 
 # ----- device auto-detect from render-layer structure --------------------
