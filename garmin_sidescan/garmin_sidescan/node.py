@@ -27,10 +27,12 @@ import time
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_acoustic_msgs.msg import RawSonarImage, SonarImageData
+from marine_control_py import ControlServer
 from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
 from sensor_msgs.msg import Range, Temperature
@@ -237,11 +239,31 @@ class GarminSidescanNode(Node):
         # transmit / safety
         self.declare_parameter('transmit_on_startup', False)
         self.declare_parameter('startup_off_repeats', 3)
-        self.declare_parameter('range_m', 0.0)
 
-        # operator control set (radar-style; rendered by CAMP)
+        # operator control set (radar-style; rendered by CAMP). Declare the range
+        # bounds first so range_m can carry a FloatingPointRange descriptor built
+        # from them for the marine_control panel.
         self.declare_parameter('range_min_m', 1.0)
         self.declare_parameter('range_max_m', 60.0)
+        # range_m default 0.0 = "do not command a range at startup". The
+        # descriptor upper bound is range_max_m; the lower bound stays 0.0 so the
+        # default is valid (sub-range_min_m values are rejected by _on_param_set,
+        # which enforces range_min_m). step 0.0 = continuous.
+        range_max = float(self.get_parameter('range_max_m').value)
+        self.declare_parameter(
+            'range_m', 0.0,
+            ParameterDescriptor(
+                description=('Sonar display range in metres (0 = leave the device '
+                             'default at startup; effective minimum is range_min_m).'),
+                floating_point_range=[
+                    FloatingPointRange(from_value=0.0, to_value=range_max, step=0.0)]))
+        # transmit on/off as a bridgeable marine_control. Holds ACTUAL transmit
+        # state, reconciled by the watchdog so the operator panel never lies.
+        self.declare_parameter(
+            'transmit', False,
+            ParameterDescriptor(
+                description=('Sonar transmit on/off (safety-guarded by the '
+                             'sound-speed watchdog).')))
         # TVG / interference frames are GCV-10-derived and unverified on the
         # GCV-20 (TVG is display-side there); expose them but allow opting out.
         self.declare_parameter('expose_gcv10_controls', True)
@@ -303,6 +325,10 @@ class GarminSidescanNode(Node):
         self._tx_lock = threading.Lock()      # guards transmit/latch state changes
         self._send_lock = threading.Lock()    # serializes TCP command sends
         self._transmitting = False
+        # True while _reconcile_transmit_param mirrors actual state into the
+        # `transmit` param, so _on_param_set skips re-issuing a transmit command.
+        self._tx_sync = False
+        self._control_server = None
         self._safety_latched = False
         self._last_valid_sv_t = None
         self._last_valid_sv_value = 0.0
@@ -402,6 +428,13 @@ class GarminSidescanNode(Node):
             self.get_logger().warn('sound_speed_topic empty: watchdog disabled')
 
         self.add_on_set_parameters_callback(self._on_param_set)
+
+        # marine_control device panel (bridgeable; rendered by rqt_marine_control).
+        # transmit + range for now; TVG/interference await enum support in the lib.
+        # Created before the timers so the watchdog can reconcile the transmit param.
+        self._control_server = ControlServer(self)
+        self._control_server.bind_parameter('transmit', group='sonar')
+        self._control_server.bind_parameter('range_m', units='m', group='sonar')
 
         self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
         self._rx_thread.start()
@@ -654,7 +687,35 @@ class GarminSidescanNode(Node):
         else:
             self._valid_streak = 0
 
+    def _reconcile_transmit_param(self):
+        """
+        Mirror actual transmit state into the `transmit` parameter.
+
+        Runs on the executor thread (the watchdog timer) so a watchdog- or
+        startup-thread-driven transmit change reaches the ControlServer echo
+        without a cross-thread set_parameters. The _tx_sync guard keeps
+        _on_param_set from re-issuing a transmit command for this mirror write.
+        """
+        if not self.has_parameter('transmit'):
+            return
+        # Snapshot under _tx_lock -- the startup daemon thread also mutates
+        # _transmitting -- for a consistent read, matching the file's discipline.
+        with self._tx_lock:
+            actual = self._transmitting
+        if bool(self.get_parameter('transmit').value) == actual:
+            return
+        self._tx_sync = True
+        try:
+            self.set_parameters([Parameter('transmit', Parameter.Type.BOOL, actual)])
+        finally:
+            self._tx_sync = False
+        if self._control_server is not None:
+            self._control_server.publish_state()
+
     def _watchdog(self):
+        # Reconcile first so an async transmit change (watchdog stop last tick,
+        # startup thread, auto-resume) is reflected in the panel promptly.
+        self._reconcile_transmit_param()
         age = self._sv_age()
         stop, kind = watchdog_action(
             safety_enabled=self._safety_enabled,
@@ -1010,6 +1071,7 @@ class GarminSidescanNode(Node):
         # because of a *different* param would desync the param store from the
         # hardware/UI. Side effects happen only once every param is acceptable.
         range_request = None
+        transmit_request = None
         for p in params:
             if p.name == 'range_m':
                 meters = float(p.value)
@@ -1027,6 +1089,8 @@ class GarminSidescanNode(Node):
                         reason=(f'range {meters} m invalid or outside '
                                 f'{self._range_min}-{self._range_max} m'))
                 range_request = meters
+            elif p.name == 'transmit':
+                transmit_request = bool(p.value)  # applied below (or mirror-only)
             elif p.name in ('sound_speed_safety_enabled', 'debug_raw'):
                 pass  # always acceptable; applied below
             elif p.name != 'use_sim_time' and self.has_parameter(p.name):
@@ -1055,6 +1119,19 @@ class GarminSidescanNode(Node):
             self._controls['range'] = f'{range_request:.1f}'
             self._publish_control_set()
             self.get_logger().info(f'range set to {range_request} m')
+
+        # Apply transmit last. ControlServer sets exactly one parameter per
+        # change, so transmit and range never share a batch from the operator
+        # path; applying it after range therefore can't break range's atomicity.
+        # Skip the command when this set is our own reconcile write (_tx_sync) --
+        # that only mirrors actual state into the param.
+        if transmit_request is not None and not self._tx_sync:
+            ok, reason = self._request_transmit(transmit_request)
+            if not ok:
+                # Refused (watchdog guard) or not achieved (a failed send can
+                # leave the sonar possibly still pinging): reject so the param
+                # stays at the actual transmit state, not the request.
+                return SetParametersResult(successful=False, reason=reason)
 
         for p in params:
             if p.name == 'sound_speed_safety_enabled':
