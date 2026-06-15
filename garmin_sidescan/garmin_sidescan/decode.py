@@ -407,9 +407,10 @@ def parse_subheader(payload):
     lengths, so a garbled payload yields None. Returns a :class:`Subheader`:
     ``display_range_m`` (v2) is this channel's own scan extent -- water-column
     depth range on the down-look, across-track slant range on the side-scan --
-    so bin size = ``display_range_m / n_bins`` must use the matching channel;
-    ``bottom_range_m`` (v1) is the shared bottom range; ``v1_tag`` is field2's
-    raw tag byte (``0x10 | len(v1)``, the ex-"range bracket").
+    so bin size = ``display_range_m / GRID_BINS`` must use the matching channel
+    (see :func:`derive_sample_rate`); ``bottom_range_m`` (v1) is the shared
+    bottom range; ``v1_tag`` is field2's raw tag byte (``0x10 | len(v1)``, the
+    ex-"range bracket").
     """
     if (payload[:2] != EB07 or len(payload) < 33
             or payload[9:12] != b'\x01\x03\x09'):

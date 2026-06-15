@@ -811,9 +811,14 @@ class GarminSidescanNode(Node):
         # better "unavailable" than wrong.
         bins = len(samples) // self._bytes_per_sample
         if bins > GRID_BINS:
+            # The device is not expected to exceed the fixed grid; if it does,
+            # the grid model is violated and the scale below is wrong for the
+            # over-length tail (sample0 floors at 0 via max()). Loud + throttled
+            # rather than silently publishing a confidently-wrong scale.
             self.get_logger().warn(
-                f'ping has {bins} bins > GRID_BINS ({GRID_BINS}); near-field '
-                'gate (sample0) clamped to 0', throttle_duration_sec=30.0)
+                f'ping has {bins} bins > GRID_BINS ({GRID_BINS}); fixed-grid '
+                'scale assumption violated, published scale is unreliable',
+                throttle_duration_sec=30.0)
         commanded = (0.0 if side == 'down'
                      else float(self._controls.get('range') or 0.0))
         msg.sample_rate = derive_sample_rate(

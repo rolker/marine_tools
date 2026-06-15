@@ -100,8 +100,13 @@ dynamically: the node publishes a `RadarControlSet` on `state` and accepts
   explicit command (pairs with the chartplotter defaulting to not pinging on
   power-up).
 - Transmit-off is also sent on node shutdown.
-- No external sound-speed interlock is needed: the GCV stops pinging on its own
-  when out of the water, so a dry transducer cannot overheat.
+- **No external sound-speed interlock.** The GCV stops pinging on its own when
+  out of the water, so a dry transducer cannot overheat — the driver relies on
+  that rather than a watchdog. This rests on a field observation (the unit stops
+  pinging in air); it is **not yet** confirmed against a Garmin spec or a
+  recorded bench test (see `docs/gcv_protocol.md` §4.6). **Until it is, do not
+  set `transmit_on_startup:=true` or command transmit with the transducer in
+  air** — startup/commanded transmit is unguarded.
 
 ## Protocol notes
 
@@ -154,7 +159,7 @@ correction must match this parameter, or it double-corrects the range.
 | `sample_rate_hz` | `0.0` | last-resort fallback when neither the sub-header v2 nor a commanded range gives a scale; 0 = unavailable |
 | `nadir_frame_id` | `''` | frame for `nadir_depth` (+X down); empty derives `<frame_id>_nadir` |
 | `nadir_beam_width_rad` | `0.0` | `Range.field_of_view` for `nadir_depth` |
-| `transmit_on_startup` | `false` | safe default |
+| `transmit_on_startup` | `false` | safe default; only enable with the transducer **submerged** — startup transmit is unguarded (see Transmit safety) |
 | `sound_speed` | `1500.0` | device's assumed sound speed (m/s) used to build the `sample_rate` scale and stamped into `ping_info.sound_speed`; see Protocol notes |
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |

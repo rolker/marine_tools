@@ -400,6 +400,16 @@ The driver's control path (from `commands.py`; envelope in §1). Builders:
 force-manual-range builder — needed only to hold a fixed swath against the
 chartplotter's auto-range.
 
+**Transmit safety — out-of-water auto-stop (issue #41).** The driver does not
+gate transmit on an external sound-speed reading; it relies on the GCV ceasing
+to ping on its own when the transducer is out of the water, so a dry transducer
+cannot overheat. **Source: field observation (R. Arsenault) — the unit stops
+pinging in air.** This is **not yet** independently confirmed against a Garmin
+spec or a recorded bench test. **TODO: bench-confirm the dry → transmit-stop
+latency and cite it here.** Until then, treat `transmit_on_startup` and any
+commanded transmit as unprotected against a dry transducer — only energize with
+the transducer submerged.
+
 ### 4.7 Chartplotter-side streams (bench inventory; not consumed by the driver)
 
 The 06-05 bucket captures show the chartplotter (`172.16.6.64`) broadcasting
