@@ -53,14 +53,16 @@ jobs:
       - name: Clone source-sibling interface packages
         run: |
           set -e
+          # POSIX sh (this step runs under dash, no bash arrays): build the
+          # find prune expression as a string and eval it. Keep-names are
+          # workflow-controlled literals, so the eval is safe.
           clone_prune() {  # <repo-url> <branch> <dir> <keep-package-dir>...
-            local url="$1" branch="$2" dir="$3"; shift 3
+            url="$1"; branch="$2"; dir="$3"; shift 3
             git clone --depth 1 -b "$branch" "$url" "../ws/src/$dir"
-            local prune=() keep
-            for keep in "$@"; do prune+=( ! -name "$keep" ); done
+            prune=""
+            for keep in "$@"; do prune="$prune ! -name '$keep'"; done
             ( cd "../ws/src/$dir" && \
-              find . -maxdepth 1 -mindepth 1 -type d \
-                "${prune[@]}" ! -name '.git' -exec rm -rf {} + )
+              eval "find . -maxdepth 1 -mindepth 1 -type d $prune ! -name '.git' -exec rm -rf {} +" )
           }
           clone_prune https://github.com/rolker/unh_marine_autonomy.git jazzy \
             unh_marine_autonomy marine_interfaces
