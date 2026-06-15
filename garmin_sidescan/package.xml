@@ -4,16 +4,14 @@
   <name>garmin_sidescan</name>
   <version>0.0.1</version>
   <description>ROS 2 driver for the Garmin GCV-10/20 sidescan sonar: decodes the
-  Marine-Network imagery multicast into marine_acoustic_msgs/RawSonarImage,
-  controls transmit/range over the GCV TCP command port, and interlocks
-  transmit on a sound-speed watchdog to protect a dry transducer.</description>
+  Marine-Network imagery multicast into marine_acoustic_msgs/RawSonarImage and
+  controls transmit/range over the GCV TCP command port.</description>
   <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
   <license>BSD-3-Clause</license>
 
   <depend>rclpy</depend>
   <depend>marine_acoustic_msgs</depend>
   <depend>marine_control_py</depend>
-  <depend>marine_interfaces</depend>
   <depend>marine_radar_control_msgs</depend>
   <depend>diagnostic_msgs</depend>
   <depend>sensor_msgs</depend>

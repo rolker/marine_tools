@@ -40,7 +40,8 @@ import collections
 import sys
 
 from garmin_sidescan.decode import (
-    D807, dark_layer, EB07, echo_layer, generation_from_layers, PingAssembler)
+    D807, dark_layer, EB07, echo_layer, generation_from_layers, GRID_BINS,
+    PingAssembler)
 import numpy as np
 from rclpy.serialization import deserialize_message
 import rosbag2_py
@@ -120,10 +121,11 @@ def read_pings_messages(bag, start, end):
     Build the same ``{channel: [(t, sub, samples)]}`` from ``sonar_image_*``.
 
     The decoded-message source (#35): per-ping scale recovered from
-    ``sample_rate`` (``range = sound_speed * bins / (2 * rate)``), the bottom
-    line from ``~/nadir_depth`` when recorded.  Bags recorded before the
-    driver published a scale (``sample_rate`` = 0) cannot be rendered from
-    messages -- use the ``debug/raw`` source for those.
+    ``sample_rate`` with the near-field gate from ``sample0``
+    (``range = sound_speed * (sample0 + j) / (2 * rate)`` for delivered sample
+    ``j``), the bottom line from ``~/nadir_depth`` when recorded.  Bags recorded
+    before the driver published a scale (``sample_rate`` = 0) cannot be rendered
+    from messages -- use the ``debug/raw`` source for those.
     """
     from marine_acoustic_msgs.msg import RawSonarImage
     from sensor_msgs.msg import Range
@@ -163,7 +165,9 @@ def read_pings_messages(bag, start, end):
         m = deserialize_message(data, RawSonarImage)
         sv, rate = m.ping_info.sound_speed, m.sample_rate
         if rate > 0 and sv > 0 and m.samples_per_beam > 0:
-            rng = sv * m.samples_per_beam / (2.0 * rate)
+            # Full display range: sample0 is the omitted near-field head of the
+            # fixed grid, so the far edge sits at grid index sample0 + bins.
+            rng = sv * (m.sample0 + m.samples_per_beam) / (2.0 * rate)
         else:
             rng = None
             unscaled += 1
@@ -195,15 +199,15 @@ def read_pings_messages(bag, start, end):
     return chans
 
 
-def _bin_size(sub, n_samples, fallback):
-    """metres/sample from this channel's own display range (v2)."""
-    if sub and sub.display_range_m and n_samples:
-        return sub.display_range_m / n_samples
+def _bin_size(sub, fallback):
+    """metres/sample over the full GRID_BINS line, from this channel's v2 range."""
+    if sub and sub.display_range_m:
+        return sub.display_range_m / GRID_BINS
     return fallback
 
 
 def _median_bin(pings):
-    bs = [s.display_range_m / (len(samp) // 2)
+    bs = [s.display_range_m / GRID_BINS
           for _t, s, samp in pings if s and s.display_range_m and len(samp)]
     return float(np.median(bs)) if bs else 0.011
 
@@ -211,8 +215,14 @@ def _median_bin(pings):
 def _column(samp, sub, grid, fallback):
     """Resample a ping onto the metric grid -- RAW values, NaN beyond range."""
     a = np.frombuffer(samp, dtype='<u2').astype(float)
-    bs = _bin_size(sub, len(a), fallback)
-    return np.interp(grid / bs, np.arange(len(a)), a, right=np.nan)
+    bs = _bin_size(sub, fallback)
+    # The delivered samples are the gated TAIL of the GRID_BINS-sample line: the
+    # first (GRID_BINS - len(a)) grid samples are the omitted near-field, so
+    # delivered sample i sits at grid index (GRID_BINS - len(a)) + i. Map the
+    # metric grid back through that offset; the near-field strip is NaN (no data).
+    sample0 = GRID_BINS - len(a)
+    return np.interp(grid / bs - sample0, np.arange(len(a)), a,
+                     left=np.nan, right=np.nan)
 
 
 def _show_raw(ax, img, extent, cmap, vmin, vmax):

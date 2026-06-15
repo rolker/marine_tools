@@ -11,7 +11,7 @@ sub-header scaling, ``nadir_depth``) runs exactly as on the boat.  Point a
 Run the driver against the replay on the same host::
 
     ros2 run garmin_sidescan garmin_sidescan --ros-args \
-        -p iface_ip:=127.0.0.1 -p filter_src:=false -p require_sound_speed:=false
+        -p iface_ip:=127.0.0.1 -p filter_src:=false
 
     python3 replay_debug_raw.py BAG [--rate 1.0] [--start S] [--end S]
 

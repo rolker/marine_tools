@@ -15,10 +15,8 @@ transmit on/off and range over the GCV TCP command port
 payloads on ``~/debug/raw`` for offline re-decode.
 
 Safety: the node asserts transmit OFF at startup and never pings without an
-explicit command.  While transmitting, a sound-speed watchdog stops the sonar
-if the sound speed reads NaN / 0 / out-of-water for ``sv_timeout`` seconds, so
-a dry transducer cannot overheat.  The whole mechanism has a dynamic master
-switch (``sound_speed_safety_enabled``).
+explicit command.  The GCV stops pinging on its own when out of the water, so
+no external sound-speed interlock is needed to protect the transducer.
 """
 import math
 import socket
@@ -34,7 +32,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from rosidl_runtime_py.utilities import get_message
 from sensor_msgs.msg import Range, Temperature
 from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import SetBool
@@ -49,8 +46,8 @@ from .commands import (
 )
 from .decode import (
     CHANNEL_OFFSET, dark_layer, derive_sample_rate, EB07, echo_layer,
-    generation_from_layers, is_water_column, marker_temperature_c, MIN_DATA_LEN,
-    PingAssembler, status_transmitting)
+    generation_from_layers, GRID_BINS, is_water_column, marker_temperature_c,
+    MIN_DATA_LEN, PingAssembler, status_transmitting)
 
 # Auxiliary GCV multicast streams the driver can listen to. The imagery group
 # is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
@@ -113,44 +110,13 @@ def transmit_state_after(commanded_on, send_ok, prior):
     Return the transmit state to record after issuing a command.
 
     A failed OFF must not be recorded as OFF: the sonar may still be pinging,
-    so we stay True and let the watchdog keep retrying.  A successful command
-    records the commanded state.  A failed ON keeps the ``prior`` state rather
-    than asserting OFF: if the sonar may already be pinging (e.g. a preceding
-    OFF that also failed left ``prior`` True, then an auto-resume ON send fails
-    too), recording OFF would falsely disarm the watchdog over a live, dry
-    transducer.
+    so we stay True and retry.  A successful command records the commanded
+    state.  A failed ON keeps the ``prior`` state rather than asserting a state
+    the command never achieved.
     """
     if not commanded_on:
         return not send_ok
     return True if send_ok else prior
-
-
-def watchdog_action(*, safety_enabled, transmitting, has_sv_topic,
-                    require_sv, sv_age, sv_timeout):
-    """
-    Decide whether the sound-speed watchdog must stop transmit.
-
-    Returns ``(stop, kind)`` where ``stop`` is a bool and ``kind`` is
-    ``''`` (no action), ``'no_source'`` (require_sound_speed set but no
-    sound-speed source configured), or ``'stale'`` (no valid reading within
-    ``sv_timeout``).
-
-    The watchdog runs independently of *require_sound_speed*: that flag governs
-    whether a fresh reading is required *before* transmitting, while the
-    watchdog must stop a dry transducer whenever it is (or may be) transmitting.
-    With no sound-speed source it mirrors ``_guard_transmit_on``: under
-    require_sv it must stop (the guard refuses to *start* here, so a
-    maybe-transmitting state reached without a guard must not be left pinging);
-    without require_sv (bench testing) there is nothing to evaluate, so it
-    leaves transmit untouched.
-    """
-    if not safety_enabled or not transmitting:
-        return False, ''
-    if not has_sv_topic:
-        return (True, 'no_source') if require_sv else (False, '')
-    if sv_age is None or sv_age > sv_timeout:
-        return True, 'stale'
-    return False, ''
 
 
 def range_in_bounds(meters, range_min, range_max):
@@ -190,7 +156,7 @@ def temperature_publish_due(temp_c, last_c, elapsed_s, heartbeat_s=2.0):
 
 
 class GarminSidescanNode(Node):
-    """Driver node: GCV imagery in, RawSonarImage out, transmit under safety."""
+    """Driver node: GCV imagery in, RawSonarImage out, transmit on command."""
 
     def __init__(self):
         super().__init__('garmin_sidescan')
@@ -258,28 +224,23 @@ class GarminSidescanNode(Node):
                 floating_point_range=[
                     FloatingPointRange(from_value=0.0, to_value=range_max, step=0.0)]))
         # transmit on/off as a bridgeable marine_control. Holds ACTUAL transmit
-        # state, reconciled by the watchdog so the operator panel never lies.
+        # state, reconciled by a timer so the operator panel never lies.
         self.declare_parameter(
             'transmit', False,
-            ParameterDescriptor(
-                description=('Sonar transmit on/off (safety-guarded by the '
-                             'sound-speed watchdog).')))
+            ParameterDescriptor(description='Sonar transmit on/off.'))
         # TVG / interference frames are GCV-10-derived and unverified on the
         # GCV-20 (TVG is display-side there); expose them but allow opting out.
         self.declare_parameter('expose_gcv10_controls', True)
 
-        # sound-speed watchdog
-        self.declare_parameter('sound_speed_safety_enabled', True)
-        # Generic default; a platform launch sets the absolute topic.
-        self.declare_parameter('sound_speed_topic', 'sound_speed')
-        self.declare_parameter('sound_speed_type', 'marine_interfaces/msg/SoundSpeed')
-        self.declare_parameter('sound_speed_field', 'sound_speed')
-        self.declare_parameter('sv_min', 1400.0)
-        self.declare_parameter('sv_max', 1600.0)
-        self.declare_parameter('sv_timeout', 12.0)
-        self.declare_parameter('require_sound_speed', True)
-        self.declare_parameter('auto_resume', True)
-        self.declare_parameter('resume_valid_samples', 3)     # sustained-valid before resume
+        # Sound speed (m/s) used to convert the device's per-ping display range
+        # into the published RawSonarImage scale (sample_rate) and stamped into
+        # ping_info.sound_speed. This is the DEVICE's assumed sound speed for
+        # scale reconstruction, not a live measurement: the GCV reports range in
+        # metres already, so any consistent value round-trips the geometry, and
+        # the device exposes no water-type / sound-speed setting (it uses a fixed
+        # internal nominal). A consumer that re-applies its own sound-speed
+        # correction must match this value. Default 1500 m/s.
+        self.declare_parameter('sound_speed', 1500.0)
 
         self._gcv_ip = self._p('gcv_ip')
         self._ctrl_port = int(self._p('control_port'))
@@ -311,29 +272,16 @@ class GarminSidescanNode(Node):
                 'falling back to auto-detect')
             self._device = 'auto'
         self._debug_raw = bool(self._p('debug_raw'))
-        self._sv_topic = self._p('sound_speed_topic')
-        self._sv_field = self._p('sound_speed_field')
-        self._sv_min = float(self._p('sv_min'))
-        self._sv_max = float(self._p('sv_max'))
-        self._sv_timeout = float(self._p('sv_timeout'))
-        self._require_sv = bool(self._p('require_sound_speed'))
-        self._auto_resume = bool(self._p('auto_resume'))
-        self._resume_valid_samples = max(1, int(self._p('resume_valid_samples')))
-        self._safety_enabled = bool(self._p('sound_speed_safety_enabled'))
+        self._sound_speed = float(self._p('sound_speed'))
 
         # state
-        self._tx_lock = threading.Lock()      # guards transmit/latch state changes
+        self._tx_lock = threading.Lock()      # guards transmit state changes
         self._send_lock = threading.Lock()    # serializes TCP command sends
         self._transmitting = False
         # True while _reconcile_transmit_param mirrors actual state into the
         # `transmit` param, so _on_param_set skips re-issuing a transmit command.
         self._tx_sync = False
         self._control_server = None
-        self._safety_latched = False
-        self._last_valid_sv_t = None
-        self._last_valid_sv_value = 0.0
-        self._last_sv_value = float('nan')
-        self._valid_streak = 0
         self._ping_count = {s: 0 for s in SIDES}
         self._range_min = float(self._p('range_min_m'))
         self._range_max = float(self._p('range_max_m'))
@@ -409,29 +357,11 @@ class GarminSidescanNode(Node):
         self.create_subscription(RadarControlValue, '~/change_state',
                                  self._on_control_value, 10)
 
-        if self._sv_topic:
-            try:
-                sv_type = get_message(self._p('sound_speed_type'))
-                # Default RELIABLE depth-10 matches sound_speed_bridge's publisher
-                # QoS; a BEST_EFFORT source would need this adjusted to match, or
-                # the watchdog would silently receive nothing.
-                self.create_subscription(sv_type, self._sv_topic, self._on_sound_speed, 10)
-                self.get_logger().info(
-                    f'sound-speed watchdog on {self._sv_topic} '
-                    f'(valid {self._sv_min}-{self._sv_max} m/s, timeout {self._sv_timeout}s)')
-            except (ValueError, ImportError, AttributeError) as exc:
-                self.get_logger().error(
-                    f'could not subscribe to sound speed ({exc}); watchdog DISABLED '
-                    '- transmit refused unless require_sound_speed:=false')
-                self._sv_topic = ''
-        else:
-            self.get_logger().warn('sound_speed_topic empty: watchdog disabled')
-
         self.add_on_set_parameters_callback(self._on_param_set)
 
         # marine_control device panel (bridgeable; rendered by rqt_marine_control).
         # transmit + range for now; TVG/interference await enum support in the lib.
-        # Created before the timers so the watchdog can reconcile the transmit param.
+        # Created before the timers so the reconcile timer can mirror the transmit param.
         self._control_server = ControlServer(self)
         self._control_server.bind_parameter('transmit', group='sonar')
         self._control_server.bind_parameter('range_m', units='m', group='sonar')
@@ -446,7 +376,7 @@ class GarminSidescanNode(Node):
         threading.Thread(
             target=self._aux_loop, name='gcv_config', daemon=True,
             args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)).start()
-        self.create_timer(0.5, self._watchdog)
+        self.create_timer(0.5, self._reconcile_transmit_param)
         self.create_timer(2.0, self._publish_status)
         self.create_timer(1.0, self._publish_diagnostics)
 
@@ -470,7 +400,7 @@ class GarminSidescanNode(Node):
                     ok = True
                 time.sleep(0.3)
             # If every OFF send failed the GCV may be pinging; stay "on" so
-            # the watchdog keeps retrying rather than reporting a false OFF.
+            # status reflects reality rather than reporting a false OFF.
             self._transmitting = not ok
         self._publish_tx_state()
         if ok:
@@ -478,7 +408,7 @@ class GarminSidescanNode(Node):
         else:
             self.get_logger().error(
                 'startup: could not assert transmit OFF (GCV unreachable?); '
-                'assuming sonar may be pinging - watchdog will retry')
+                'assuming sonar may be pinging')
         if range_m > 0:
             if self._send(build_range_cmd(range_m)):
                 self._controls['range'] = f'{range_m:.1f}'
@@ -486,11 +416,7 @@ class GarminSidescanNode(Node):
             else:
                 self.get_logger().error(f'startup: range command ({range_m} m) failed to send')
         if want_on:
-            ok, msg = self._guard_transmit_on()
-            if ok:
-                self._set_transmit(True, 'startup (transmit_on_startup)')
-            else:
-                self.get_logger().warn(f'startup transmit_on_startup refused: {msg}')
+            self._set_transmit(True, 'startup (transmit_on_startup)')
 
     # ----- TCP command send --------------------------------------------------
     def _send(self, data):
@@ -510,26 +436,22 @@ class GarminSidescanNode(Node):
     def _set_transmit(self, on, reason):
         with self._tx_lock:
             ok = self._send(TRANSMIT_ON if on else TRANSMIT_OFF)
-            # A failed OFF keeps _transmitting True so the watchdog keeps
-            # retrying and status reflects reality; a failed ON keeps the prior
-            # state so an auto-resume ON failing after a failed OFF can't
-            # falsely report OFF (see transmit_state_after).
+            # A failed OFF keeps _transmitting True so status reflects reality
+            # (the sonar may still be pinging) and we retry; a failed ON keeps
+            # the prior state (see transmit_state_after).
             self._transmitting = transmit_state_after(on, ok, prior=self._transmitting)
-            if on and ok:
-                self._safety_latched = False
         if not on and not ok:
             self.get_logger().error(
                 f'transmit OFF command FAILED ({reason}); sonar may still be '
                 'pinging - will retry')
         else:
-            log = self.get_logger().error if (not on and reason.startswith('SAFETY')) \
-                else self.get_logger().info
-            log(f'transmit {"ON" if self._transmitting else "OFF"} ({reason})')
+            self.get_logger().info(
+                f'transmit {"ON" if self._transmitting else "OFF"} ({reason})')
         self._publish_tx_state()
 
     def _publish_tx_state(self):
         self._pub_tx.publish(Bool(data=bool(self._transmitting)))
-        # keep the operator-control mirror in sync (incl. watchdog-driven changes)
+        # keep the operator-control mirror in sync with actual transmit state
         self._controls['status'] = 'transmit' if self._transmitting else 'standby'
         self._publish_control_set()
 
@@ -542,46 +464,14 @@ class GarminSidescanNode(Node):
         failed OFF send reports that the sonar may still be transmitting.
         """
         if on:
-            ok, msg = self._guard_transmit_on()
-            if not ok:
-                self.get_logger().warn(f'transmit ON refused: {msg}')
-                return False, msg
             self._set_transmit(True, 'request')
             if self._transmitting:
                 return True, 'transmitting'
             return False, 'transmit ON command failed to send'
-        self._safety_latched = False    # explicit operator off: no auto-resume
         self._set_transmit(False, 'request')
         if self._transmitting:
             return False, 'transmit OFF command failed to send; sonar may still be pinging'
         return True, 'transmit off'
-
-    # ----- transmit guard ----------------------------------------------------
-    def _sv_age(self):
-        if self._last_valid_sv_t is None:
-            return None
-        return time.monotonic() - self._last_valid_sv_t
-
-    def _current_sound_speed(self):
-        """Last valid sound speed if still fresh, else 0.0 (unavailable)."""
-        age = self._sv_age()
-        if age is None or age > self._sv_timeout:
-            return 0.0
-        return self._last_valid_sv_value
-
-    def _guard_transmit_on(self):
-        if not self._safety_enabled or not self._require_sv:
-            return True, ''
-        if not self._sv_topic:
-            return False, ('sound_speed_topic not configured; refusing to transmit '
-                           '(override with require_sound_speed:=false)')
-        age = self._sv_age()
-        if age is None:
-            return False, 'no valid sound speed received yet; refusing to transmit'
-        if age > self._sv_timeout:
-            return False, (f'last valid sound speed was {age:.1f}s ago '
-                           f'(>{self._sv_timeout}s); transducer may be out of water')
-        return True, ''
 
     def _on_set_transmit(self, req, resp):
         resp.success, resp.message = self._request_transmit(bool(req.data))
@@ -653,48 +543,14 @@ class GarminSidescanNode(Node):
             return
         self._publish_control_set()
 
-    # ----- sound-speed watchdog ---------------------------------------------
-    def _extract_field(self, msg):
-        val = msg
-        for part in self._sv_field.split('.'):
-            val = getattr(val, part)
-        return float(val)
-
-    def _on_sound_speed(self, msg):
-        try:
-            sv = self._extract_field(msg)
-        except (AttributeError, TypeError, ValueError) as exc:
-            self.get_logger().warn(
-                f'sound-speed field "{self._sv_field}" unreadable: {exc}',
-                throttle_duration_sec=10.0)
-            return
-        self._last_sv_value = sv
-        if math.isfinite(sv) and self._sv_min <= sv <= self._sv_max:
-            self._last_valid_sv_t = time.monotonic()
-            self._last_valid_sv_value = sv
-            self._valid_streak += 1
-            # Resume only after sustained recovery, and only if the full
-            # transmit guard (master switch, freshness) still passes — a
-            # single in-range sample must not re-energize a dry transducer.
-            if (self._safety_latched and self._auto_resume and self._safety_enabled
-                    and self._valid_streak >= self._resume_valid_samples):
-                ok, _msg = self._guard_transmit_on()
-                if ok:
-                    self.get_logger().info(
-                        f'sound speed recovered ({sv:.1f} m/s, '
-                        f'{self._valid_streak} samples); auto-resuming transmit')
-                    self._set_transmit(True, 'auto_resume after sustained recovery')
-        else:
-            self._valid_streak = 0
-
     def _reconcile_transmit_param(self):
         """
         Mirror actual transmit state into the `transmit` parameter.
 
-        Runs on the executor thread (the watchdog timer) so a watchdog- or
-        startup-thread-driven transmit change reaches the ControlServer echo
-        without a cross-thread set_parameters. The _tx_sync guard keeps
-        _on_param_set from re-issuing a transmit command for this mirror write.
+        Runs on the executor thread (the reconcile timer) so a startup-thread-
+        driven transmit change reaches the ControlServer echo without a
+        cross-thread set_parameters. The _tx_sync guard keeps _on_param_set
+        from re-issuing a transmit command for this mirror write.
         """
         if not self.has_parameter('transmit'):
             return
@@ -711,30 +567,6 @@ class GarminSidescanNode(Node):
             self._tx_sync = False
         if self._control_server is not None:
             self._control_server.publish_state()
-
-    def _watchdog(self):
-        # Reconcile first so an async transmit change (watchdog stop last tick,
-        # startup thread, auto-resume) is reflected in the panel promptly.
-        self._reconcile_transmit_param()
-        age = self._sv_age()
-        stop, kind = watchdog_action(
-            safety_enabled=self._safety_enabled,
-            transmitting=self._transmitting,
-            has_sv_topic=bool(self._sv_topic),
-            require_sv=self._require_sv,
-            sv_age=age,
-            sv_timeout=self._sv_timeout)
-        if not stop:
-            return
-        self._safety_latched = True
-        if kind == 'no_source':
-            reason = ('SAFETY: require_sound_speed set but no sound-speed source '
-                      'configured; stopping ping to protect transducer')
-        else:
-            shown = 'never' if age is None else f'{age:.1f}s ago'
-            reason = (f'SAFETY: sound speed invalid/stale (last valid {shown}, '
-                      f'value={self._last_sv_value}); stopping ping to protect transducer')
-        self._set_transmit(False, reason)
 
     # ----- imagery receive + decode -----------------------------------------
     def _open_mcast(self, group, port):
@@ -961,9 +793,15 @@ class GarminSidescanNode(Node):
         # Per-channel frame so TF orients each transducer (see FRAME_SUFFIX).
         msg.header.frame_id = f'{self._frame_id}_{FRAME_SUFFIX[side]}'
         msg.ping_info.frequency = self._freq[side]
-        sv = self._current_sound_speed()
+        sv = self._sound_speed
         msg.ping_info.sound_speed = sv
-        # Derive sample_rate so a consumer recovers range = sv*bins/(2*rate).
+        # The GCV frames each ping as a fixed GRID_BINS-sample line spanning
+        # [0, display_range] and gates the near-field by delivering only the
+        # LAST `bins` of that grid. So derive sample_rate from the full grid and
+        # expose the omitted head count as sample0: a consumer then recovers a
+        # delivered sample j at range = sv*(sample0 + j)/(2*rate), i.e. the data
+        # starts at the near-field offset, not at range 0. (Publishing sample0=0
+        # mis-scales every sample, by ~20% of range at short range.)
         # The range source is the ping's OWN sub-header v2 (per channel, tracks
         # hardware auto-range), falling back to the commanded-range mirror and
         # then the sample_rate_hz parameter -- see decode.derive_sample_rate.
@@ -972,13 +810,24 @@ class GarminSidescanNode(Node):
         # swath, so a wrong-but-confident ~2x scale must not be published --
         # better "unavailable" than wrong.
         bins = len(samples) // self._bytes_per_sample
+        if bins > GRID_BINS:
+            # The device is not expected to exceed the fixed grid; if it does,
+            # the grid model is violated and the scale below is wrong for the
+            # over-length tail (sample0 floors at 0 via max()). Loud + throttled
+            # rather than silently publishing a confidently-wrong scale.
+            self.get_logger().warn(
+                f'ping has {bins} bins > GRID_BINS ({GRID_BINS}); fixed-grid '
+                'scale assumption violated, published scale is unreliable',
+                throttle_duration_sec=30.0)
         commanded = (0.0 if side == 'down'
                      else float(self._controls.get('range') or 0.0))
         msg.sample_rate = derive_sample_rate(
-            sub, bins, sv, commanded_range_m=commanded,
+            sub, GRID_BINS, sv, commanded_range_m=commanded,
             fallback_rate=self._sample_rate)
         msg.samples_per_beam = bins
-        msg.sample0 = 0
+        # Near-field gate: the first (GRID_BINS - bins) grid samples are omitted,
+        # so the delivered data starts at grid sample index sample0.
+        msg.sample0 = max(0, GRID_BINS - bins)
         # rx_angles/tx_angles are the *steering* angle applied to the beam
         # (per the RawSonarImage spec) -- 0 for a fixed, unsteered single-beam
         # sidescan. The transducer's physical look direction (port out / stbd
@@ -996,7 +845,6 @@ class GarminSidescanNode(Node):
     def _publish_diagnostics(self):
         now = time.monotonic()
         ping_age = None if self._last_ping_t is None else now - self._last_ping_t
-        sv_age = self._sv_age()
 
         # Imagery stream
         lvl, msg = imagery_diag_level(self._transmitting, ping_age)
@@ -1012,33 +860,21 @@ class GarminSidescanNode(Node):
                                f"{self._ping_count['down']}"),
             ])
 
-        # Transmit + sound-speed safety. WARN if the device-reported transmit
-        # state (from the :50050 status frame) disagrees with what we commanded,
-        # or if we are (maybe) transmitting on a stale/absent sound speed.
+        # Transmit state. WARN if the device-reported transmit state (from the
+        # :50050 status frame) disagrees with what we commanded.
         dev_tx = self._device_transmitting
         mismatch = dev_tx is not None and dev_tx != self._transmitting
-        sv_stale = self._transmitting and self._safety_enabled and (
-            sv_age is None or sv_age > self._sv_timeout)
-        tx_lvl = DiagnosticStatus.OK
-        tx_msg = 'transmitting' if self._transmitting else 'standby'
-        if mismatch:
-            tx_lvl = DiagnosticStatus.WARN
-            tx_msg = f'commanded {self._transmitting} but device reports {dev_tx}'
-        elif sv_stale:
-            tx_lvl = DiagnosticStatus.WARN
-            tx_msg = 'transmitting without a fresh sound speed'
+        tx_lvl = DiagnosticStatus.WARN if mismatch else DiagnosticStatus.OK
+        tx_msg = (f'commanded {self._transmitting} but device reports {dev_tx}'
+                  if mismatch
+                  else ('transmitting' if self._transmitting else 'standby'))
         transmit = DiagnosticStatus(
-            name='garmin_sidescan: transmit/safety', hardware_id=self._gcv_ip,
+            name='garmin_sidescan: transmit', hardware_id=self._gcv_ip,
             level=tx_lvl, message=tx_msg, values=[
                 KeyValue(key='commanded_transmitting', value=str(self._transmitting)),
                 KeyValue(key='device_transmitting',
                          value='unknown' if dev_tx is None else str(dev_tx)),
-                KeyValue(key='safety_enabled', value=str(self._safety_enabled)),
-                KeyValue(key='require_sound_speed', value=str(self._require_sv)),
-                KeyValue(key='safety_latched', value=str(self._safety_latched)),
-                KeyValue(key='sound_speed_mps', value=f'{self._last_sv_value:.1f}'),
-                KeyValue(key='sound_speed_age_s',
-                         value='n/a' if sv_age is None else f'{sv_age:.1f}'),
+                KeyValue(key='sound_speed_mps', value=f'{self._sound_speed:.1f}'),
             ])
 
         arr = DiagnosticArray()
@@ -1047,14 +883,9 @@ class GarminSidescanNode(Node):
         self._pub_diag.publish(arr)
 
     def _publish_status(self):
-        age = self._sv_age()
-        age_s = 'n/a' if age is None else f'{age:.1f}s'
         self._pub_status.publish(String(data=(
             f'tx={"ON" if self._transmitting else "OFF"} '
-            f'safety={"on" if self._safety_enabled else "OFF"} '
-            f'require_sv={self._require_sv} '
-            f'latched={self._safety_latched} '
-            f'sv={self._last_sv_value:.1f} sv_age={age_s} '
+            f'sound_speed={self._sound_speed:.1f} '
             f'pings(port/stbd/down)={self._ping_count["port"]}/'
             f'{self._ping_count["stbd"]}/{self._ping_count["down"]}')))
         # Re-publish the control set on the status timer so a late or udp-bridged
@@ -1091,7 +922,7 @@ class GarminSidescanNode(Node):
                 range_request = meters
             elif p.name == 'transmit':
                 transmit_request = bool(p.value)  # applied below (or mirror-only)
-            elif p.name in ('sound_speed_safety_enabled', 'debug_raw'):
+            elif p.name == 'debug_raw':
                 pass  # always acceptable; applied below
             elif p.name != 'use_sim_time' and self.has_parameter(p.name):
                 # Every other declared parameter is read once at startup. Silently
@@ -1128,21 +959,13 @@ class GarminSidescanNode(Node):
         if transmit_request is not None and not self._tx_sync:
             ok, reason = self._request_transmit(transmit_request)
             if not ok:
-                # Refused (watchdog guard) or not achieved (a failed send can
-                # leave the sonar possibly still pinging): reject so the param
-                # stays at the actual transmit state, not the request.
+                # Not achieved (a failed send can leave the sonar possibly still
+                # pinging): reject so the param stays at the actual transmit
+                # state, not the request.
                 return SetParametersResult(successful=False, reason=reason)
 
         for p in params:
-            if p.name == 'sound_speed_safety_enabled':
-                self._safety_enabled = bool(p.value)
-                if self._safety_enabled:
-                    self.get_logger().info('sound-speed safety mechanism ENABLED')
-                else:
-                    self.get_logger().warn(
-                        'sound-speed safety mechanism DISABLED (watchdog auto-stop and '
-                        'transmit guard off - dry-transducer protection is not active)')
-            elif p.name == 'debug_raw':
+            if p.name == 'debug_raw':
                 self._debug_raw = bool(p.value)
                 self.get_logger().info(
                     'debug_raw ON - publishing raw payloads on ~/debug/raw'
@@ -1152,8 +975,8 @@ class GarminSidescanNode(Node):
     def destroy_node(self):
         """Stop the receive loop and assert transmit off on shutdown."""
         self._running = False
-        # Retry the OFF; a single dropped frame on shutdown must not leave a
-        # dry transducer pinging. _send already swallows OSError -> bool.
+        # Retry the OFF; a single dropped frame on shutdown must not leave the
+        # sonar pinging unattended. _send already swallows OSError -> bool.
         off_ok = False
         for _ in range(3):
             if self._send(TRANSMIT_OFF):

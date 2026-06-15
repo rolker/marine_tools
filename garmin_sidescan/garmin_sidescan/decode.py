@@ -407,9 +407,10 @@ def parse_subheader(payload):
     lengths, so a garbled payload yields None. Returns a :class:`Subheader`:
     ``display_range_m`` (v2) is this channel's own scan extent -- water-column
     depth range on the down-look, across-track slant range on the side-scan --
-    so bin size = ``display_range_m / n_bins`` must use the matching channel;
-    ``bottom_range_m`` (v1) is the shared bottom range; ``v1_tag`` is field2's
-    raw tag byte (``0x10 | len(v1)``, the ex-"range bracket").
+    so bin size = ``display_range_m / GRID_BINS`` must use the matching channel
+    (see :func:`derive_sample_rate`); ``bottom_range_m`` (v1) is the shared
+    bottom range; ``v1_tag`` is field2's raw tag byte (``0x10 | len(v1)``, the
+    ex-"range bracket").
     """
     if (payload[:2] != EB07 or len(payload) < 33
             or payload[9:12] != b'\x01\x03\x09'):
@@ -452,10 +453,25 @@ def parse_downlook_subheader(payload):
     return parse_subheader(payload)
 
 
-def derive_sample_rate(sub, n_bins, sound_speed, commanded_range_m=0.0,
+# The GCV frames every ping as a fixed-length line of GRID_BINS samples spanning
+# [0, display_range], independent of range; the near-field is gated by delivering
+# only the *last* n_bins of that grid (the first GRID_BINS - n_bins samples are
+# omitted). So sample_rate is derived from the full grid and the omitted count is
+# the RawSonarImage sample0 -- see GarminSidescanNode._make_sonar_msg. 2^11,
+# validated on the GCV-20 (the down-look bottom echo lands at the reported
+# bottom_range_m only under this geometry) and consistent with the GCV-10 ceiling.
+GRID_BINS = 2048
+
+
+def derive_sample_rate(sub, grid_bins, sound_speed, commanded_range_m=0.0,
                        fallback_rate=0.0):
     """
     Return the ``RawSonarImage.sample_rate`` (Hz) for one assembled ping.
+
+    ``grid_bins`` is the device's full per-ping line length (:data:`GRID_BINS`),
+    spanning ``[0, display_range]`` -- NOT the delivered sample count, which is
+    the gated tail of that grid (the near-field offset is carried by
+    ``sample0``; see :meth:`GarminSidescanNode._make_sonar_msg`).
 
     The scale source, in priority order:
 
@@ -469,14 +485,15 @@ def derive_sample_rate(sub, n_bins, sound_speed, commanded_range_m=0.0,
     3. **``fallback_rate``** -- a manually configured rate, or 0.0 =
        "unavailable" (the ``RawSonarImage`` convention).
 
-    With a range ``R`` the rate is ``sound_speed * n_bins / (2 * R)``, so a
-    consumer recovers ``R = sound_speed * n_bins / (2 * rate)``.
+    With a range ``R`` over the full grid the rate is
+    ``sound_speed * grid_bins / (2 * R)``, so a consumer recovers a delivered
+    sample ``j`` at ``range = sound_speed * (sample0 + j) / (2 * rate)``.
     """
     range_m = sub.display_range_m if sub is not None else 0.0
     if range_m <= 0.0:
         range_m = commanded_range_m
-    if range_m > 0.0 and sound_speed > 0.0 and n_bins > 0:
-        return sound_speed * n_bins / (2.0 * range_m)
+    if range_m > 0.0 and sound_speed > 0.0 and grid_bins > 0:
+        return sound_speed * grid_bins / (2.0 * range_m)
     return fallback_rate
 
 
