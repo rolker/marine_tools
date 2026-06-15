@@ -1,9 +1,9 @@
 # garmin_sidescan
 
 ROS 2 driver for the Garmin GCV-10 / GCV-20 sidescan sonar (Marine Network).
-Decodes the imagery multicast into `marine_acoustic_msgs/RawSonarImage`, owns
-transmit/range control over the GCV TCP command port, and interlocks transmit
-on a sound-speed watchdog so a dry transducer cannot overheat.
+Decodes the imagery multicast into `marine_acoustic_msgs/RawSonarImage` and owns
+transmit/range control over the GCV TCP command port. (The GCV stops pinging on
+its own when out of the water, so no external sound-speed interlock is needed.)
 
 The chartplotter is required only to power up / wake the Marine Network; it is
 otherwise inaccessible, so **this node performs all sonar control.**
@@ -87,28 +87,21 @@ dynamically: the node publishes a `RadarControlSet` on `state` and accepts
 
 | Control | Type | Values | Notes |
 |---------|------|--------|-------|
-| `status` | enum | `standby` / `transmit` | routed through the safety guard; reflects watchdog-driven changes |
+| `status` | enum | `standby` / `transmit` | reflects actual transmit state |
 | `range` | float | `range_min_m`..`range_max_m` (m) | verified on GCV-20 |
 | `tvg` | enum | `off`/`low`/`medium`/`high` | GCV-10-derived; **unverified on GCV-20** (TVG is display-side there) |
 | `interference` | enum | `off`/`low`/`medium`/`high` | GCV-10-derived; **unverified on GCV-20** |
 
 `tvg` / `interference` are gated by `expose_gcv10_controls` (default true).
-`status=transmit` cannot bypass the sound-speed interlock — it goes through the
-same guard as the service.
 
-## Safety
+## Transmit safety
 
 - **Transmit OFF at startup** — the node asserts off and never pings without an
   explicit command (pairs with the chartplotter defaulting to not pinging on
   power-up).
-- **Sound-speed watchdog** — while transmitting, if sound speed reads NaN / 0 /
-  outside `sv_min`–`sv_max` (plausible in-water range) for `sv_timeout`
-  seconds, transmit auto-stops. Auto-resumes when a valid in-water sound speed
-  returns (`auto_resume`, default on); a manual off is never auto-overridden.
-- **`sound_speed_safety_enabled`** — dynamic master switch (default enabled).
-  Toggle live for out-of-water bench testing:
-  `ros2 param set <node> sound_speed_safety_enabled false`.
 - Transmit-off is also sent on node shutdown.
+- No external sound-speed interlock is needed: the GCV stops pinging on its own
+  when out of the water, so a dry transducer cannot overheat.
 
 ## Protocol notes
 
@@ -137,11 +130,7 @@ imagery stream because they are not reliably present there:
 | `nadir_frame_id` | `''` | frame for `nadir_depth` (+X down); empty derives `<frame_id>_nadir` |
 | `nadir_beam_width_rad` | `0.0` | `Range.field_of_view` for `nadir_depth` |
 | `transmit_on_startup` | `false` | safe default |
-| `sound_speed_safety_enabled` | `true` | dynamic master switch |
-| `require_sound_speed` | `true` | refuse transmit unless a valid SV is fresh; `false` for bench tests |
-| `sv_min` / `sv_max` | `1400` / `1600` | plausible in-water sound speed (m/s) |
-| `sv_timeout` | `12.0` | seconds of bad/missing SV before auto-stop |
-| `auto_resume` | `true` | resume transmit when valid in-water SV returns |
+| `sound_speed` | `1500.0` | device's assumed sound speed (m/s) used to build the `sample_rate` scale and stamped into `ping_info.sound_speed`; see Protocol notes |
 | `range_m` | `0.0` | >0 commands range (settable at runtime) |
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
 | `expose_gcv10_controls` | `true` | include TVG / interference controls |

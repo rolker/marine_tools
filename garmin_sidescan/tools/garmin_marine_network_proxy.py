@@ -32,8 +32,8 @@ driver expects them, so the *unmodified* driver runs on gabby:
   and serializes them; connections are handled on a thread each regardless.
 
 Every UDP relay is one-way GCV->ROS and nothing reaches the GCV except the
-driver's own control frames, so the sonar's transmit safety (the sound-speed
-watchdog) stays entirely in the driver on gabby. The status/config streams are
+driver's own control frames, so all sonar transmit control stays entirely in
+the driver on gabby. The status/config streams are
 relayed by default so the driver's ``debug_raw`` capture records them; relaying
 status also feeds the driver's (otherwise-starved) device transmit-flag path.
 

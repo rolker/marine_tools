@@ -47,7 +47,7 @@ loopback (`--iface-ip 127.0.0.1`, TTL 0) so nothing leaves the host.
 ```bash
 # terminal 1 — the driver under test
 ros2 run garmin_sidescan garmin_sidescan --ros-args \
-    -p iface_ip:=127.0.0.1 -p filter_src:=false -p require_sound_speed:=false
+    -p iface_ip:=127.0.0.1 -p filter_src:=false
 # terminal 2 — the replay
 python3 tools/replay_debug_raw.py BAG --start 100 --end 300
 # terminal 3 — watch the output (sensor topics are best-effort; a
