@@ -118,6 +118,31 @@ imagery stream because they are not reliably present there:
   is stamped with the ROS receive time of its first packet. On an NTP-synced
   host this is accurate to a few ms; note it is receive (not transmit) time.
 
+### Range scale, near-field gate, and `sound_speed`
+
+The GCV reports a per-ping **display range** (sub-header v2) and frames every
+ping as a fixed **2048-sample line** spanning `[0, display_range]`, delivering
+only the **last `n_bins`** of that grid — the first `2048 − n_bins` samples are
+a gated near-field zone (~0.1 m). The driver encodes this as:
+
+- `sample_rate = sound_speed · 2048 / (2 · display_range)` — derived from the
+  full grid, and
+- `sample0 = 2048 − n_bins` — the omitted near-field head.
+
+A consumer recovers delivered sample `j` at
+`range = sound_speed · (sample0 + j) / (2 · sample_rate)`, so the data starts at
+the near-field offset, not at range 0. (Encoding `sample0 = 0` mis-scales every
+sample — ~20 % of range at short range.) The 2048 grid is validated on the
+GCV-20: the down-look bottom echo lands at the reported `bottom_range_m` only
+under this geometry.
+
+`sound_speed` here is the **device's assumed** sound speed (parameter, default
+1500 m/s), used to build the scale and stamped into `ping_info.sound_speed`. The
+GCV reports range in metres already, so any consistent value round-trips the
+geometry; it does **not** track water temperature/salinity (the device exposes
+no such setting). A downstream consumer that re-applies its own sound-speed
+correction must match this parameter, or it double-corrects the range.
+
 ## Key parameters
 
 | Parameter | Default | Notes |

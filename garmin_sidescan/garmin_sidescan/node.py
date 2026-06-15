@@ -46,8 +46,8 @@ from .commands import (
 )
 from .decode import (
     CHANNEL_OFFSET, dark_layer, derive_sample_rate, EB07, echo_layer,
-    generation_from_layers, is_water_column, marker_temperature_c, MIN_DATA_LEN,
-    PingAssembler, status_transmitting)
+    generation_from_layers, GRID_BINS, is_water_column, marker_temperature_c,
+    MIN_DATA_LEN, PingAssembler, status_transmitting)
 
 # Auxiliary GCV multicast streams the driver can listen to. The imagery group
 # is a parameter (mcast_group/port); these two are fixed by the GCV protocol.
@@ -795,7 +795,13 @@ class GarminSidescanNode(Node):
         msg.ping_info.frequency = self._freq[side]
         sv = self._sound_speed
         msg.ping_info.sound_speed = sv
-        # Derive sample_rate so a consumer recovers range = sv*bins/(2*rate).
+        # The GCV frames each ping as a fixed GRID_BINS-sample line spanning
+        # [0, display_range] and gates the near-field by delivering only the
+        # LAST `bins` of that grid. So derive sample_rate from the full grid and
+        # expose the omitted head count as sample0: a consumer then recovers a
+        # delivered sample j at range = sv*(sample0 + j)/(2*rate), i.e. the data
+        # starts at the near-field offset, not at range 0. (Publishing sample0=0
+        # mis-scales every sample, by ~20% of range at short range.)
         # The range source is the ping's OWN sub-header v2 (per channel, tracks
         # hardware auto-range), falling back to the commanded-range mirror and
         # then the sample_rate_hz parameter -- see decode.derive_sample_rate.
@@ -804,13 +810,19 @@ class GarminSidescanNode(Node):
         # swath, so a wrong-but-confident ~2x scale must not be published --
         # better "unavailable" than wrong.
         bins = len(samples) // self._bytes_per_sample
+        if bins > GRID_BINS:
+            self.get_logger().warn(
+                f'ping has {bins} bins > GRID_BINS ({GRID_BINS}); near-field '
+                'gate (sample0) clamped to 0', throttle_duration_sec=30.0)
         commanded = (0.0 if side == 'down'
                      else float(self._controls.get('range') or 0.0))
         msg.sample_rate = derive_sample_rate(
-            sub, bins, sv, commanded_range_m=commanded,
+            sub, GRID_BINS, sv, commanded_range_m=commanded,
             fallback_rate=self._sample_rate)
         msg.samples_per_beam = bins
-        msg.sample0 = 0
+        # Near-field gate: the first (GRID_BINS - bins) grid samples are omitted,
+        # so the delivered data starts at grid sample index sample0.
+        msg.sample0 = max(0, GRID_BINS - bins)
         # rx_angles/tx_angles are the *steering* angle applied to the beam
         # (per the RawSonarImage spec) -- 0 for a fixed, unsteered single-beam
         # sidescan. The transducer's physical look direction (port out / stbd

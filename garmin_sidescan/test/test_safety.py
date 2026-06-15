@@ -437,6 +437,41 @@ def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
     assert down_msg.sample_rate == 0.0
 
 
+def test_make_sonar_msg_encodes_near_field_gate():
+    # The GCV delivers the gated TAIL of a fixed 2048-sample line spanning
+    # [0, display_range]; the omitted near-field head must be exposed as sample0
+    # so a consumer places delivered sample j at range sv*(sample0+j)/(2*rate),
+    # NOT starting at range 0. Validated against the device's own down-look
+    # bottom echo: display_range 1.843 m, 1943 delivered bins -> sample0 105,
+    # and the bottom-echo bin (319) recovers the reported bottom_range_m (~0.381 m).
+    from builtin_interfaces.msg import Time
+    from garmin_sidescan.decode import GRID_BINS, Subheader
+
+    sub = Subheader(channel=2, layer=0x0d, v1_tag=0x12,
+                    bottom_range_m=0.381, display_range_m=1.843,
+                    near_field_m=0.0985)
+    node = types.SimpleNamespace(
+        _frame_id='gs', _freq={'down': 0.0}, _sound_speed=1500.0,
+        _controls={'range': '0.0'}, _bytes_per_sample=2, _sample_rate=0.0,
+        _sonar_dtype=0, get_logger=lambda: _FakeLogger())
+    samples = bytes(2 * 1943)                    # 1943 uint16 bins
+    stamp = types.SimpleNamespace(to_msg=lambda: Time())
+    msg = GarminSidescanNode._make_sonar_msg(node, 'down', samples, stamp, sub=sub)
+
+    assert msg.samples_per_beam == 1943
+    assert msg.sample0 == GRID_BINS - 1943       # == 105, the near-field gate
+    # full display range recovers from the FULL grid (sample0 + bins)
+    full = 1500.0 * (msg.sample0 + msg.samples_per_beam) / (2.0 * msg.sample_rate)
+    assert abs(full - 1.843) < 1e-3
+    # the bottom echo at delivered bin 319 -> grid index sample0+319 -> ~0.381 m
+    range_319 = 1500.0 * (msg.sample0 + 319) / (2.0 * msg.sample_rate)
+    assert abs(range_319 - 0.381) < 5e-3
+    # a consumer that ignored sample0 would shift every sample inward by the
+    # near-field offset (~0.094 m here) and badly misplace the bottom
+    ignored = 1500.0 * 319 / (2.0 * msg.sample_rate)
+    assert range_319 - ignored > 0.08
+
+
 def test_emit_ping_skips_implausible_nadir_values():
     from garmin_sidescan.decode import ScanLine, Subheader
 

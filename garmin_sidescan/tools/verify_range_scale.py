@@ -118,7 +118,10 @@ def read_bag(bag, start, end):
         elif topic in img_topics and start <= rel <= end:
             m = deserialize_message(data, RawSonarImage)
             sv, rate = m.ping_info.sound_speed, m.sample_rate
-            rng = (sv * m.samples_per_beam / (2.0 * rate)
+            # Full display range = sv*(sample0 + bins)/(2*rate): sample0 is the
+            # near-field gate (the omitted head of the fixed grid), so the last
+            # delivered sample sits at grid index sample0 + samples_per_beam.
+            rng = (sv * (m.sample0 + m.samples_per_beam) / (2.0 * rate)
                    if rate > 0 and sv > 0 else float('nan'))
             published.setdefault(img_topics[topic], []).append((rel, rng))
         elif topic == state_topic and start <= rel <= end:
