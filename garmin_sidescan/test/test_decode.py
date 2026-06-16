@@ -10,12 +10,16 @@ import os
 import struct
 
 from garmin_sidescan.decode import (
-    dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH,
+    dark_layer, decode_leb128, derive_sample_rate, echo_layer, FH, FHS,
     generation_from_layers, is_run_delimiter, is_water_column,
     marker_temperature_c, parse_downlook_subheader,
-    parse_subheader, PingAssembler, SH, status_subtype, status_transmitting,
-    strip_first_layer_trailer, strip_leading_ping_header, Subheader,
-    subheader_bottom_range_m, TRAILER_MAGIC)
+    parse_subheader, PingAssembler, SH, SHS, status_subtype, status_transmitting,
+    strip_leading_ping_header, Subheader, subheader_bottom_range_m)
+
+# The per-packet records the driver once mistook for an appended "trailer"
+# (issue #26) include this byte sequence as field10's value; tests assert it
+# never leaks into the extracted samples.
+TRAILER_MAGIC = b'\x52\x80\x10'
 
 
 def _d807_telemetry(temp_c, channel):
@@ -112,36 +116,61 @@ def test_assembler_stamps_run_with_first_packet_time():
 
 # ----- GCV-20 echo extraction (echo_layer) -------------------------------
 
-def _gcv20_packet(channel, first_layer, tail=b''):
-    # eb07 0000 + LE len + 12-byte sub-header (channel at offset 12) + FH layer
-    # [+ SH + tail]. echo_layer keys off the FH/SH signatures, not fixed offsets.
-    head = (bytes([0xeb, 0x07, 0, 0]) + bytes(4)
-            + bytes([0x0e, 1, 3, 9, channel, 0, 0, 0]))
-    return head + FH + first_layer + (SH + tail if tail else b'')
+def _leb128(value):
+    """Encode an unsigned int as a little-endian base-128 varint."""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _eb07_with_layer(channel, samples, trailing=b'', beam=0x0e):
+    # Grammar-valid eb07: envelope + sub-header opener (01 03 09 <ch>) + a
+    # length-delimited render-layer field (tag 0x3f = field7, L=7) whose value is
+    # <LEB128 sample-byte count><samples>, then any trailing records. The payload
+    # is padded to exceed MIN_DATA_LEN; the envelope length stays consistent.
+    samples = bytes(samples)
+    value = _leb128(len(samples)) + samples
+    layer = bytes([0x3f]) + _leb128(len(value)) + value
+    body = bytes([beam, 0x01, 0x03, 0x09, channel]) + layer + bytes(trailing)
+    if len(body) < 26:
+        body += bytes(26 - len(body))
+    return bytes([0xeb, 0x07, 0, 0]) + struct.pack('<I', len(body)) + body
 
 
 def test_echo_layer_returns_first_layer_uint16_bytes():
-    # First layer returned as-is = uint16-LE samples (low byte then high byte)
-    pkt = _gcv20_packet(0, bytes([0x10, 0x01, 0x20, 0x02]), tail=bytes(2))
+    # First render layer returned as-is = uint16-LE samples (low byte then high)
+    pkt = _eb07_with_layer(0, bytes([0x10, 0x01, 0x20, 0x02]))
     assert echo_layer(pkt) == bytes([0x10, 0x01, 0x20, 0x02])
     # interpreted as uint16-LE: 0x0110, 0x0220
     assert struct.unpack('<2H', echo_layer(pkt)) == (0x0110, 0x0220)
 
 
 def test_echo_layer_trims_to_whole_samples():
-    # odd-length first layer: drop the trailing byte so concatenation can't
+    # odd sample-byte count: drop the trailing byte so concatenation can't
     # straddle a uint16 sample across the packet boundary
-    pkt = _gcv20_packet(0, bytes([10, 1, 20, 2, 99]), tail=bytes(2))
+    pkt = _eb07_with_layer(0, bytes([10, 1, 20, 2, 99]))
     assert echo_layer(pkt) == bytes([10, 1, 20, 2])
 
 
-def test_echo_layer_runs_to_end_without_sh():
-    # down-look-style: no following SH -> first layer runs to end of packet
-    pkt = _gcv20_packet(2, bytes([10, 1, 20, 2, 30, 3]))
+def test_echo_layer_reads_declared_length_not_packet_tail():
+    # The sample region is bounded by the layer field's own LEB128 length, so the
+    # records that follow it -- here a record counter whose value contains 0x43,
+    # the exact issue-#26 trap that the old rfind(0x43) trailer search mis-cut --
+    # never leak into the samples.
+    counter_record = bytes([0x43, 0x91, 0xb5, 0x43,   # field8: counter (has 0x43)
+                            0x4a, 0xac, 0x02,         # field9: offset
+                            0x52, 0x80, 0x10,         # field10: 80 10
+                            0x5a, 0xca, 0x5b])        # field11: range echo
+    pkt = _eb07_with_layer(2, bytes([10, 1, 20, 2, 30, 3]), trailing=counter_record)
     assert echo_layer(pkt) == bytes([10, 1, 20, 2, 30, 3])
 
 
-def test_echo_layer_empty_without_first_header():
+def test_echo_layer_empty_without_render_layer():
+    # no sub-header opener (01 03 09) -> not an imagery record -> b''
     assert echo_layer(bytes([0xeb, 0x07, 0, 0]) + bytes(40)) == b''
 
 
@@ -310,38 +339,102 @@ def test_derive_sample_rate_fallback_chain():
     assert derive_sample_rate(_sub(21.0), 0, sv, 50.0, fallback_rate=7.5) == 7.5
 
 
-# ----- GCV-20 trailer / leading-header stripping (issue #26) --------------
-
-def test_strip_first_layer_trailer_removes_delimited_trailer():
-    # samples (no trailer magic) followed by a real trailer record
-    samples = bytes(range(40))
-    trailer = bytes([0x43, 0x81, 0x96, 0x03, 0x49, 0x00,
-                     0x52, 0x80, 0x10, 0x5a, 0xc6, 0x70])
-    assert strip_first_layer_trailer(samples + trailer) == samples
-
-
-def test_strip_first_layer_trailer_keeps_clean_layer():
-    # no trailer present -> unchanged (the delimiter, not a fixed length, bounds it)
-    samples = bytes(range(40))
-    assert strip_first_layer_trailer(samples) == samples
+# ----- GCV-20 render-layer extraction by grammar length (issue #26) --------
+# Real 2026-06-15 Lake Massabesic packets whose record-counter (field8) high byte
+# is 0x43 -- the condition under which the pre-fix rfind(0x43) trailer search
+# locked onto the counter byte instead of the true opener and left a bright
+# 0x__43 residual sample at every packet boundary (the reported waterfall
+# artifact). See ~/data/logs/analysis/2026-06-15_sidescan_artifact/.
+COUNTER43_FIXTURE = os.path.join(
+    os.path.dirname(__file__), 'fixtures', 'gcv20_counter43_pings.bin')
 
 
-def test_strip_first_layer_trailer_handles_firmware_without_96_03_opener():
-    # The 2026-06-10 GCV-20 wet capture trailer has an 'e6 24' opener, not the
-    # bench capture's '96 03'. Keying on '96 03' alone left this trailer in,
-    # which read back as constant per-packet bands in the waterfall. Anchor on
-    # the 0x43 opener + 52 80 10 magic instead. (Real bytes, both channels.)
-    samples = bytes(range(40))
-    down = bytes.fromhex('43d1e62449005280105b9ead026baaa40c')   # down-look
-    side = bytes.fromhex('43d2e6244aac025280105bc2af0267')       # side-scan
-    assert strip_first_layer_trailer(samples + down) == samples
-    assert strip_first_layer_trailer(samples + side) == samples
+def _render_layers(payload):
+    """
+    Return each render layer's sample bytes by walking the eb07 grammar.
+
+    Independently mirrors the protocol (value after the inner LEB128 count), not
+    echo_layer's code, so equality with echo_layer is a real cross-check.
+    """
+    i, n, layers = 9, len(payload), []          # 9 = RECORD_START (after beam byte)
+    while i < n:
+        length_class = payload[i] & 0x07
+        i += 1
+        if length_class <= 6:
+            i += length_class
+            continue
+        field_len, i = decode_leb128(payload, i)
+        value = payload[i:i + field_len]
+        count, off = decode_leb128(value, 0)
+        layers.append(value[off:off + count])
+        i += field_len
+    return layers
 
 
-def test_strip_first_layer_trailer_ignores_magic_far_from_end():
-    # a 52 80 10 byte sequence deep in the samples must not trigger a cut
-    layer = TRAILER_MAGIC + bytes(60)
-    assert strip_first_layer_trailer(layer) == layer
+def _old_rfind_strip(payload):
+    """
+    Reproduce the pre-fix extraction to witness the issue-#26 regression.
+
+    Finds FH/FHS, then rfind(52 80 10) and rfind(0x43) for the trailer opener.
+    On counter-high-byte-0x43 packets it leaves a 0x__43 residual sample that the
+    grammar-length extraction never does.
+    """
+    f = payload.find(FH, 12)
+    if f < 0:
+        f = payload.find(FHS, 12)
+    if f < 0:
+        return b''
+    ends = [p for p in (payload.find(SH, f + 4), payload.find(SHS, f + 4)) if p >= 0]
+    layer = payload[f + 4:min(ends) if ends else len(payload)]
+    m = layer.rfind(TRAILER_MAGIC)
+    if 0 <= m and m >= len(layer) - 24:
+        op = layer.rfind(0x43, max(0, m - 10), m)
+        if op >= 0:
+            layer = layer[:op]
+    return layer[:len(layer) // 2 * 2]
+
+
+def test_eb07_payload_is_a_clean_tagged_record_stream():
+    # The render layers are length-delimited (L=7) fields: walking the grammar
+    # from RECORD_START consumes a real packet EXACTLY to the envelope end (no
+    # leftover bytes), so the sample length is read, never searched for.
+    pl = next(p for p in _load_records(GCV20_FIXTURE)
+              if p[:2] == b'\xeb\x07' and len(p) > 32)
+    env_len = struct.unpack_from('<I', pl, 4)[0]
+    i, n, n_layers = 9, len(pl), 0
+    while i < n:
+        length_class = pl[i] & 0x07
+        i += 1
+        if length_class <= 6:
+            i += length_class
+            continue
+        field_len, i = decode_leb128(pl, i)
+        i += field_len
+        n_layers += 1
+    assert i == n == env_len + 8           # consumed exactly to the envelope end
+    layers = _render_layers(pl)
+    assert layers and n_layers == len(layers)
+    # echo_layer returns the first render layer, trimmed to whole uint16 samples
+    first = layers[0]
+    assert echo_layer(pl) == first[:len(first) // 2 * 2]
+
+
+def test_echo_layer_no_0x43_residual_on_real_capture():
+    payloads = _load_records(COUNTER43_FIXTURE)
+    eb07 = [p for p in payloads if p[:2] == b'\xeb\x07' and len(p) > 32]
+    assert eb07, 'fixture has no imagery packets'
+    old_with_residual = 0
+    for pl in eb07:
+        first = _render_layers(pl)[0]
+        # the fix returns exactly the grammar-declared samples...
+        assert echo_layer(pl) == first[:len(first) // 2 * 2]
+        assert TRAILER_MAGIC not in echo_layer(pl)
+        # ...whereas the pre-fix rfind(0x43) search ends these packets in the
+        # 0x__43 boundary residual (low byte 0x43, high byte = a counter byte)
+        old = _old_rfind_strip(pl)
+        if len(old) >= 2 and old[-2] == 0x43 and old[-1] >= 0x40:
+            old_with_residual += 1
+    assert old_with_residual == len(eb07)   # every packet tripped the old bug
 
 
 def test_strip_leading_ping_header_drops_long_run():
@@ -384,8 +477,7 @@ def test_gcv20_real_capture_strips_trailer_and_leading_band():
 
 def test_assembler_uses_supplied_extractor():
     # PingAssembler routes per-packet extraction through the supplied callable.
-    # First layer is 8 bytes so the packet exceeds MIN_DATA_LEN (32).
-    pkt = _gcv20_packet(7, bytes([10, 1, 20, 2, 30, 3, 40, 4]), tail=bytes(2))
+    pkt = _eb07_with_layer(7, bytes([10, 1, 20, 2, 30, 3, 40, 4]))
     assembler = PingAssembler(echo_layer)
     assert assembler.feed(pkt) == []                # accumulating
     out = assembler.feed(bytes([0xd8, 0x07]))       # marker flushes

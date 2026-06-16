@@ -6,8 +6,9 @@ Garmin GCV-10/20 sidescan imagery decode primitives.
   d807 packet = marker delimiting a channel's run within a ping.
   One channel scan line = 7 consecutive same-channel packets (6 full + 1 short).
 
-Per-packet layers are bracketed by header signatures: ``fh``/``fhs`` opens the
-first layer, ``sh``/``shs`` opens later layers.  The high-resolution echo lives
+The eb07 payload is a tagged-record stream (docs/gcv_protocol.md section 3); the
+render layers are length-delimited (``L = 7``) fields, each ``<tag> <LEB128
+length> <LEB128 sample-byte count> <samples>``.  The high-resolution echo lives
 in a DIFFERENT layer per generation, so the per-packet sample extractor is a
 parameter of :class:`PingAssembler`, chosen by the caller from the device
 generation (see node.py's ``device`` auto-detect):
@@ -16,13 +17,13 @@ generation (see node.py's ``device`` auto-detect):
   three layers per packet; the echo is the LAST ("dark") layer -- bytes after
   the final ``sh``/``shs`` + 4 to end of packet.  Use :func:`dark_layer`.
 * **GCV-20** (bench-validated 2026-06-07 against the GCV-10 bucket reference;
-  pending a wet-capture seafloor confirmation): only two layers per packet (no
-  third "dark" layer); the echo is the **first (``fh``) layer, an array of
-  little-endian uint16 samples** (the high byte is the smooth echo MSB, the low
-  byte its LSB -- a per-byte view looks like a decaying "odd" stream interleaved
-  with a uniform "even" one).  Use :func:`echo_layer` and publish ``UINT16``.
-  Taking the last layer here (the GCV-10 rule) yields a washed-out low-res/AGC
-  display layer -- the original "looks wrong in rqt" bug.
+  wet-validated on the 2026-06-15 Lake Massabesic survey): the echo is the
+  **first render layer, an array of little-endian uint16 samples** (the high
+  byte is the smooth echo MSB, the low byte its LSB -- a per-byte view looks like
+  a decaying "odd" stream interleaved with a uniform "even" one).  Use
+  :func:`echo_layer` (which reads the layer's declared length from the grammar)
+  and publish ``UINT16``.  Taking the last layer here (the GCV-10 rule) yields a
+  washed-out low-res/AGC display layer -- the original "looks wrong in rqt" bug.
 
 Neither a frequency nor a usable per-ping timestamp is carried in the imagery
 sub-header, so the driver takes frequency from configuration and stamps pings
@@ -152,35 +153,27 @@ def marker_temperature_c(payload):
     return value if math.isfinite(value) else None
 
 
-# Render-layer header signatures (little-endian sample pairs).
-FH = bytes([218, 4, 216, 4])    # da 04 d8 04  full-packet first-layer header
-FHS = bytes([242, 3, 240, 3])   # f2 03 f0 03  short-packet first-layer header
-SH = bytes([174, 2, 172, 2])    # ae 02 ac 02  full-packet later-layer header
-SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01  short-packet later-layer header
+# Render-layer "signatures" -- NOT magic. A render layer is a length-delimited
+# field in the eb07 tagged-record grammar (see docs/gcv_protocol.md section 3 and
+# :func:`echo_layer`):  ``<tag, L=7> <LEB128 field length> <LEB128 sample-byte
+# count> <samples>``. The four byte sequences below are just the (length, count)
+# LEB128 pair as it reads when a layer is a given size -- they look constant only
+# because the per-packet sample count was constant in the reference captures
+# (decode them as varints: ``da 04`` = 602, ``d8 04`` = 600, etc.). They survive
+# solely as a coarse layer-presence / generation heuristic for
+# :func:`generation_from_layers` and :func:`dark_layer`; the GCV-20 echo
+# extractor reads the field length from the grammar instead of matching them
+# (the old magic+trailer search regressed when the record counter's high byte was
+# 0x43 -- issue #26).
+#   FH  da 04 d8 04 -> length 602, count 600  (full first layer)
+#   FHS f2 03 f0 03 -> length 498, count 496  (short first layer)
+#   SH  ae 02 ac 02 -> length 302, count 300  (full later layer)
+#   SHS fa 01 f8 01 -> length 250, count 248  (short later layer)
+FH = bytes([218, 4, 216, 4])    # da 04 d8 04
+FHS = bytes([242, 3, 240, 3])   # f2 03 f0 03
+SH = bytes([174, 2, 172, 2])    # ae 02 ac 02
+SHS = bytes([250, 1, 248, 1])   # fa 01 f8 01
 
-# Each GCV-20 first-layer sample block ends with a fixed trailer record the
-# device appends before the next layer header (side-scan) or end of packet
-# (down-look):  ``43 <id> <opener> | <op>[seq] | 52 80 10 | 5b <crc…>``.  The
-# sample length is *delimited* by this trailer, not length-prefixed -- the eb07
-# LE-length at offset 4 covers the whole payload, and the FH/SH headers are
-# fixed magic (identical on every packet regardless of size), so neither yields
-# the sample-region length.  We locate the trailer by its fixed inner magic and
-# cut the samples at the ``0x43`` record opener, rather than assume a fixed
-# sample count (which varies with range / firmware / generation).  Left
-# undecoded, the trailer reads back as constant bright lines at every
-# packet-concatenation boundary in the waterfall (issue #26).
-#
-# The bytes between the ``0x43`` opener and the ``52 80 10`` magic vary by
-# firmware (an early bench capture had ``96 03``; the 2026-06-10 GCV-20 wet
-# capture has ``e6 24``) and the trailer appears on BOTH the down-look and
-# side-scan first layers.  So we anchor only on the two invariants -- the
-# ``0x43`` opener and the ``52 80 10`` magic ~6 bytes later -- not the variable
-# middle.  Keying on ``96 03`` alone (the old rule) left the trailer in place on
-# this firmware, which is exactly the residual banding seen in the waterfall.
-TRAILER_MAGIC = b'\x52\x80\x10'      # fixed inner magic of the trailer record
-TRAILER_OPENER_BYTE = 0x43           # '43 <id>…' record-opener byte
-TRAILER_OPENER_SPAN = 10             # opener sits within this many bytes before the magic
-TRAILER_TAIL_WINDOW = 24             # trailer sits within this many bytes of the end
 # The first packet of a scan line begins with a per-ping header: one 16-bit
 # value repeated for a device-chosen run before the samples (reads back as the
 # bright near-range band).  Detected by value-repeat (length not hard-coded) and
@@ -196,6 +189,11 @@ CHANNEL_OFFSET = 12
 # identifiable intrinsically, independent of channel number or packet size.
 LAYER_OFFSET = 8
 WATER_COLUMN_LAYER = 0x0d
+# The tagged-record fields begin right after the beam byte at LAYER_OFFSET; the
+# record opens ``01 03 09 <channel>`` (field0=3, field1=channel) -- see
+# :func:`parse_subheader` and :func:`_first_render_layer`.
+RECORD_START = LAYER_OFFSET + 1
+SUBHEADER_OPENER = b'\x01\x03\x09'
 MIN_DATA_LEN = 32               # below this an eb07 payload has no sample data
 # A real scan line is ~2048 bins; cap the accumulator so a degenerate stream
 # (one channel forever, no markers) can't grow it without bound.
@@ -241,31 +239,6 @@ def dark_layer(payload):
     return payload[i + 4:]
 
 
-def strip_first_layer_trailer(layer):
-    """
-    Drop the per-packet trailer record the GCV-20 appends after the echo samples.
-
-    The trailer is delimited, not length-prefixed: ``43 <id> … 52 80 10 …``.
-    Find its fixed magic near the end, then the ``0x43`` record opener within a
-    few bytes before it (so sample data that coincidentally contains ``52 80 10``
-    elsewhere can't trigger a cut), and return the bytes before the opener.
-    Returns ``layer`` unchanged when no trailer is present (older captures,
-    synthetic packets), so the delimiter -- not a hard-coded length -- bounds the
-    sample region.
-    """
-    m = layer.rfind(TRAILER_MAGIC)
-    if m < 0 or m < len(layer) - TRAILER_TAIL_WINDOW:
-        return layer
-    # The record opens with 0x43 a handful of bytes before the magic (the bytes
-    # between vary by firmware -- see the module comment). The opener is the
-    # rightmost 0x43 in that span; an earlier coincidental 0x43 in real samples
-    # is left intact.
-    opener = layer.rfind(TRAILER_OPENER_BYTE, max(0, m - TRAILER_OPENER_SPAN), m)
-    if opener < 0:
-        return layer
-    return layer[:opener]
-
-
 def strip_leading_ping_header(block):
     """
     Drop the per-ping header that opens the first packet of a GCV-20 scan line.
@@ -285,35 +258,64 @@ def strip_leading_ping_header(block):
     return block[n:] if n >= LEADING_RUN_MIN_BYTES else block
 
 
+def _first_render_layer(payload):
+    """
+    Return the first render layer's sample bytes from an eb07 payload, or ``b''``.
+
+    The eb07 payload is a tagged-record stream (docs/gcv_protocol.md section 3):
+    each field is ``<tag = (field# << 3) | L>``, with an inline L-byte LEB128
+    value for ``L = 1..6`` and, for ``L = 7``, an explicit LEB128 length followed
+    by that many value bytes.  The render layers are the ``L = 7``
+    (length-delimited) fields; the first one is the high-resolution echo.  Its
+    value is ``<LEB128 sample-byte count> <samples>``, so the sample region is
+    bounded by the field's own declared length -- no trailer search, no magic, no
+    hard-coded size.  The records the driver once mistook for an appended
+    "trailer" (the record counter / offset / ``52 80 10`` / range echo, issue
+    #26) are simply the fields *between* this layer field and the next; reading
+    the length never reaches them, so they can no longer leak a bright residual
+    sample into the waterfall.
+
+    Walks tag length-classes only (the low 3 bits), so it is independent of the
+    field numbers and of the per-packet sample count.
+    """
+    if (payload[:2] != EB07 or len(payload) <= MIN_DATA_LEN
+            or payload[RECORD_START:RECORD_START + 3] != SUBHEADER_OPENER):
+        return b''
+    i = RECORD_START
+    n = len(payload)
+    while i < n:
+        length_class = payload[i] & 0x07
+        i += 1
+        if length_class <= 6:                       # inline LEB128 value
+            i += length_class
+            continue
+        field_len, i = decode_leb128(payload, i)    # L == 7: explicit length
+        if field_len is None or i + field_len > n:
+            return b''
+        value = payload[i:i + field_len]
+        count, off = decode_leb128(value, 0)        # value = <count> <samples>
+        if count is None or off + count > len(value):
+            return b''
+        return value[off:off + count]
+    return b''
+
+
 def echo_layer(payload):
     """
     Return the GCV-20 16-bit echo from one eb07 payload as raw uint16-LE bytes.
 
-    The first (``fh``/``fhs``) render layer -- the bytes from the first-layer
-    header + 4 up to the next ``sh``/``shs`` (or end of packet if absent, as on
-    down-look) -- is an array of little-endian uint16 samples: the smooth high
-    byte is the echo MSB, the noisy low byte its LSB (so a per-byte view shows a
-    decaying odd stream interleaved with a uniform even stream).  Returned as-is
-    so the caller can publish ``DTYPE_UINT16``; trimmed to a whole number of
-    samples so the per-packet concatenation can't straddle a sample across the
-    packet boundary (the layer length varies, sometimes odd).  Taking only the
-    high byte would be a correct but 8-bit-truncated view.  Returns ``b''`` if
-    no first-layer header is present.
+    The echo is the first render layer (see :func:`_first_render_layer`): an
+    array of little-endian uint16 samples -- the smooth high byte is the echo
+    MSB, the noisy low byte its LSB.  The layer length is read from the grammar,
+    so nothing downstream of the samples (the record counter, range echo, or the
+    next layer) can leak in -- the source of the per-packet bright lines in issue
+    #26.  Trimmed to a whole number of samples (the count is occasionally odd) so
+    the per-packet concatenation can't straddle a uint16 across the boundary, and
+    returned for the caller to publish as ``DTYPE_UINT16``.  Returns ``b''`` when
+    the payload carries no render layer.
     """
-    # Search past the fixed prefix/sub-header so a coincidental signature byte
-    # pattern in the eb07 magic / length / sub-header can't shift the start.
-    f = payload.find(FH, CHANNEL_OFFSET)
-    if f < 0:
-        f = payload.find(FHS, CHANNEL_OFFSET)
-    if f < 0:
-        return b''
-    # The first layer ends at the next layer header of EITHER form -- a full
-    # first layer can be followed by a short later header (and vice versa), so
-    # don't couple the terminator to the opener type.
-    ends = [p for p in (payload.find(SH, f + 4), payload.find(SHS, f + 4)) if p >= 0]
-    s = min(ends) if ends else len(payload)
-    first = strip_first_layer_trailer(payload[f + 4:s])
-    return first[:len(first) // 2 * 2]
+    samples = _first_render_layer(payload)
+    return samples[:len(samples) // 2 * 2]
 
 
 def is_water_column(payload):
