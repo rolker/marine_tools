@@ -24,6 +24,7 @@ decodes and the structural analysis here come from the wet captures below.
 | 2026-06-05/09 GCV-20 bench/wet | imagery | GCV-20 echo layer, trailer fix (#26), fixtures |
 | `bag_2026-06-10T15.54.41` | all 4 streams, 20 min, **2 Cod Rock auto-range transitions**, M3 in same bag | sub-header varints (M3-validated), status/config decode, auto-range behavior |
 | `bag_2026-06-11T15.35.08` | all 4 streams, 30 min | independent re-verification sweep: envelope 100%, rates/lengths, d807 channel tag, rare status sub-types |
+| `bag_2026-06-15T14.59.41` (Lake Massabesic survey) | all 4 streams, 20 min, 2 auto-range transitions | render layers are length-delimited fields; `#26` regression (record-counter high byte `0x43` → `rfind(0x43)` residual); `gcv20_counter43_pings.bin` fixture |
 
 ---
 
@@ -181,8 +182,9 @@ backstops a dropped delimiter (the stream cycles channels). See issue #37.
 Side-scan and down-look sample packets; a scan line is reassembled from a run
 of same-channel packets bracketed by `d807` markers. The render-layer model
 (per-generation echo extraction, GCV-10 "dark layer" vs GCV-20 16-bit first
-layer, trailer/leading-header stripping) was reverse-engineered by **Dan
-Tauriello** and is fully documented and unit-tested in **`decode.py`** — refer
+layer) was reverse-engineered by **Dan Tauriello**; the render layers are
+length-delimited fields of the record grammar (see "Render layers are
+length-delimited fields" below), fully unit-tested in **`decode.py`** — refer
 there for the authoritative layout. Key sub-header bytes (full-frame offsets,
 after the 8-byte envelope):
 
@@ -208,7 +210,7 @@ field3  (tag 0x19):    value 0 in imagery frames (the channel in d807 markers)
 field4  (tag 0x20|L):  v2  DISPLAY RANGE  (this channel's scan extent)
 field5  (tag 0x28|L):  v3  ~64–100 mm     (near-field / start range?; corr 0.94; meaning TBD)
 field6  (tag 0x31):    value 2
-3f  da 04 d8 04        FH header → samples begin
+field7  (tag 0x3f, L=7):  RENDER LAYER 1 — length-delimited (see below)
 ```
 
 - **v1 = measured bottom range**, per ping, **shared across all channels**
@@ -233,6 +235,48 @@ field6  (tag 0x31):    value 2
 
 `n_bins` (~2034) is **not** a range control — its short values
 (848/1148/1500/1748 ≈ 2034 − N×309) are dropped-packet assembly artifacts.
+
+#### Render layers are length-delimited fields (no magic, no trailer)
+
+The render layers continue the **same tagged-record grammar** (§3.A) — they are
+`L=7` (length-delimited) fields. There is **no separate "trailer" and no
+sample-region search**: a layer's byte length is declared inline. Walking the
+grammar from offset 9 consumes a real packet **exactly to the envelope end**
+(verified on the 2026-06-15 bag and both fixtures), e.g. a GCV-20 side-scan
+packet:
+
+```
+field7   tag 3f  L=7  len=602  value = <LEB 600><600 sample bytes>   render layer 1 (16-bit echo)
+field8   tag 43       3 bytes  = device record counter (monotonic, +1 per scan line)
+field9   tag 4a       1–2 B    = packet's cumulative sample offset within the line
+field10  tag 52       2 bytes  = 80 10  (a constant)
+field11  tag 5a       2 bytes  = per-ping range echo (≈ field2 range)
+field12  tag 67  L=7  len=302  value = <LEB 300><300 sample bytes>   render layer 2 (lower-res)
+field13  tag 6b       3 bytes  = closing record
+```
+
+So the bytes `decode.py` once treated as **fixed magic** are the layer's LEB128
+**length** pair: `da 04 d8 04` decodes as varints `602` (field length) then
+`600` (inner sample-byte count); `f2 03 f0 03` → `498`/`496`; `ae 02 ac 02`
+(later layer) → `302`/`300`. They were constant only because the per-packet
+sample count was constant in the early captures — a different range/firmware
+emits a different length, which the old magic match would miss.
+
+The records once treated as an **appended "trailer"** (`43 … 4a … 52 80 10 …`)
+are simply **fields 8–11 between the two layer fields** — not part of the
+samples. `echo_layer` reads `field7`'s declared length and returns exactly its
+samples; the GCV-10 (`dark_layer`) path is unchanged (its high-res "dark" layer
+is the last layer, bounded by the packet end).
+
+> **Regression history (issue #26).** The original fix searched for the layer
+> end: `rfind(52 80 10)` then `rfind(0x43)` for the trailer opener. But field8's
+> 3-byte value is the **record counter**, whose high byte is `0x43` for ~65,536
+> consecutive records (~33 min). When it is, `rfind(0x43)` locks onto that inner
+> byte instead of the true opener and leaves a bright `0x__43` residual sample at
+> **every** packet-concatenation boundary — the comb of vertical lines seen for
+> the first ~6.5 min of the 2026-06-15 Lake Massabesic survey, which cleared on
+> its own when the counter rolled `0x43FFFF → 0x44xxxx`. Reading the field length
+> removes the search (and the bug) entirely.
 
 #### Distinguishing the beams (down / port / starboard)
 
