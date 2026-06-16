@@ -191,6 +191,24 @@ def parse_datagram(p: bytes) -> Optional[dict]:
     return {'type': dg}  # recognised but not decoded
 
 
+def frame_all_record(payload: bytes) -> bytes:
+    """
+    Frame one datagram payload as a record in a genuine Kongsberg ``.all`` file.
+
+    On-disk ``.all`` framing (EM Datagram Formats 850-160692): each datagram is
+    preceded by a 4-byte little-endian length giving the number of bytes in the
+    datagram -- i.e. STX through the checksum inclusive, which is exactly the
+    UDP payload as received. Files written this way load in Caris HIPS, QPS
+    Qimera, MB-System, etc.
+
+    This is deliberately NOT the framing used by :func:`iter_datagrams` /
+    ``replay`` (a *big-endian* length, the throwaway capture format from the
+    ``m3_udp_capture.py`` dev tool). Saved ``.all`` files are interoperable with
+    hydrographic software but are not replayable by the in-repo ``replay`` tool.
+    """
+    return struct.pack('<I', len(payload)) + payload
+
+
 def iter_datagrams(buf: bytes) -> Iterator[bytes]:
     """
     Yield raw datagram payloads from a length-framed capture file.
