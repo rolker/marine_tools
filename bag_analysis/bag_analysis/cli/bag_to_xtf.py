@@ -101,6 +101,16 @@ def _build_parser() -> argparse.ArgumentParser:
               'stamp before the ping is dropped as un-georeferenceable'),
     )
     p.add_argument(
+        '--start-time', default=None,
+        help=('Skip pings before this time. Accepts epoch seconds or an '
+              'ISO-8601 UTC timestamp (e.g. 2026-06-15T16:26:49). Use to '
+              'trim dock idle from the start of a survey.'),
+    )
+    p.add_argument(
+        '--end-time', default=None,
+        help='Skip pings after this time (same formats as --start-time).',
+    )
+    p.add_argument(
         '--tf-cache', type=float, default=600.0,
         help='TF buffer cache length in seconds',
     )
@@ -142,6 +152,26 @@ def _ping_geometry(msg, n_samples: int) -> tuple[float, float, float, float]:
 def _stamp_ns(stamp) -> int:
     """Nanoseconds since epoch from a builtin_interfaces/Time stamp."""
     return stamp.sec * _NS_PER_S + stamp.nanosec
+
+
+def _parse_time(value):
+    """
+    Parse a CLI time to epoch nanoseconds, or None if not given.
+
+    Accepts either epoch seconds (e.g. ``1750000000``) or an ISO-8601
+    timestamp (e.g. ``2026-06-15T16:26:49``); a naive ISO time is read
+    as UTC.
+    """
+    if value is None:
+        return None
+    try:
+        return int(float(value) * 1e9)
+    except ValueError:
+        pass
+    parsed = _dt.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return int(parsed.timestamp() * 1e9)
 
 
 def _lookup_pose(buffer, frame, earth_frame, stamp, max_tf_age_ns):
@@ -216,6 +246,8 @@ def _convert(args, stream, counts) -> int:
     ]
     max_tf_age_ns = int(args.max_tf_age * _NS_PER_S)
     pair_tol_ns = args.pair_tolerance * _NS_PER_S
+    start_ns = _parse_time(args.start_time)
+    end_ns = _parse_time(args.end_time)
 
     writer = XtfWriter(stream, sonar_name=args.sonar_name)
     pending: dict = {'port': None, 'starboard': None}
@@ -268,6 +300,16 @@ def _convert(args, stream, counts) -> int:
             continue
         counts[side] += 1
 
+        # Time-window trim (e.g. dock-out to dock-in). TF/nadir are fed
+        # regardless above; only sidescan pings are gated. The bag is
+        # time-ordered, so once past end_ns nothing more is needed.
+        eff_ns = _stamp_ns(msg.header.stamp) or t_ns
+        if start_ns is not None and eff_ns < start_ns:
+            counts['out_of_window'] += 1
+            continue
+        if end_ns is not None and eff_ns > end_ns:
+            break
+
         if float(msg.sample_rate) <= 0.0:
             counts['malformed'] += 1
             continue
@@ -311,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     counts = {
         'port': 0, 'starboard': 0, 'paired': 0, 'no_tf': 0, 'stale_tf': 0,
         'approx_tf': 0, 'malformed': 0, 'unpaired': 0, 'nadir': 0,
-        'no_altitude': 0,
+        'no_altitude': 0, 'out_of_window': 0,
     }
     # Write to a sibling .partial and rename on success, so a crash never
     # leaves a truncated file at the destination path.
@@ -342,6 +384,9 @@ def _report(output: Path, ping_count: int, counts: dict) -> None:
           f' paired={counts["paired"]}')
     print(f'  dropped: no_tf={counts["no_tf"]} stale_tf={counts["stale_tf"]} '
           f'malformed={counts["malformed"]} unpaired={counts["unpaired"]}')
+    if counts['out_of_window']:
+        print(f'  trimmed: {counts["out_of_window"]} pings outside '
+              '--start-time/--end-time window')
     if counts['approx_tf']:
         print(f'  note: {counts["approx_tf"]} pings used a latest-TF fallback '
               '(within --max-tf-age)')

@@ -7,8 +7,11 @@ age-bounded so a TF gap can't silently stamp a ping with an unrelated
 pose.
 """
 
+import datetime as _dt
+
 from bag_analysis.cli.bag_to_xtf import (
     _lookup_pose,
+    _parse_time,
     _PendingPing,
     _speed_mps,
     _stamp_ns,
@@ -24,6 +27,23 @@ _MAX_AGE_NS = 1_000_000_000  # 1 s
 
 def test_stamp_ns():
     assert _stamp_ns(TimeMsg(sec=12, nanosec=500_000_000)) == 12_500_000_000
+
+
+def test_parse_time_none():
+    assert _parse_time(None) is None
+
+
+def test_parse_time_epoch_seconds():
+    assert _parse_time('100.5') == 100_500_000_000
+
+
+def test_parse_time_iso_utc():
+    # A naive ISO time is read as UTC, so it equals the explicit-Z form.
+    expected = int(
+        _dt.datetime(2026, 6, 15, 16, 26, 49,
+                     tzinfo=_dt.timezone.utc).timestamp() * 1e9)
+    assert _parse_time('2026-06-15T16:26:49') == expected
+    assert _parse_time('2026-06-15T16:26:49Z') == expected
 
 
 def test_speed_mps_from_ecef_displacement():

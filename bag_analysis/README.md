@@ -124,11 +124,26 @@ from the latest `nadir_depth` (`sensor_msgs/Range`).
 frames** — a self-contained `bizzyboat_sonar` bag does; a sidescan-only
 `*_sidescan_raw` bag has no nav and cannot be georeferenced. The
 down-look channel is dropped (XTF is a two-channel port/starboard
-format). Key options: `--port-topic` / `--starboard-topic` /
-`--nadir-topic`, `--earth-frame` (default `earth`), `--pair-tolerance`
-(max |Δt| to pair port with starboard, default 0.25 s), and
-`--max-pings` (cap output, for quick checks). The converted samples are
-raw amplitudes, untouched by any artifact filtering.
+format). The converted samples are raw amplitudes, untouched by any
+artifact filtering.
+
+To trim dock idle from a survey, pass `--start-time` / `--end-time`
+(epoch seconds or an ISO-8601 UTC timestamp like
+`2026-06-15T16:26:49`); pings outside the window are skipped (TF is
+still consumed across the whole bag, so georeferencing is unaffected).
+A quick way to find the dock-out/dock-in times is the boat speed from
+`/bizzy/odom`. Example:
+
+```bash
+ros2 run bag_analysis bag_to_xtf --bag <bag> --output survey.xtf \
+    --start-time 2026-06-15T16:26:49 --end-time 2026-06-15T20:56:17
+```
+
+Other options: `--port-topic` / `--starboard-topic` / `--nadir-topic`,
+`--earth-frame` (default `earth`), `--pair-tolerance` (max |Δt| to pair
+port with starboard, default 0.25 s), `--max-tf-age` (drop pings whose
+only TF is older than this, default 1 s), and `--max-pings` (cap output,
+for quick checks).
 
 ## Schema
 
