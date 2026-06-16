@@ -14,7 +14,9 @@ downstream ``cube_bathymetry/detections_to_pointcloud`` node turns that into a
 TPU itself; it is purely a wire-format translator. See marine_tools#1.
 """
 
+import datetime
 import math
+import os
 import socket
 import struct
 import threading
@@ -40,12 +42,26 @@ class KongsbergEmBridge(Node):
         # iterates every element of two_way_travel_times and does NOT consult
         # flags, so invalid (twtt=0) beams would otherwise become z=0 points.
         self.declare_parameter('skip_invalid_beams', True)
+        # Directory in which to record the raw datagram stream as a genuine
+        # Kongsberg ``.all`` file (loadable by Caris/Qimera/MB-System). Empty
+        # disables recording. Each node run writes a fresh timestamped file so
+        # restarts never overwrite or interleave prior recordings.
+        self.declare_parameter('save_all_dir', '')
 
         self.frame_id = self.get_parameter('frame_id').value
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
 
         self.publisher = self.create_publisher(
             SonarDetections, 'detections', qos_profile_sensor_data)
+
+        self._save_file = self._open_save_file(
+            str(self.get_parameter('save_all_dir').value).strip())
+        self._save_count = 0
+        # Guards _save_file across the recv thread (_record) and the main
+        # thread (destroy_node). The thread join in destroy_node uses a
+        # timeout, so the recv thread can still be mid-write when shutdown
+        # closes the file -- the lock makes the None-check/write/close atomic.
+        self._save_lock = threading.Lock()
 
         addr = self.get_parameter('bind_address').value
         port = int(self.get_parameter('bind_port').value)
@@ -62,6 +78,52 @@ class KongsbergEmBridge(Node):
             f'kongsberg_em_bridge listening on {addr}:{port} (UDP), '
             f'publishing SonarDetections on "detections", frame "{self.frame_id}"')
 
+    def _open_save_file(self, save_dir):
+        """
+        Open a fresh timestamped ``.all`` file in ``save_dir``, or return None.
+
+        Returns the open binary file handle, or ``None`` if recording is
+        disabled (empty dir) or the file cannot be created -- a recording
+        failure must never stop the node from bridging live data.
+        """
+        if not save_dir:
+            return None
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            '%Y%m%d_%H%M%S')
+        path = os.path.join(save_dir, f'm3_{stamp}.all')
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            handle = open(path, 'wb')
+        except OSError as exc:
+            self.get_logger().error(
+                f'could not open .all recording {path}: {exc}; '
+                f'continuing without recording')
+            return None
+        self.get_logger().info(f'recording received datagrams to {path}')
+        return handle
+
+    def _record(self, data):
+        """Append one received datagram to the ``.all`` file, if recording."""
+        with self._save_lock:
+            if self._save_file is None:
+                return
+            try:
+                self._save_file.write(em.frame_all_record(data))
+                self._save_file.flush()
+                self._save_count += 1
+            except (OSError, ValueError) as exc:
+                # Disable recording on write failure (e.g. disk full, or a
+                # write that lost the close/shutdown race -> "write to closed
+                # file" ValueError) rather than warn on every packet -- the
+                # live bridge must keep running.
+                self.get_logger().error(
+                    f'.all recording write failed: {exc}; recording disabled')
+                try:
+                    self._save_file.close()
+                except OSError:
+                    pass
+                self._save_file = None
+
     def destroy_node(self):
         self._running = False
         if self._thread.is_alive():
@@ -70,6 +132,15 @@ class KongsbergEmBridge(Node):
             self.sock.close()
         except OSError:
             pass
+        with self._save_lock:
+            if self._save_file is not None:
+                try:
+                    self._save_file.close()
+                except OSError:
+                    pass
+                self.get_logger().info(
+                    f'closed .all recording ({self._save_count} datagrams)')
+                self._save_file = None
         super().destroy_node()
 
     def _recv_loop(self):
@@ -80,6 +151,10 @@ class KongsbergEmBridge(Node):
                 continue
             except OSError:
                 break
+            # Record every received datagram (position, attitude, sound speed,
+            # clock, N/78, ...) before the N/78 publish filter, so the saved
+            # .all has the nav/attitude needed to georeference downstream.
+            self._record(data)
             if len(data) <= 1 or data[0] != em.STX or \
                     data[1] != em.DG_RAW_RANGE_ANGLE_78:
                 continue

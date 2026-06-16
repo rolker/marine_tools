@@ -16,6 +16,10 @@ def generate_launch_description():
         DeclareLaunchArgument('bind_port', default_value='20002'),
         DeclareLaunchArgument('frame_id', default_value='m3'),
         DeclareLaunchArgument('namespace', default_value=''),
+        DeclareLaunchArgument(
+            'save_all_dir', default_value='',
+            description='Directory to record received datagrams as a timestamped '
+                        'Kongsberg .all file; empty disables recording.'),
         Node(
             package='kongsberg_em_bridge',
             executable='kongsberg_em_bridge',
@@ -24,6 +28,7 @@ def generate_launch_description():
             parameters=[{
                 'bind_port': LaunchConfiguration('bind_port'),
                 'frame_id': LaunchConfiguration('frame_id'),
+                'save_all_dir': LaunchConfiguration('save_all_dir'),
             }],
             output='screen',
         ),

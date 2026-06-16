@@ -85,6 +85,40 @@ def test_dispatch_and_iter_framing():
     assert em.parse_datagram(payloads[1])['type'] == em.DG_ATTITUDE
 
 
+def test_frame_all_record_little_endian():
+    # Genuine .all framing is a little-endian length prefix == len(payload).
+    payload = bytes([em.STX, em.DG_ATTITUDE]) + b'\xaa\xbb\xcc'
+    rec = em.frame_all_record(payload)
+    assert rec == struct.pack('<I', len(payload)) + payload
+    assert struct.unpack_from('<I', rec, 0)[0] == len(payload)
+    assert rec[4:] == payload
+
+
+def test_frame_all_record_distinct_from_big_endian_capture():
+    # The saved .all length is little-endian and must differ from the repo's
+    # big-endian capture framing for any non-byte-symmetric length.
+    payload = b'\x02\x41' + b'\x00' * 258  # len 260 -> 0x0104, asymmetric
+    assert em.frame_all_record(payload)[:4] == struct.pack('<I', len(payload))
+    assert struct.pack('<I', len(payload)) != struct.pack('>I', len(payload))
+
+
+def test_frame_all_record_roundtrips_with_le_reader():
+    # A minimal little-endian reader recovers the original datagrams, proving
+    # the saved file is parseable as a real .all stream.
+    dg = _build_n78([(0.0, 0x00, 0.0125, -25.0)])
+    aux = bytes([em.STX, em.DG_POSITION]) + b'\x01\x02\x03'
+    blob = em.frame_all_record(dg) + em.frame_all_record(aux)
+    recovered = []
+    i = 0
+    while i + 4 <= len(blob):
+        (ln,) = struct.unpack_from('<I', blob, i)
+        i += 4
+        recovered.append(blob[i:i + ln])
+        i += ln
+    assert recovered == [dg, aux]
+    assert em.parse_datagram(recovered[0])['type'] == em.DG_RAW_RANGE_ANGLE_78
+
+
 def test_em_time_to_unix():
     assert em.em_time_to_unix(0, 0) is None
     assert em.em_time_to_unix(20260604, 86_400_000) is None  # time_ms out of range
