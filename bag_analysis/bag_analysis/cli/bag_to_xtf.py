@@ -16,6 +16,11 @@ The bag must contain the TF chain from ``earth`` down to the sidescan
 sensor frames (a self-contained ``bizzyboat_sonar`` bag does); a
 sidescan-only ``*_sidescan_raw`` bag has no nav and cannot be
 georeferenced.
+
+The output is written to a ``.partial`` sibling and atomically renamed
+into place only after a clean run, so a crash mid-stream never leaves a
+truncated-but-valid-looking XTF behind. A run that writes zero pings
+(wrong topics, no nav, all-malformed) exits non-zero.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ from ..reader import iter_messages
 from ..xtf.geo import ecef_pose_to_geo
 from ..xtf.writer import ChannelPing, XtfWriter
 
-# marine_acoustic_msgs/SonarImageData.dtype -> (numpy base type, is_signed).
+# marine_acoustic_msgs/SonarImageData.dtype -> numpy base type.
 _DTYPE_MAP = {
     0: np.uint8, 1: np.int8, 2: np.uint16, 3: np.int16,
     4: np.uint32, 5: np.int32, 6: np.uint64, 7: np.int64,
@@ -45,18 +50,20 @@ _DEFAULT_PORT = '/bizzy/sensors/sidescan/garmin_sidescan/sonar_image_port'
 _DEFAULT_STBD = '/bizzy/sensors/sidescan/garmin_sidescan/sonar_image_starboard'
 _DEFAULT_NADIR = '/bizzy/sensors/sidescan/garmin_sidescan/nadir_depth'
 _DEFAULT_SOUND_SPEED = 1500.0
+_NS_PER_S = 1_000_000_000
 
 
 class _PendingPing:
     """A georeferenced single-channel ping awaiting its counterpart."""
 
     __slots__ = (
-        't_ns', 'time', 'lat', 'lon', 'alt', 'heading', 'pitch', 'roll',
+        't_ns', 'time', 'lat', 'lon', 'heading', 'pitch', 'roll',
         'ecef', 'samples', 'slant_range', 'frequency', 'time_delay',
         'time_duration', 'sound_velocity',
     )
 
     def __init__(self, **kw) -> None:
+        """Populate slots from keyword arguments."""
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -86,7 +93,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         '--pair-tolerance', type=float, default=0.25,
-        help='Max |dt| (s) to pair a port ping with a starboard ping',
+        help='Max |dt| (s) on header stamps to pair port with starboard',
+    )
+    p.add_argument(
+        '--max-tf-age', type=float, default=1.0,
+        help=('Max age (s) of a fallback "latest" TF relative to the ping '
+              'stamp before the ping is dropped as un-georeferenceable'),
     )
     p.add_argument(
         '--tf-cache', type=float, default=600.0,
@@ -118,8 +130,6 @@ def _ping_geometry(msg, n_samples: int) -> tuple[float, float, float, float]:
     """Return (slant_range_m, time_delay_s, time_duration_s, sound_speed)."""
     sound_speed = msg.ping_info.sound_speed or _DEFAULT_SOUND_SPEED
     fs = float(msg.sample_rate)
-    if fs <= 0.0:
-        return 0.0, 0.0, 0.0, sound_speed
     sample0 = int(msg.sample0)
     # Range to the last sample; the near-field gate (sample0) shifts the
     # window away from the transducer, so it must be included.
@@ -129,32 +139,60 @@ def _ping_geometry(msg, n_samples: int) -> tuple[float, float, float, float]:
     return slant_range, time_delay, time_duration, sound_speed
 
 
-def _lookup_pose(buffer: Buffer, frame: str, earth_frame: str, stamp):
+def _stamp_ns(stamp) -> int:
+    """Nanoseconds since epoch from a builtin_interfaces/Time stamp."""
+    return stamp.sec * _NS_PER_S + stamp.nanosec
+
+
+def _lookup_pose(buffer, frame, earth_frame, stamp, max_tf_age_ns):
     """
-    Look up earth->frame, preferring the ping stamp, falling back to latest.
+    Look up earth->frame at the ping stamp, with a bounded latest fallback.
 
-    Returns (translation_xyz, quaternion_xyzw) or None if unavailable.
+    Returns ``(pose, status)`` where ``pose`` is
+    ``((x, y, z), (qx, qy, qz, qw))`` or ``None``, and ``status`` is one
+    of ``'exact'`` (stamped lookup), ``'approx'`` (fell back to the
+    latest transform, within ``max_tf_age_ns``), ``'stale'`` (latest
+    transform too old -> dropped), or ``'missing'`` (no transform at
+    all). A bounded fallback prevents silently stamping a ping with a
+    pose from an unrelated time when TF has a gap.
     """
-    for query_time in (rclpy.time.Time.from_msg(stamp), rclpy.time.Time()):
-        try:
-            tf = buffer.lookup_transform(earth_frame, frame, query_time)
-        except TransformException:
-            continue
-        t = tf.transform.translation
-        q = tf.transform.rotation
-        return (t.x, t.y, t.z), (q.x, q.y, q.z, q.w)
-    return None
+    try:
+        tf = buffer.lookup_transform(
+            earth_frame, frame, rclpy.time.Time.from_msg(stamp))
+        return _pose_from_tf(tf), 'exact'
+    except TransformException:
+        pass
+    try:
+        tf = buffer.lookup_transform(earth_frame, frame, rclpy.time.Time())
+    except TransformException:
+        return None, 'missing'
+    ping_ns = _stamp_ns(stamp)
+    age = abs(ping_ns - _stamp_ns(tf.header.stamp))
+    if ping_ns > 0 and age > max_tf_age_ns:
+        return None, 'stale'
+    return _pose_from_tf(tf), 'approx'
 
 
-def _make_pending(msg, t_ns, pose, altitude) -> _PendingPing:
+def _pose_from_tf(tf):
+    """Extract ((x, y, z), (qx, qy, qz, qw)) from a TransformStamped."""
+    t = tf.transform.translation
+    q = tf.transform.rotation
+    return (t.x, t.y, t.z), (q.x, q.y, q.z, q.w)
+
+
+def _make_pending(msg, bag_t_ns, pose) -> _PendingPing:
+    """Build a georeferenced pending ping from a RawSonarImage + TF pose."""
     samples = _decode_samples(msg)
     slant_range, time_delay, time_duration, sound_speed = _ping_geometry(
         msg, samples.size)
-    lat, lon, alt, heading, pitch, roll = ecef_pose_to_geo(pose[0], pose[1])
+    lat, lon, _alt, heading, pitch, roll = ecef_pose_to_geo(pose[0], pose[1])
+    # Prefer the acquisition stamp; fall back to bag-receive time only if
+    # the driver left the header unstamped.
+    stamp_ns = _stamp_ns(msg.header.stamp) or bag_t_ns
     return _PendingPing(
-        t_ns=t_ns,
-        time=_dt.datetime.fromtimestamp(t_ns / 1e9, tz=_dt.timezone.utc),
-        lat=lat, lon=lon, alt=alt, heading=heading, pitch=pitch, roll=roll,
+        t_ns=stamp_ns,
+        time=_dt.datetime.fromtimestamp(stamp_ns / 1e9, tz=_dt.timezone.utc),
+        lat=lat, lon=lon, heading=heading, pitch=pitch, roll=roll,
         ecef=np.array(pose[0]), samples=samples, slant_range=slant_range,
         frequency=msg.ping_info.frequency, time_delay=time_delay,
         time_duration=time_duration, sound_velocity=sound_speed,
@@ -169,6 +207,99 @@ def _speed_mps(a: _PendingPing, b: _PendingPing) -> float:
     return float(np.linalg.norm(a.ecef - b.ecef) / dt)
 
 
+def _convert(args, stream, counts) -> int:
+    """Run the read/georeference/pair/write loop; return pings written."""
+    buffer = Buffer(cache_time=Duration(seconds=args.tf_cache))
+    topics = [
+        '/tf', '/tf_static', args.port_topic, args.starboard_topic,
+        args.nadir_topic,
+    ]
+    max_tf_age_ns = int(args.max_tf_age * _NS_PER_S)
+    pair_tol_ns = args.pair_tolerance * _NS_PER_S
+
+    writer = XtfWriter(stream, sonar_name=args.sonar_name)
+    pending: dict = {'port': None, 'starboard': None}
+    latest_altitude = None
+    prev_emitted = None
+
+    def emit(port: _PendingPing, stbd: _PendingPing) -> None:
+        nonlocal prev_emitted
+        speed = _speed_mps(prev_emitted, port) if prev_emitted else 0.0
+        if latest_altitude is None:
+            counts['no_altitude'] += 1
+        writer.write_ping(
+            time=port.time, ping_number=writer.ping_count,
+            latitude_deg=port.lat, longitude_deg=port.lon,
+            sensor_depth_m=0.0, altitude_m=latest_altitude or 0.0,
+            heading_deg=port.heading, pitch_deg=port.pitch,
+            roll_deg=port.roll, speed_mps=speed,
+            sound_velocity_mps=port.sound_velocity,
+            port=ChannelPing(
+                samples=port.samples, slant_range_m=port.slant_range,
+                frequency_hz=port.frequency, time_delay_s=port.time_delay,
+                time_duration_s=port.time_duration),
+            starboard=ChannelPing(
+                samples=stbd.samples, slant_range_m=stbd.slant_range,
+                frequency_hz=stbd.frequency, time_delay_s=stbd.time_delay,
+                time_duration_s=stbd.time_duration),
+        )
+        counts['paired'] += 1
+        prev_emitted = port
+
+    for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
+        if topic == '/tf':
+            for tr in msg.transforms:
+                buffer.set_transform(tr, 'bag_to_xtf')
+            continue
+        if topic == '/tf_static':
+            for tr in msg.transforms:
+                buffer.set_transform_static(tr, 'bag_to_xtf')
+            continue
+        if topic == args.nadir_topic:
+            latest_altitude = float(msg.range)
+            counts['nadir'] += 1
+            continue
+
+        if topic == args.port_topic:
+            side = 'port'
+        elif topic == args.starboard_topic:
+            side = 'starboard'
+        else:
+            continue
+        counts[side] += 1
+
+        if float(msg.sample_rate) <= 0.0:
+            counts['malformed'] += 1
+            continue
+
+        pose, status = _lookup_pose(
+            buffer, msg.header.frame_id, args.earth_frame,
+            msg.header.stamp, max_tf_age_ns)
+        if pose is None:
+            counts['no_tf' if status == 'missing' else 'stale_tf'] += 1
+            continue
+        if status == 'approx':
+            counts['approx_tf'] += 1
+        ping = _make_pending(msg, t_ns, pose)
+
+        other = 'starboard' if side == 'port' else 'port'
+        mate = pending[other]
+        if mate is not None and abs(ping.t_ns - mate.t_ns) <= pair_tol_ns:
+            port, stbd = (ping, mate) if side == 'port' else (mate, ping)
+            emit(port, stbd)
+            pending['port'] = pending['starboard'] = None
+        else:
+            if pending[side] is not None:
+                counts['unpaired'] += 1  # discarded; mate never arrived
+            pending[side] = ping
+
+        if args.max_pings is not None and writer.ping_count >= args.max_pings:
+            break
+
+    counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
+    return writer.ping_count
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``bag_to_xtf`` console script."""
     args = _build_parser().parse_args(argv)
@@ -177,101 +308,49 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    buffer = Buffer(cache_time=Duration(seconds=args.tf_cache))
-    topics = [
-        '/tf', '/tf_static', args.port_topic, args.starboard_topic,
-        args.nadir_topic,
-    ]
+    counts = {
+        'port': 0, 'starboard': 0, 'paired': 0, 'no_tf': 0, 'stale_tf': 0,
+        'approx_tf': 0, 'malformed': 0, 'unpaired': 0, 'nadir': 0,
+        'no_altitude': 0,
+    }
+    # Write to a sibling .partial and rename on success, so a crash never
+    # leaves a truncated file at the destination path.
+    partial = args.output.with_name(args.output.name + '.partial')
+    try:
+        with open(partial, 'wb') as stream:
+            ping_count = _convert(args, stream, counts)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
-    pending: dict[str, _PendingPing] = {'port': None, 'starboard': None}
-    latest_altitude = 0.0
-    prev_emitted: _PendingPing | None = None
-    counts = {'port': 0, 'starboard': 0, 'paired': 0,
-              'no_tf': 0, 'unpaired': 0}
+    if ping_count == 0:
+        partial.unlink(missing_ok=True)
+        print('error: no pings written (check topics, nav/TF, sample_rate)',
+              file=sys.stderr)
+        _report(args.output, ping_count, counts)
+        return 1
 
-    with open(args.output, 'wb') as stream:
-        writer = XtfWriter(stream, sonar_name=args.sonar_name)
-
-        def emit(port: _PendingPing, stbd: _PendingPing) -> None:
-            nonlocal prev_emitted
-            speed = _speed_mps(prev_emitted, port) if prev_emitted else 0.0
-            writer.write_ping(
-                time=port.time,
-                ping_number=writer.ping_count,
-                latitude_deg=port.lat, longitude_deg=port.lon,
-                sensor_depth_m=0.0, altitude_m=latest_altitude,
-                heading_deg=port.heading, pitch_deg=port.pitch,
-                roll_deg=port.roll, speed_mps=speed,
-                sound_velocity_mps=port.sound_velocity,
-                port=ChannelPing(
-                    samples=port.samples, slant_range_m=port.slant_range,
-                    frequency_hz=port.frequency,
-                    time_delay_s=port.time_delay,
-                    time_duration_s=port.time_duration),
-                starboard=ChannelPing(
-                    samples=stbd.samples, slant_range_m=stbd.slant_range,
-                    frequency_hz=stbd.frequency,
-                    time_delay_s=stbd.time_delay,
-                    time_duration_s=stbd.time_duration),
-            )
-            counts['paired'] += 1
-            prev_emitted = port
-
-        for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
-            if topic == '/tf':
-                for tr in msg.transforms:
-                    buffer.set_transform(tr, 'bag_to_xtf')
-                continue
-            if topic == '/tf_static':
-                for tr in msg.transforms:
-                    buffer.set_transform_static(tr, 'bag_to_xtf')
-                continue
-            if topic == args.nadir_topic:
-                latest_altitude = float(msg.range)
-                continue
-
-            if topic == args.port_topic:
-                side = 'port'
-            elif topic == args.starboard_topic:
-                side = 'starboard'
-            else:
-                continue
-            counts[side] += 1
-
-            pose = _lookup_pose(
-                buffer, msg.header.frame_id, args.earth_frame,
-                msg.header.stamp)
-            if pose is None:
-                counts['no_tf'] += 1
-                continue
-            ping = _make_pending(msg, t_ns, pose, latest_altitude)
-
-            other = 'starboard' if side == 'port' else 'port'
-            mate = pending[other]
-            if mate is not None and abs(ping.t_ns - mate.t_ns) <= (
-                    args.pair_tolerance * 1e9):
-                port, stbd = (ping, mate) if side == 'port' else (mate, ping)
-                emit(port, stbd)
-                pending['port'] = pending['starboard'] = None
-            else:
-                if pending[side] is not None:
-                    counts['unpaired'] += 1
-                pending[side] = ping
-
-            if args.max_pings is not None and \
-                    writer.ping_count >= args.max_pings:
-                break
-
-    counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
-    _report(args.output, writer.ping_count, counts)
+    partial.replace(args.output)
+    _report(args.output, ping_count, counts)
     return 0
 
 
-def _report(output: Path, ping_count: int, counts: dict[str, int]) -> None:
+def _report(output: Path, ping_count: int, counts: dict) -> None:
+    """Print a conversion summary, including any data loss."""
     print(f'wrote {ping_count} XTF pings -> {output}')
-    print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}')
-    print(f'  paired={counts["paired"]} '
-          f'dropped_no_tf={counts["no_tf"]} unpaired={counts["unpaired"]}')
+    print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
+          f' paired={counts["paired"]}')
+    print(f'  dropped: no_tf={counts["no_tf"]} stale_tf={counts["stale_tf"]} '
+          f'malformed={counts["malformed"]} unpaired={counts["unpaired"]}')
+    if counts['approx_tf']:
+        print(f'  note: {counts["approx_tf"]} pings used a latest-TF fallback '
+              '(within --max-tf-age)')
+    if counts['nadir'] == 0:
+        print('  warning: no nadir_depth messages; altitude written as 0 for '
+              'all pings')
+    elif counts['no_altitude']:
+        print(f'  warning: {counts["no_altitude"]} pings written before the '
+              'first nadir_depth (altitude 0)')
 
 
 if __name__ == '__main__':

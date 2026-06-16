@@ -205,7 +205,10 @@ class XtfWriter:
         struct.pack_into('<f', buf, 12, float(chan.time_delay_s))
         struct.pack_into('<f', buf, 16, float(chan.time_duration_s))
         struct.pack_into('<f', buf, 20, float(chan.seconds_per_ping))
-        struct.pack_into('<H', buf, 26, int(chan.frequency_hz) & 0xFFFF)
+        # The per-ping Frequency field here is a uint16 (Hz) that cannot
+        # represent sidescan frequencies (e.g. 455 kHz), so it is left 0;
+        # the authoritative per-channel frequency lives in CHANINFO
+        # (a float) written in the file header.
         struct.pack_into('<I', buf, 42, num_samples)              # NumSamples
         return bytes(buf)
 

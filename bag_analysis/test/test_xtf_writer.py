@@ -111,6 +111,10 @@ def test_ping_packets_round_trip():
     assert list(first['channels'][0]['samples']) == [10, 20, 30, 40]
     assert list(first['channels'][1]['samples']) == [50, 60, 70, 80]
     assert first['channels'][0]['slant'] == pytest.approx(20.0)
+    # The per-ping Frequency uint16 (offset 26) can't hold sidescan
+    # frequencies, so it is deliberately left 0 rather than truncated.
+    chan0 = 1024 + 256
+    assert struct.unpack_from('<H', data, chan0 + 26)[0] == 0
 
     second = pings[1]
     assert list(second['channels'][0]['samples']) == [11, 21, 31]
