@@ -10,6 +10,10 @@
   <depend>rclpy</depend>
   <depend>rosbag2_py</depend>
   <depend>rosidl_runtime_py</depend>
+  <!-- tf2_ros: bag_to_xtf composes earth->sensor offline from the bag's
+       /tf stream to georeference each sidescan ping. -->
+  <depend>tf2_ros</depend>
+  <depend>marine_acoustic_msgs</depend>
 
   <!-- Message packages we have extractors for; types we don't extract
        (tf2_msgs, visualization_msgs, std_msgs/Header, etc.) need to be

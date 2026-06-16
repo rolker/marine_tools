@@ -97,6 +97,39 @@ than crashing the pipeline.
 `PlotResult` carries the PNG path plus a list of summary stats that
 land in `summary.md`.
 
+## Sidescan → XTF export (`bag_to_xtf`)
+
+`bag_to_xtf` converts recorded Garmin sidescan into an
+[XTF](https://en.wikipedia.org/wiki/EXtended_Triton_Format) file that
+standard survey tools read (OpenSideScan and MB-System on Linux;
+SonarWiz/Triton on Windows).
+
+```bash
+ros2 run bag_analysis bag_to_xtf \
+    --bag /path/to/bizzyboat_sonar/2026-06-15T15-03-45+00-00 \
+    --output ~/data/sidescan/2026-06-15.xtf
+```
+
+It reads the port and starboard `marine_acoustic_msgs/RawSonarImage`
+channels, pairs them per ping, and writes a two-channel (port/starboard)
+XTF. Each ping is georeferenced by composing the bag's TF tree offline
+and looking up `earth → <ping frame_id>`; since `earth` is the ECEF
+frame, that yields the transducer's true lat/lon plus heading/pitch/roll
+relative to local north. Slant range comes from the ping geometry
+(`(sample0 + n_samples) · sound_speed / (2 · sample_rate)`), so the
+near-field gate (`sample0`) is included. Altitude-above-bottom is taken
+from the latest `nadir_depth` (`sensor_msgs/Range`).
+
+**The bag must contain the full TF chain from `earth` to the sidescan
+frames** — a self-contained `bizzyboat_sonar` bag does; a sidescan-only
+`*_sidescan_raw` bag has no nav and cannot be georeferenced. The
+down-look channel is dropped (XTF is a two-channel port/starboard
+format). Key options: `--port-topic` / `--starboard-topic` /
+`--nadir-topic`, `--earth-frame` (default `earth`), `--pair-tolerance`
+(max |Δt| to pair port with starboard, default 0.25 s), and
+`--max-pings` (cap output, for quick checks). The converted samples are
+raw amplitudes, untouched by any artifact filtering.
+
 ## Schema
 
 `data.db` holds:

@@ -23,6 +23,7 @@ setup(
         'console_scripts': [
             'bag_to_sqlite = bag_analysis.cli.bag_to_sqlite:main',
             'sqlite_to_report = bag_analysis.cli.sqlite_to_report:main',
+            'bag_to_xtf = bag_analysis.cli.bag_to_xtf:main',
         ],
     },
 )
