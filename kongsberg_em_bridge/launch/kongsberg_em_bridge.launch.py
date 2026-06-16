@@ -20,6 +20,14 @@ def generate_launch_description():
             'save_all_dir', default_value='',
             description='Directory to record received datagrams as a timestamped '
                         'Kongsberg .all file; empty disables recording.'),
+        DeclareLaunchArgument(
+            'save_all_max_seconds', default_value='0.0',
+            description='Roll the .all recording to a fresh file after this many '
+                        'wall-clock seconds; 0 disables the time trigger.'),
+        DeclareLaunchArgument(
+            'save_all_max_bytes', default_value='0',
+            description='Roll the .all recording to a fresh file after this many '
+                        'bytes; 0 disables the size trigger.'),
         Node(
             package='kongsberg_em_bridge',
             executable='kongsberg_em_bridge',
@@ -29,6 +37,8 @@ def generate_launch_description():
                 'bind_port': LaunchConfiguration('bind_port'),
                 'frame_id': LaunchConfiguration('frame_id'),
                 'save_all_dir': LaunchConfiguration('save_all_dir'),
+                'save_all_max_seconds': LaunchConfiguration('save_all_max_seconds'),
+                'save_all_max_bytes': LaunchConfiguration('save_all_max_bytes'),
             }],
             output='screen',
         ),
