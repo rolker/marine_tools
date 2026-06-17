@@ -28,6 +28,27 @@ from marine_acoustic_msgs.msg import DetectionFlag, PingInfo, SonarDetections
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from std_srvs.srv import SetBool
+
+
+def recording_transition(currently_recording, want_on, save_dir):
+    """
+    Pure decision for the ``set_recording`` service.
+
+    Returns ``(action, ok, message)`` where ``action`` is ``'open'`` /
+    ``'close'`` / ``'noop'`` (what the caller should do to ``_save_file``).
+    Both directions are idempotent, and turning on with no ``save_all_dir``
+    configured is rejected (``ok=False``) rather than silently doing nothing.
+    """
+    if want_on:
+        if currently_recording:
+            return 'noop', True, 'already recording'
+        if not save_dir:
+            return 'noop', False, 'no save_all_dir configured; cannot record'
+        return 'open', True, 'recording started'
+    if not currently_recording:
+        return 'noop', True, 'not recording'
+    return 'close', True, 'recording stopped'
 
 
 def save_rollover_due(elapsed_s, bytes_written, max_seconds, max_bytes):
@@ -74,6 +95,11 @@ class KongsbergEmBridge(Node):
         # mid-stream segment may not load/georeference cleanly in some readers.
         self.declare_parameter('save_all_max_seconds', 0.0)
         self.declare_parameter('save_all_max_bytes', 0)
+        # .all recording is a debugging aid that can consume a lot of disk, so
+        # it is OPT-IN on every platform: default off. save_all_dir still
+        # configures *where* it writes; set record_on_start=true to record from
+        # startup, or arm it at runtime via the set_recording service. #54.
+        self.declare_parameter('record_on_start', False)
 
         self.frame_id = self.get_parameter('frame_id').value
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
@@ -88,13 +114,19 @@ class KongsbergEmBridge(Node):
         # Per-segment rollover bookkeeping (reset by _open_save_file).
         self._save_started = None     # time.monotonic() when current file opened
         self._save_bytes = 0          # bytes written to the current segment
-        self._save_file = self._open_save_file(self._save_dir)
+        record_on_start = bool(self.get_parameter('record_on_start').value)
+        self._save_file = (
+            self._open_save_file(self._save_dir) if record_on_start else None)
         self._save_count = 0
         # Guards _save_file across the recv thread (_record) and the main
         # thread (destroy_node). The thread join in destroy_node uses a
         # timeout, so the recv thread can still be mid-write when shutdown
         # closes the file -- the lock makes the None-check/write/close atomic.
         self._save_lock = threading.Lock()
+        # Runtime on/off for .all recording (no node restart needed): true =
+        # start a fresh segment, false = close the current file. See #54.
+        self._set_recording_srv = self.create_service(
+            SetBool, '~/set_recording', self._set_recording_cb)
 
         addr = self.get_parameter('bind_address').value
         port = int(self.get_parameter('bind_port').value)
@@ -152,6 +184,30 @@ class KongsbergEmBridge(Node):
             path = os.path.join(save_dir, f'm3_{stamp}_{n:02d}.all')
             n += 1
         return path
+
+    def _set_recording_cb(self, request, response):
+        """Start/stop ``.all`` recording at runtime (``std_srvs/SetBool``)."""
+        with self._save_lock:
+            action, ok, message = recording_transition(
+                self._save_file is not None, request.data, self._save_dir)
+            if action == 'open':
+                self._save_file = self._open_save_file(self._save_dir)
+                if self._save_file is None:
+                    ok = False
+                    message = f'failed to open .all file in {self._save_dir!r}'
+                else:
+                    self._save_count = 0
+            elif action == 'close':
+                try:
+                    self._save_file.close()
+                except OSError:
+                    pass
+                message = f'recording stopped ({self._save_count} datagrams)'
+                self._save_file = None
+        self.get_logger().info(f'set_recording({request.data}): {message}')
+        response.success = ok
+        response.message = message
+        return response
 
     def _record(self, data):
         """Append one received datagram to the ``.all`` file, if recording."""

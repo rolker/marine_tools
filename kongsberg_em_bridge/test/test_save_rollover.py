@@ -13,7 +13,11 @@ without an rclpy node so the test needs no ROS graph.
 
 import os
 
-from kongsberg_em_bridge.node import KongsbergEmBridge, save_rollover_due
+from kongsberg_em_bridge.node import (
+    KongsbergEmBridge,
+    recording_transition,
+    save_rollover_due,
+)
 
 
 def test_disabled_by_default_never_rolls():
@@ -58,3 +62,26 @@ def test_unique_all_path_disambiguates_same_second(tmp_path):
     second = KongsbergEmBridge._unique_all_path(str(tmp_path))
     assert second != first
     assert not os.path.exists(second)
+
+
+# --- runtime recording toggle (set_recording service) decision (#54) ---
+
+def test_recording_transition_start_when_off():
+    assert recording_transition(False, True, '/tmp/x') == ('open', True, 'recording started')
+
+
+def test_recording_transition_start_without_dir_rejected():
+    action, ok, _ = recording_transition(False, True, '')
+    assert action == 'noop' and ok is False
+
+
+def test_recording_transition_start_when_already_on_is_noop():
+    assert recording_transition(True, True, '/tmp/x') == ('noop', True, 'already recording')
+
+
+def test_recording_transition_stop_when_on():
+    assert recording_transition(True, False, '/tmp/x') == ('close', True, 'recording stopped')
+
+
+def test_recording_transition_stop_when_already_off_is_noop():
+    assert recording_transition(False, False, '/tmp/x') == ('noop', True, 'not recording')
