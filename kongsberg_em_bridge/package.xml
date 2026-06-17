@@ -10,6 +10,7 @@
   <depend>rclpy</depend>
   <depend>marine_acoustic_msgs</depend>
   <depend>builtin_interfaces</depend>
+  <depend>std_srvs</depend>
 
   <!-- launch / launch_ros are imported by the launch file and must be present
        at runtime on a minimal install that only pulls this package. -->
