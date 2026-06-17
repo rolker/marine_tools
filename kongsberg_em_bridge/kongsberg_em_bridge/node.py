@@ -20,6 +20,7 @@ import os
 import socket
 import struct
 import threading
+import time
 
 from builtin_interfaces.msg import Time as TimeMsg
 from kongsberg_em_bridge import em_datagrams as em
@@ -27,6 +28,23 @@ from marine_acoustic_msgs.msg import DetectionFlag, PingInfo, SonarDetections
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+
+
+def save_rollover_due(elapsed_s, bytes_written, max_seconds, max_bytes):
+    """
+    Return ``(should_roll, reason)`` for a ``.all`` recording segment.
+
+    A trigger arms only when its limit is > 0, so the default (0/0) never rolls.
+    Time and size arm independently; time is reported first when both fire.
+    ``elapsed_s`` may be ``None`` before the segment's open time is known, in
+    which case the time trigger is inert. Pure (no I/O) so it is unit-tested
+    without an rclpy node.
+    """
+    if max_seconds > 0 and elapsed_s is not None and elapsed_s >= max_seconds:
+        return True, 'time'
+    if max_bytes > 0 and bytes_written >= max_bytes:
+        return True, 'size'
+    return False, ''
 
 
 class KongsbergEmBridge(Node):
@@ -47,6 +65,15 @@ class KongsbergEmBridge(Node):
         # disables recording. Each node run writes a fresh timestamped file so
         # restarts never overwrite or interleave prior recordings.
         self.declare_parameter('save_all_dir', '')
+        # PROTOTYPE rollover: split the .all recording into a fresh file once
+        # the current one reaches this many wall-clock seconds and/or bytes.
+        # 0 (default) disables that trigger; the two arm independently, so e.g.
+        # max_seconds=600 + max_bytes=0 gives 10-minute files regardless of
+        # size. NOTE (deferred): split segments do NOT yet re-emit the
+        # installation/runtime/SVP datagrams (e.g. I/73) at their head, so a
+        # mid-stream segment may not load/georeference cleanly in some readers.
+        self.declare_parameter('save_all_max_seconds', 0.0)
+        self.declare_parameter('save_all_max_bytes', 0)
 
         self.frame_id = self.get_parameter('frame_id').value
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
@@ -54,8 +81,14 @@ class KongsbergEmBridge(Node):
         self.publisher = self.create_publisher(
             SonarDetections, 'detections', qos_profile_sensor_data)
 
-        self._save_file = self._open_save_file(
-            str(self.get_parameter('save_all_dir').value).strip())
+        self._save_dir = str(self.get_parameter('save_all_dir').value).strip()
+        self._save_max_seconds = float(
+            self.get_parameter('save_all_max_seconds').value)
+        self._save_max_bytes = int(self.get_parameter('save_all_max_bytes').value)
+        # Per-segment rollover bookkeeping (reset by _open_save_file).
+        self._save_started = None     # time.monotonic() when current file opened
+        self._save_bytes = 0          # bytes written to the current segment
+        self._save_file = self._open_save_file(self._save_dir)
         self._save_count = 0
         # Guards _save_file across the recv thread (_record) and the main
         # thread (destroy_node). The thread join in destroy_node uses a
@@ -88,19 +121,37 @@ class KongsbergEmBridge(Node):
         """
         if not save_dir:
             return None
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
-            '%Y%m%d_%H%M%S')
-        path = os.path.join(save_dir, f'm3_{stamp}.all')
         try:
             os.makedirs(save_dir, exist_ok=True)
+            path = self._unique_all_path(save_dir)
             handle = open(path, 'wb')
         except OSError as exc:
             self.get_logger().error(
-                f'could not open .all recording {path}: {exc}; '
+                f'could not open .all recording in {save_dir}: {exc}; '
                 f'continuing without recording')
             return None
+        self._save_started = time.monotonic()
+        self._save_bytes = 0
         self.get_logger().info(f'recording received datagrams to {path}')
         return handle
+
+    @staticmethod
+    def _unique_all_path(save_dir):
+        """
+        Return a fresh ``m3_<UTC>.all`` path in ``save_dir`` that does not exist.
+
+        The base name is second-resolution, so a size-triggered roll inside the
+        same second would collide; a ``_NN`` suffix is appended in that case so
+        the ``'wb'`` open never truncates a just-written segment.
+        """
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            '%Y%m%d_%H%M%S')
+        path = os.path.join(save_dir, f'm3_{stamp}.all')
+        n = 1
+        while os.path.exists(path):
+            path = os.path.join(save_dir, f'm3_{stamp}_{n:02d}.all')
+            n += 1
+        return path
 
     def _record(self, data):
         """Append one received datagram to the ``.all`` file, if recording."""
@@ -108,9 +159,11 @@ class KongsbergEmBridge(Node):
             if self._save_file is None:
                 return
             try:
-                self._save_file.write(em.frame_all_record(data))
+                framed = em.frame_all_record(data)
+                self._save_file.write(framed)
                 self._save_file.flush()
                 self._save_count += 1
+                self._save_bytes += len(framed)
             except (OSError, ValueError) as exc:
                 # Disable recording on write failure (e.g. disk full, or a
                 # write that lost the close/shutdown race -> "write to closed
@@ -123,6 +176,36 @@ class KongsbergEmBridge(Node):
                 except OSError:
                     pass
                 self._save_file = None
+                return
+            # Roll AFTER a successful write so a completed segment always ends
+            # on a whole datagram boundary (valid .all framing).
+            self._maybe_roll()
+
+    def _maybe_roll(self):
+        """
+        Roll to a fresh ``.all`` segment if a time or size limit is reached.
+
+        Called under ``_save_lock`` with ``_save_file`` open. A reopen failure
+        leaves ``_save_file`` None (recording stops, logged in
+        ``_open_save_file``) while the live bridge keeps running. PROTOTYPE: the
+        new segment does not re-emit installation/runtime datagrams, so a
+        mid-stream file may lack the I/73 record some readers expect.
+        """
+        elapsed = (None if self._save_started is None
+                   else time.monotonic() - self._save_started)
+        should_roll, reason = save_rollover_due(
+            elapsed, self._save_bytes, self._save_max_seconds, self._save_max_bytes)
+        if not should_roll:
+            return
+        self.get_logger().info(
+            f'rolling .all recording ({reason}): completed segment has '
+            f'{self._save_bytes} bytes')
+        try:
+            self._save_file.close()
+        except OSError:
+            pass
+        # _open_save_file resets _save_started/_save_bytes for the new segment.
+        self._save_file = self._open_save_file(self._save_dir)
 
     def destroy_node(self):
         self._running = False
@@ -235,11 +318,14 @@ class KongsbergEmBridge(Node):
 
         self.publisher.publish(msg)
         self._ping_count += 1
-        if self._ping_count % 100 == 1:
-            self.get_logger().info(
-                f'ping {parsed["ping"]}: {len(msg.two_way_travel_times)} detections '
-                f'(of {parsed["nrx"]} beams), c={info.sound_speed:.1f} m/s, '
-                f'f={info.frequency / 1000.0:.0f} kHz')
+        # Decode-health heartbeat, time-throttled rather than every N pings:
+        # at survey ping rates a per-100-ping line prints every few seconds,
+        # which floods the console. ~30 s keeps a liveness signal without spam.
+        self.get_logger().info(
+            f'ping {parsed["ping"]}: {len(msg.two_way_travel_times)} detections '
+            f'(of {parsed["nrx"]} beams), c={info.sound_speed:.1f} m/s, '
+            f'f={info.frequency / 1000.0:.0f} kHz',
+            throttle_duration_sec=30.0)
 
 
 def main(args=None):
