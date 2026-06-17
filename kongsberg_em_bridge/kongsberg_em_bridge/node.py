@@ -95,10 +95,11 @@ class KongsbergEmBridge(Node):
         # mid-stream segment may not load/georeference cleanly in some readers.
         self.declare_parameter('save_all_max_seconds', 0.0)
         self.declare_parameter('save_all_max_bytes', 0)
-        # .all recording is a debugging aid. True (default) records on startup
-        # when save_all_dir is set; False leaves it off until the set_recording
-        # service arms it (save_all_dir still configures *where* it writes). #54.
-        self.declare_parameter('record_on_start', True)
+        # .all recording is a debugging aid that can consume a lot of disk, so
+        # it is OPT-IN on every platform: default off. save_all_dir still
+        # configures *where* it writes; set record_on_start=true to record from
+        # startup, or arm it at runtime via the set_recording service. #54.
+        self.declare_parameter('record_on_start', False)
 
         self.frame_id = self.get_parameter('frame_id').value
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
