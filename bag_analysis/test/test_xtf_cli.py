@@ -10,15 +10,18 @@ pose.
 import datetime as _dt
 
 from bag_analysis.cli.bag_to_xtf import (
+    _DEFAULT_SECONDS_PER_PING,
     _lookup_pose,
     _parse_time,
     _PendingPing,
+    _seconds_per_ping,
     _speed_mps,
     _stamp_ns,
 )
 from builtin_interfaces.msg import Time as TimeMsg
 from geometry_msgs.msg import TransformStamped
 import numpy as np
+import pytest
 from rclpy.duration import Duration
 from tf2_ros import Buffer
 
@@ -56,6 +59,34 @@ def test_speed_mps_zero_dt():
     a = _PendingPing(t_ns=5, ecef=np.array([0.0, 0.0, 0.0]))
     b = _PendingPing(t_ns=5, ecef=np.array([1.0, 0.0, 0.0]))
     assert _speed_mps(a, b) == 0.0
+
+
+def test_seconds_per_ping_first_ping_uses_default():
+    # No previous ping -> nominal value, never 0 (PINGVerter rejects spp <= 0).
+    cur = _PendingPing(t_ns=1_000_000_000)
+    assert _seconds_per_ping(None, cur) == _DEFAULT_SECONDS_PER_PING
+    assert _seconds_per_ping(None, cur) > 0.0
+
+
+def test_seconds_per_ping_uses_interping_interval():
+    prev = _PendingPing(t_ns=1_000_000_000)
+    cur = _PendingPing(t_ns=1_050_000_000)  # 50 ms later
+    assert _seconds_per_ping(prev, cur) == pytest.approx(0.05)
+
+
+def test_seconds_per_ping_gap_falls_back_to_default():
+    prev = _PendingPing(t_ns=1_000_000_000)
+    cur = _PendingPing(t_ns=6_000_000_000)  # 5 s gap (dropout)
+    assert _seconds_per_ping(prev, cur) == _DEFAULT_SECONDS_PER_PING
+
+
+def test_seconds_per_ping_nonincreasing_stamp_falls_back_to_default():
+    # Duplicate / out-of-order stamps must not yield 0 or a negative interval.
+    prev = _PendingPing(t_ns=2_000_000_000)
+    same = _PendingPing(t_ns=2_000_000_000)
+    earlier = _PendingPing(t_ns=1_000_000_000)
+    assert _seconds_per_ping(prev, same) == _DEFAULT_SECONDS_PER_PING
+    assert _seconds_per_ping(prev, earlier) == _DEFAULT_SECONDS_PER_PING
 
 
 def _tf(frame: str, sec: int, x: float, y: float, z: float) -> TransformStamped:

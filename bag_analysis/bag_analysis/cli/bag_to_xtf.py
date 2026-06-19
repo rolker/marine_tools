@@ -37,7 +37,12 @@ from tf2_ros import Buffer, TransformException
 
 from ..reader import iter_messages
 from ..xtf.geo import ecef_pose_to_geo
-from ..xtf.writer import ChannelPing, XtfWriter
+from ..xtf.writer import (
+    LAYOUT_PINGMAPPER,
+    LAYOUT_STANDARD,
+    ChannelPing,
+    XtfWriter,
+)
 
 # marine_acoustic_msgs/SonarImageData.dtype -> numpy base type.
 _DTYPE_MAP = {
@@ -121,6 +126,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         '--max-pings', type=int, default=None,
         help='Stop after writing this many ping packets (for testing)',
+    )
+    p.add_argument(
+        '--layout', choices=(LAYOUT_STANDARD, LAYOUT_PINGMAPPER),
+        default=LAYOUT_STANDARD,
+        help=(
+            'XTF channel layout. "standard" (default) is the spec-compliant '
+            'interleaved layout read by pyxtf and standard XTF tools. '
+            '"pingmapper" is a non-standard contiguous layout required by '
+            'PINGVerter / PING-Mapper, which misread the standard layout; '
+            'files written this way will mis-decode in standard XTF readers.'
+        ),
     )
     return p
 
@@ -237,6 +253,30 @@ def _speed_mps(a: _PendingPing, b: _PendingPing) -> float:
     return float(np.linalg.norm(a.ecef - b.ecef) / dt)
 
 
+# Nominal inter-ping interval (s) used for the first ping and across gaps,
+# where the real spacing is unavailable or implausible. ~0.1 s is a
+# representative sidescan ping period; any finite positive value works.
+_DEFAULT_SECONDS_PER_PING = 0.1
+# Gaps longer than this are treated as dropouts, not real ping intervals.
+_MAX_SECONDS_PER_PING = 2.0
+
+
+def _seconds_per_ping(prev: _PendingPing | None, cur: _PendingPing) -> float:
+    """Inter-ping interval (s) for the XTF channel header.
+
+    Derived from the time since the previously emitted ping; falls back to a
+    nominal value for the first ping and across gaps so the field is always
+    finite and positive. PINGVerter / PING-Mapper reject SecondsPerPing <= 0
+    (they flag the whole ping as invalid geometry), so 0 must never be written.
+    """
+    if prev is None:
+        return _DEFAULT_SECONDS_PER_PING
+    dt = (cur.t_ns - prev.t_ns) / 1e9
+    if not 0.0 < dt <= _MAX_SECONDS_PER_PING:
+        return _DEFAULT_SECONDS_PER_PING
+    return dt
+
+
 def _convert(args, stream, counts) -> int:
     """Run the read/georeference/pair/write loop; return pings written."""
     buffer = Buffer(cache_time=Duration(seconds=args.tf_cache))
@@ -249,7 +289,8 @@ def _convert(args, stream, counts) -> int:
     start_ns = _parse_time(args.start_time)
     end_ns = _parse_time(args.end_time)
 
-    writer = XtfWriter(stream, sonar_name=args.sonar_name)
+    writer = XtfWriter(
+        stream, sonar_name=args.sonar_name, layout=args.layout)
     pending: dict = {'port': None, 'starboard': None}
     latest_altitude = None
     prev_emitted = None
@@ -257,6 +298,7 @@ def _convert(args, stream, counts) -> int:
     def emit(port: _PendingPing, stbd: _PendingPing) -> None:
         nonlocal prev_emitted
         speed = _speed_mps(prev_emitted, port) if prev_emitted else 0.0
+        seconds_per_ping = _seconds_per_ping(prev_emitted, port)
         if latest_altitude is None:
             counts['no_altitude'] += 1
         writer.write_ping(
@@ -269,11 +311,13 @@ def _convert(args, stream, counts) -> int:
             port=ChannelPing(
                 samples=port.samples, slant_range_m=port.slant_range,
                 frequency_hz=port.frequency, time_delay_s=port.time_delay,
-                time_duration_s=port.time_duration),
+                time_duration_s=port.time_duration,
+                seconds_per_ping=seconds_per_ping),
             starboard=ChannelPing(
                 samples=stbd.samples, slant_range_m=stbd.slant_range,
                 frequency_hz=stbd.frequency, time_delay_s=stbd.time_delay,
-                time_duration_s=stbd.time_duration),
+                time_duration_s=stbd.time_duration,
+                seconds_per_ping=seconds_per_ping),
         )
         counts['paired'] += 1
         prev_emitted = port

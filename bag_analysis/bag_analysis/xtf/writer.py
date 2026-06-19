@@ -50,6 +50,10 @@ _PING_CHAN_HEADER_LEN = 64
 
 _SAMPLE_DTYPE = np.dtype('<u2')  # little-endian uint16
 
+# Per-ping channel layouts (see XtfWriter for the trade-off).
+LAYOUT_STANDARD = 'standard'      # interleaved [hdr0][data0][hdr1][data1]
+LAYOUT_PINGMAPPER = 'pingmapper'  # contiguous  [hdr0][hdr1][data0][data1]
+
 
 @dataclass
 class ChannelPing:
@@ -75,9 +79,29 @@ class XtfWriter:
         note: str = '',
         port_frequency_hz: float = 0.0,
         starboard_frequency_hz: float = 0.0,
+        layout: str = LAYOUT_STANDARD,
     ) -> None:
-        """Open the writer and emit the XTF file header to ``stream``."""
+        """Open the writer and emit the XTF file header to ``stream``.
+
+        ``layout`` controls the per-ping channel arrangement:
+
+        * ``LAYOUT_STANDARD`` (default) -- spec-compliant interleaved layout:
+          each XTFPINGCHANHEADER is immediately followed by its own channel's
+          samples (``[hdr0][data0][hdr1][data1]``). This is what the Triton XTF
+          spec and the reference reader (pyxtf) require.
+        * ``LAYOUT_PINGMAPPER`` -- non-standard contiguous layout that groups
+          both channel headers first, then both channels' samples
+          (``[hdr0][hdr1][data0][data1]``). PINGVerter / PING-Mapper assume
+          this arrangement and misread the standard interleaved layout for the
+          second channel; use it only when the output is destined for that
+          toolchain. Standard XTF readers will mis-decode it.
+        """
+        if layout not in (LAYOUT_STANDARD, LAYOUT_PINGMAPPER):
+            raise ValueError(
+                f'unknown layout {layout!r}; expected '
+                f'{LAYOUT_STANDARD!r} or {LAYOUT_PINGMAPPER!r}')
         self._stream = stream
+        self._layout = layout
         self._ping_count = 0
         self._write_file_header(
             sonar_name, program_name, note,
@@ -191,13 +215,22 @@ class XtfWriter:
         struct.pack_into('<f', header, 208, float(roll_deg))
         struct.pack_into('<f', header, 212, float(heading_deg))
 
+        port_header = self._chan_header(0, n_port, port)
+        stbd_header = self._chan_header(1, n_stbd, starboard)
+
         self._stream.write(header)
-        self._stream.write(
-            self._chan_header(0, n_port, port))
-        self._stream.write(port_bytes)
-        self._stream.write(
-            self._chan_header(1, n_stbd, starboard))
-        self._stream.write(stbd_bytes)
+        if self._layout == LAYOUT_PINGMAPPER:
+            # Contiguous: both channel headers, then both channels' samples.
+            self._stream.write(port_header)
+            self._stream.write(stbd_header)
+            self._stream.write(port_bytes)
+            self._stream.write(stbd_bytes)
+        else:
+            # Standard interleaved: each header immediately followed by its data.
+            self._stream.write(port_header)
+            self._stream.write(port_bytes)
+            self._stream.write(stbd_header)
+            self._stream.write(stbd_bytes)
         self._ping_count += 1
 
     @staticmethod
