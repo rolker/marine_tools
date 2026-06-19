@@ -108,7 +108,8 @@ def test_ping_packets_round_trip():
     assert first['heading'] == pytest.approx(123.4, abs=1e-3)
     assert first['year'] == 2026
     assert len(first['channels']) == 2
-    assert list(first['channels'][0]['samples']) == [10, 20, 30, 40]
+    # Port (channel 0) is stored reversed per XTF convention; starboard as-is.
+    assert list(first['channels'][0]['samples']) == [40, 30, 20, 10]
     assert list(first['channels'][1]['samples']) == [50, 60, 70, 80]
     assert first['channels'][0]['slant'] == pytest.approx(20.0)
     # The per-ping Frequency uint16 (offset 26) can't hold sidescan
@@ -117,8 +118,23 @@ def test_ping_packets_round_trip():
     assert struct.unpack_from('<H', data, chan0 + 26)[0] == 0
 
     second = pings[1]
-    assert list(second['channels'][0]['samples']) == [11, 21, 31]
+    assert list(second['channels'][0]['samples']) == [31, 21, 11]  # port reversed
     assert list(second['channels'][1]['samples']) == [51, 61, 71]
+
+
+def test_port_channel_reversed_starboard_unchanged():
+    """Port samples are written reversed (XTF convention); starboard is not."""
+    stream = io.BytesIO()
+    writer = XtfWriter(stream)
+    t = _dt.datetime(2026, 6, 15, tzinfo=_dt.timezone.utc)
+    writer.write_ping(
+        time=t, ping_number=0, latitude_deg=0.0, longitude_deg=0.0,
+        sensor_depth_m=0.0, altitude_m=0.0, heading_deg=0.0, pitch_deg=0.0,
+        roll_deg=0.0, speed_mps=0.0, sound_velocity_mps=1500.0,
+        port=_chan([1, 2, 3, 4, 5]), starboard=_chan([1, 2, 3, 4, 5]))
+    ping = _parse_pings(stream.getvalue())[0]
+    assert list(ping['channels'][0]['samples']) == [5, 4, 3, 2, 1]  # port flipped
+    assert list(ping['channels'][1]['samples']) == [1, 2, 3, 4, 5]  # stbd as-is
 
 
 def test_record_length_consumes_exact_file():

@@ -148,7 +148,12 @@ class XtfWriter:
         starboard: ChannelPing,
     ) -> None:
         """Append one two-channel sonar ping packet to the file."""
-        port_bytes = _samples_to_bytes(port.samples)
+        # XTF convention: the port channel is stored in reversed sample order
+        # (outermost/far range first, nadir last) relative to starboard, so a
+        # standard viewer renders port extending left of nadir into a
+        # continuous swath. The driver publishes both channels near->far, so
+        # flip port here; starboard is written as-is.
+        port_bytes = _samples_to_bytes(np.asarray(port.samples)[::-1])
         stbd_bytes = _samples_to_bytes(starboard.samples)
         n_port = len(port_bytes) // _BYTES_PER_SAMPLE
         n_stbd = len(stbd_bytes) // _BYTES_PER_SAMPLE
