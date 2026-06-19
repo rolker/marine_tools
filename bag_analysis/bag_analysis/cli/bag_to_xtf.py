@@ -38,9 +38,9 @@ from tf2_ros import Buffer, TransformException
 from ..reader import iter_messages
 from ..xtf.geo import ecef_pose_to_geo
 from ..xtf.writer import (
+    ChannelPing,
     LAYOUT_PINGMAPPER,
     LAYOUT_STANDARD,
-    ChannelPing,
     XtfWriter,
 )
 
@@ -262,7 +262,8 @@ _MAX_SECONDS_PER_PING = 2.0
 
 
 def _seconds_per_ping(prev: _PendingPing | None, cur: _PendingPing) -> float:
-    """Inter-ping interval (s) for the XTF channel header.
+    """
+    Inter-ping interval (s) for the XTF channel header.
 
     Derived from the time since the previously emitted ping; falls back to a
     nominal value for the first ping and across gaps so the field is always

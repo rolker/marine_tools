@@ -11,9 +11,9 @@ import io
 import struct
 
 from bag_analysis.xtf.writer import (
+    ChannelPing,
     LAYOUT_PINGMAPPER,
     LAYOUT_STANDARD,
-    ChannelPing,
     XtfWriter,
 )
 import numpy as np
@@ -146,10 +146,12 @@ def test_port_channel_reversed_starboard_unchanged():
 
 
 def test_seconds_per_ping_written_to_channel_header():
-    """SecondsPerPing must round-trip as finite/positive at channel-header
-    offset 20. PINGVerter rejects SecondsPerPing <= 0 (flags the whole ping as
-    invalid geometry), so a 0 here makes the XTF unreadable -- see marine_tools
-    issue #58."""
+    """
+    Each channel header must carry a finite, positive SecondsPerPing.
+
+    PINGVerter rejects SecondsPerPing <= 0 (it flags the whole ping as invalid
+    geometry), so writing 0 makes the XTF unreadable -- see marine_tools #58.
+    """
     stream = io.BytesIO()
     writer = XtfWriter(stream)
     t = _dt.datetime(2026, 6, 15, tzinfo=_dt.timezone.utc)
@@ -180,8 +182,11 @@ def _write_one_ping(layout, n_port, n_stbd):
 
 
 def test_standard_layout_interleaves_header_and_data():
-    """Standard (spec/pyxtf) layout: [hdr0][data0][hdr1][data1] -- channel 1's
-    header sits AFTER channel 0's header and channel 0's samples."""
+    """
+    Interleaved layout places channel 1's header after channel 0's data.
+
+    Standard / pyxtf layout is [hdr0][data0][hdr1][data1].
+    """
     n = 6
     data = _write_one_ping(LAYOUT_STANDARD, n, n)
     chan0 = _FILE_HEADER_LEN + _PING_HEADER_LEN
@@ -191,8 +196,12 @@ def test_standard_layout_interleaves_header_and_data():
 
 
 def test_pingmapper_layout_groups_headers_then_data():
-    """PINGMapper (contiguous) layout: [hdr0][hdr1][data0][data1] -- channel 1's
-    header immediately follows channel 0's header, with no samples between."""
+    """
+    Contiguous layout places both channel headers before any sample data.
+
+    PINGMapper layout is [hdr0][hdr1][data0][data1], with no samples between
+    the two headers.
+    """
     n = 6
     data = _write_one_ping(LAYOUT_PINGMAPPER, n, n)
     chan0 = _FILE_HEADER_LEN + _PING_HEADER_LEN

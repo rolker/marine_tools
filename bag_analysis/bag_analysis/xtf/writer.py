@@ -81,7 +81,8 @@ class XtfWriter:
         starboard_frequency_hz: float = 0.0,
         layout: str = LAYOUT_STANDARD,
     ) -> None:
-        """Open the writer and emit the XTF file header to ``stream``.
+        """
+        Open the writer and emit the XTF file header to ``stream``.
 
         ``layout`` controls the per-ping channel arrangement:
 
