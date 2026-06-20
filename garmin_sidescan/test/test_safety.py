@@ -422,8 +422,7 @@ def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
         return types.SimpleNamespace(
             _frame_id='gs', _freq={side: 0.0},
             _sound_speed=1500.0,
-            _controls={'range': '50.0'},
-            _bytes_per_sample=2, _sample_rate=0.0, _sonar_dtype=0,
+            _controls={'range': '50.0'}, _sample_rate=0.0,
             _make_sonar_msg=GarminSidescanNode._make_sonar_msg)
     samples = bytes(4096)                       # 2048 uint16 bins
     stamp = types.SimpleNamespace(to_msg=lambda: Time())
@@ -452,8 +451,8 @@ def test_make_sonar_msg_encodes_near_field_gate():
                     near_field_m=0.0985)
     node = types.SimpleNamespace(
         _frame_id='gs', _freq={'down': 0.0}, _sound_speed=1500.0,
-        _controls={'range': '0.0'}, _bytes_per_sample=2, _sample_rate=0.0,
-        _sonar_dtype=0, get_logger=lambda: _FakeLogger())
+        _controls={'range': '0.0'}, _sample_rate=0.0,
+        get_logger=lambda: _FakeLogger())
     samples = bytes(2 * 1943)                    # 1943 uint16 bins
     stamp = types.SimpleNamespace(to_msg=lambda: Time())
     msg = GarminSidescanNode._make_sonar_msg(node, 'down', samples, stamp, sub=sub)
@@ -470,6 +469,47 @@ def test_make_sonar_msg_encodes_near_field_gate():
     # near-field offset (~0.094 m here) and badly misplace the bottom
     ignored = 1500.0 * 319 / (2.0 * msg.sample_rate)
     assert range_319 - ignored > 0.08
+
+
+def test_make_sonar_msg_bits_sets_dtype_and_stride():
+    # The sample width is per-channel (8-bit GCV-10 side-scan, 16-bit
+    # water-column/GCV-20), carried as ScanLine.bits and applied here -- not a
+    # device-wide dtype. Pin both paths (issue #60).
+    from builtin_interfaces.msg import Time
+    from marine_acoustic_msgs.msg import SonarImageData
+    node = types.SimpleNamespace(
+        _frame_id='gs', _freq={'port': 0.0}, _sound_speed=1500.0,
+        _controls={'range': '0.0'}, _sample_rate=1000.0,
+        get_logger=lambda: _FakeLogger())
+    stamp = types.SimpleNamespace(to_msg=lambda: Time())
+    m8 = GarminSidescanNode._make_sonar_msg(node, 'port', bytes(300), stamp, bits=8)
+    assert m8.image.dtype == SonarImageData.DTYPE_UINT8
+    assert m8.samples_per_beam == 300            # 1 byte/sample
+    m16 = GarminSidescanNode._make_sonar_msg(node, 'port', bytes(300), stamp, bits=16)
+    assert m16.image.dtype == SonarImageData.DTYPE_UINT16
+    assert m16.samples_per_beam == 150           # 2 bytes/sample
+
+
+def test_publish_diagnostics_does_not_reference_removed_fields():
+    # Regression for issue #60: _publish_diagnostics runs on a 1 s timer and
+    # must not reach for the removed device-wide _bytes_per_sample (that crashed
+    # the diagnostics timer ~1 s after every start). Smoke-test the publish path.
+    from builtin_interfaces.msg import Time
+    published = []
+    node = types.SimpleNamespace(
+        _last_ping_t=None, _transmitting=False, _gcv_ip='10.0.0.1',
+        _detected_gen='gcv20', _device_transmitting=None, _sound_speed=1500.0,
+        _ping_count={'port': 1, 'stbd': 2, 'down': 3},
+        _pub_diag=types.SimpleNamespace(publish=published.append),
+        get_clock=lambda: types.SimpleNamespace(
+            now=lambda: types.SimpleNamespace(to_msg=lambda: Time())))
+    GarminSidescanNode._publish_diagnostics(node)
+    assert len(published) == 1
+    arr = published[0]
+    assert len(arr.status) == 2                  # imagery + transmit
+    keys = {kv.key for s in arr.status for kv in s.values}
+    assert 'device' in keys
+    assert 'dtype_bits' not in keys              # per-channel now; scalar dropped
 
 
 def test_emit_ping_skips_implausible_nadir_values():
@@ -496,10 +536,10 @@ def test_emit_ping_skips_implausible_nadir_values():
     stamp = types.SimpleNamespace(to_msg=lambda: None)
     node = fake()
     # plausible: 0 < v1 <= v2 -> published with max_range = v2
-    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(7.5, 21.0)))
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(7.5, 21.0), 16))
     assert len(published) == 1 and abs(published[0].max_range - 21.0) < 1e-6
     # corrupt: v1 beyond the observable window -> no spec-invalid Range
-    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(30.0, 21.0)))
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(30.0, 21.0), 16))
     # degenerate: non-positive v1 -> skipped
-    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(0.0, 21.0)))
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(0.0, 21.0), 16))
     assert len(published) == 1

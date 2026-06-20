@@ -502,7 +502,7 @@ def derive_sample_rate(sub, grid_bins, sound_speed, commanded_range_m=0.0,
 # One assembled scan line.  ``stamp`` is the ``recv_time`` of the run's first
 # packet; ``subheader`` is that run's parsed :class:`Subheader` (None when no
 # packet of the run parsed -- both generations parse; see test fixtures).
-ScanLine = namedtuple('ScanLine', 'channel samples stamp subheader')
+ScanLine = namedtuple('ScanLine', 'channel samples stamp subheader bits')
 
 
 class PingAssembler:
@@ -519,19 +519,27 @@ class PingAssembler:
     emit any trailing accumulation.
     """
 
-    def __init__(self, extractor=dark_layer):
-        # Per-packet sample extractor, chosen by device generation:
-        # dark_layer (GCV-10) or echo_layer (GCV-20).
-        self._extract = extractor
+    def __init__(self, force_extractor=None):
+        # The sample extractor is chosen PER PACKET from its render-layer
+        # structure (see :meth:`feed`), NOT per device: the GCV-10 side-scan
+        # "dark" 3-layer form is 8-bit (:func:`dark_layer`); every echo form --
+        # all GCV-20 channels AND the GCV-10 water-column (down-look), which is a
+        # single 16-bit layer like a GCV-20 echo -- is 16-bit
+        # (:func:`echo_layer`). A single device-wide extractor blanked the
+        # GCV-10 water-column (``dark_layer`` finds no later-layer header ->
+        # empty). ``force_extractor`` pins one extractor (tests / legacy).
+        self._force = force_extractor
         self._cur_ch = None
         self._acc = bytearray()
         self._t0 = 0.0
         self._cur_sub = None
+        self._cur_bits = 16
+        self._cur_extract = force_extractor or dark_layer
 
     def _emit(self, out):
         if self._cur_ch is not None and self._acc:
             out.append(ScanLine(self._cur_ch, bytes(self._acc), self._t0,
-                                self._cur_sub))
+                                self._cur_sub, self._cur_bits))
         self._acc = bytearray()
         self._cur_sub = None
 
@@ -552,15 +560,33 @@ class PingAssembler:
                 self._cur_ch = None
         elif payload[:2] == EB07 and len(payload) > MIN_DATA_LEN:
             ch = payload[CHANNEL_OFFSET]
-            block = self._extract(payload)
             if ch != self._cur_ch:
                 self._emit(out)
                 self._cur_ch = ch
                 self._t0 = recv_time
+                # Pin the extractor for the whole run from its first packet's
+                # render-layer structure (unless force-pinned): the 3-layer
+                # "dark" form (>=2 later-layer headers, generation_from_layers
+                # == 'gcv10') is the GCV-10 8-bit side-scan; every other sample
+                # packet is a 16-bit echo layer -- all GCV-20 channels and,
+                # crucially, the GCV-10 water-column (a single echo layer the
+                # old device-wide dark_layer extractor blanked). A run is one
+                # channel with one render-layer form, so pinning keeps _cur_bits
+                # and the leading-strip in step with the accumulated bytes even
+                # if a later (e.g. dropped/garbled) packet would classify
+                # differently.
+                self._cur_extract = (
+                    self._force if self._force is not None
+                    else (dark_layer if generation_from_layers(payload) == 'gcv10'
+                          else echo_layer))
+                self._cur_bits = 8 if self._cur_extract is dark_layer else 16
+                block = self._cur_extract(payload)
                 # The per-ping leading header rides only the first packet of a
-                # scan line, and only on the GCV-20 (echo_layer) stream.
-                if self._extract is echo_layer:
+                # scan line, and only on the echo_layer (16-bit) streams.
+                if self._cur_extract is echo_layer:
                     block = strip_leading_ping_header(block)
+            else:
+                block = self._cur_extract(payload)
             if self._cur_sub is None:
                 # Every packet of a run repeats the same sub-header values, so
                 # the first packet that parses tags the whole run (a garbled

@@ -39,6 +39,12 @@ FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv_real_pings.bi
 # raw eb07/d807 payloads spanning down-look (ch2) + both side-scan (ch0/ch1)
 # runs, same <u16 length><payload> record format as the GCV-10 fixture.
 GCV20_FIXTURE = os.path.join(os.path.dirname(__file__), 'fixtures', 'gcv20_real_pings.bin')
+# Real GCV-10 *water-column* (down-look, 0x0d) eb07 payloads (2026-06-05 bench).
+# Unlike the GCV-10 side-scan (3-layer 8-bit "dark"), the water-column is a
+# single 16-bit echo layer -- so the layer-count heuristic mislabels it gcv20
+# and the old device-wide dark_layer extractor blanked it (issue #60).
+GCV10_WC_FIXTURE = os.path.join(
+    os.path.dirname(__file__), 'fixtures', 'gcv10_watercolumn_pings.bin')
 
 
 def _load_records(path):
@@ -96,8 +102,52 @@ def test_real_capture_decodes_to_two_channel_scan_lines():
         assert 7.0 < p.subheader.bottom_range_m < 11.0
 
 
-def test_assembler_stamps_run_with_first_packet_time():
+def test_gcv10_water_column_decodes_as_16bit_echo_not_blank_dark():
+    # Issue #60: the GCV-10 water-column is a single 16-bit echo layer, NOT the
+    # 3-layer 8-bit "dark" side-scan form. Pin the failure modes the fix guards:
+    payloads = _load_records(GCV10_WC_FIXTURE)
+    assert payloads
+    p = payloads[0]
+    assert is_water_column(p)                       # 0x0d down-look beam
+    # The layer-count heuristic mislabels the single-layer WC as 'gcv20'...
+    assert generation_from_layers(p) == 'gcv20'
+    # ...so a device-wide dark_layer extractor blanks it...
+    assert dark_layer(p) == b''
+    # ...while echo_layer recovers a real 16-bit sample run.
+    assert len(echo_layer(p)) > 200
+
+    # The assembler self-selects per packet: water-column -> echo (16-bit),
+    # regardless of the device's latched generation.
     assembler = PingAssembler()
+    pings = []
+    for pl in payloads:
+        pings.extend(assembler.feed(pl))
+    pings.extend(assembler.flush())
+    assert pings, 'water-column run produced no scan line (regression: blanked)'
+    line = pings[-1]
+    assert line.bits == 16
+    assert len(line.samples) > 200
+
+
+def test_gcv10_side_scan_self_selects_8bit_dark():
+    # The same self-selecting assembler must still decode the GCV-10 side-scan
+    # (3-layer dark form) as 8-bit -- the per-packet structural signal.
+    payloads = load_fixture()
+    assembler = PingAssembler()
+    pings = []
+    for pl in payloads:
+        pings.extend(assembler.feed(pl))
+    pings.extend(assembler.flush())
+    full = [p for p in pings if len(p.samples) > 1000]
+    assert full
+    assert all(p.bits == 8 for p in full)
+
+
+def test_assembler_stamps_run_with_first_packet_time():
+    # Pin dark_layer: these synthetic packets carry an SH header but no
+    # FH/FHS, so per-packet self-select can't classify them -- the assembly
+    # mechanics under test are extractor-independent.
+    assembler = PingAssembler(dark_layer)
     # two synthetic full packets of one channel, then a marker to flush.
     # Total length must exceed MIN_DATA_LEN (32); channel byte at offset 12.
     pkt = bytes([0xeb, 0x07, 0, 0]) + bytes(8) + bytes([5]) + bytes(20) \
@@ -461,7 +511,7 @@ def test_gcv20_real_capture_strips_trailer_and_leading_band():
     # fixture spans down-look (ch2) + both side-scan (ch0/ch1) runs
     assert {p.channel for p in pings} >= {0, 1, 2}
     assert len(pings) >= 3
-    for ch, samples, _t, _sub in pings:
+    for ch, samples, _t, _sub, _bits in pings:
         # no per-packet trailer bytes survive into the scan line
         assert TRAILER_MAGIC not in samples, f'trailer leaked into ch{ch}'
         # no long constant leading run (the bright near-range band)
@@ -559,7 +609,7 @@ def test_assembler_keeps_ping_whole_across_telemetry_marker():
     # Regression for issue #37: a 020c temperature marker interleaved mid-run
     # must NOT split the ping. Build one channel's run as 4 packets + a telemetry
     # marker + 3 more packets, then a delimiter; expect ONE scan line of all 7.
-    assembler = PingAssembler()
+    assembler = PingAssembler(dark_layer)   # synthetic dark packets (no FH/FHS)
     pkt = bytes([0xeb, 0x07, 0, 0]) + bytes(8) + bytes([5]) + bytes(20) \
         + bytes([174, 2, 172, 2]) + bytes([10, 20, 30])
     out = []
