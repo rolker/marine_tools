@@ -10,10 +10,16 @@ import datetime as _dt
 import io
 import struct
 
-from bag_analysis.xtf.writer import ChannelPing, XtfWriter
+from bag_analysis.xtf.writer import (
+    ChannelPing,
+    LAYOUT_PINGMAPPER,
+    LAYOUT_STANDARD,
+    XtfWriter,
+)
 import numpy as np
 import pytest
 
+_FILE_HEADER_LEN = 1024
 _FILE_HEADER_LEN = 1024
 _PING_HEADER_LEN = 256
 _PING_CHAN_HEADER_LEN = 64
@@ -84,11 +90,13 @@ def _parse_pings(data: bytes):
         for _ in range(n_chans):
             n_samples = struct.unpack_from('<I', data, pos + 42)[0]
             slant = struct.unpack_from('<f', data, pos + 4)[0]
+            seconds_per_ping = struct.unpack_from('<f', data, pos + 20)[0]
             sample_start = pos + _PING_CHAN_HEADER_LEN
             samples = np.frombuffer(
                 data, dtype='<u2', count=n_samples, offset=sample_start)
             ping['channels'].append(
-                {'n': n_samples, 'slant': slant, 'samples': samples})
+                {'n': n_samples, 'slant': slant,
+                 'seconds_per_ping': seconds_per_ping, 'samples': samples})
             pos = sample_start + n_samples * 2
         pings.append(ping)
         offset += record_len
@@ -135,6 +143,81 @@ def test_port_channel_reversed_starboard_unchanged():
     ping = _parse_pings(stream.getvalue())[0]
     assert list(ping['channels'][0]['samples']) == [5, 4, 3, 2, 1]  # port flipped
     assert list(ping['channels'][1]['samples']) == [1, 2, 3, 4, 5]  # stbd as-is
+
+
+def test_seconds_per_ping_written_to_channel_header():
+    """
+    Each channel header must carry a finite, positive SecondsPerPing.
+
+    PINGVerter rejects SecondsPerPing <= 0 (it flags the whole ping as invalid
+    geometry), so writing 0 makes the XTF unreadable -- see marine_tools #58.
+    """
+    stream = io.BytesIO()
+    writer = XtfWriter(stream)
+    t = _dt.datetime(2026, 6, 15, tzinfo=_dt.timezone.utc)
+    writer.write_ping(
+        time=t, ping_number=0, latitude_deg=0.0, longitude_deg=0.0,
+        sensor_depth_m=0.0, altitude_m=0.0, heading_deg=0.0, pitch_deg=0.0,
+        roll_deg=0.0, speed_mps=0.0, sound_velocity_mps=1500.0,
+        port=_chan([1, 2, 3, 4]), starboard=_chan([5, 6, 7, 8]))
+    ping = _parse_pings(stream.getvalue())[0]
+    for chan in ping['channels']:
+        assert chan['seconds_per_ping'] > 0.0
+        assert chan['seconds_per_ping'] == pytest.approx(0.08)  # from _chan()
+
+
+def _write_one_ping(layout, n_port, n_stbd):
+    """Write a single ping in ``layout`` and return the raw file bytes."""
+    stream = io.BytesIO()
+    kwargs = {} if layout is None else {'layout': layout}
+    writer = XtfWriter(stream, **kwargs)
+    t = _dt.datetime(2026, 6, 15, tzinfo=_dt.timezone.utc)
+    writer.write_ping(
+        time=t, ping_number=0, latitude_deg=0.0, longitude_deg=0.0,
+        sensor_depth_m=0.0, altitude_m=0.0, heading_deg=0.0, pitch_deg=0.0,
+        roll_deg=0.0, speed_mps=0.0, sound_velocity_mps=1500.0,
+        port=_chan(list(range(1, n_port + 1))),
+        starboard=_chan(list(range(1, n_stbd + 1))))
+    return stream.getvalue()
+
+
+def test_standard_layout_interleaves_header_and_data():
+    """
+    Interleaved layout places channel 1's header after channel 0's data.
+
+    Standard / pyxtf layout is [hdr0][data0][hdr1][data1].
+    """
+    n = 6
+    data = _write_one_ping(LAYOUT_STANDARD, n, n)
+    chan0 = _FILE_HEADER_LEN + _PING_HEADER_LEN
+    chan1 = chan0 + _PING_CHAN_HEADER_LEN + n * 2  # past chan0 hdr + chan0 data
+    assert struct.unpack_from('<H', data, chan1)[0] == 1       # ChannelNumber
+    assert struct.unpack_from('<I', data, chan1 + 42)[0] == n  # NumSamples
+
+
+def test_pingmapper_layout_groups_headers_then_data():
+    """
+    Contiguous layout places both channel headers before any sample data.
+
+    PINGMapper layout is [hdr0][hdr1][data0][data1], with no samples between
+    the two headers.
+    """
+    n = 6
+    data = _write_one_ping(LAYOUT_PINGMAPPER, n, n)
+    chan0 = _FILE_HEADER_LEN + _PING_HEADER_LEN
+    chan1 = chan0 + _PING_CHAN_HEADER_LEN  # immediately after chan0 header
+    assert struct.unpack_from('<H', data, chan1)[0] == 1       # ChannelNumber
+    assert struct.unpack_from('<I', data, chan1 + 42)[0] == n  # NumSamples
+
+
+def test_default_layout_is_standard():
+    assert _write_one_ping(None, 4, 4) == _write_one_ping(LAYOUT_STANDARD, 4, 4)
+    assert _write_one_ping(None, 4, 4) != _write_one_ping(LAYOUT_PINGMAPPER, 4, 4)
+
+
+def test_unknown_layout_rejected():
+    with pytest.raises(ValueError):
+        XtfWriter(io.BytesIO(), layout='bogus')
 
 
 def test_record_length_consumes_exact_file():
