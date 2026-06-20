@@ -496,10 +496,10 @@ def test_emit_ping_skips_implausible_nadir_values():
     stamp = types.SimpleNamespace(to_msg=lambda: None)
     node = fake()
     # plausible: 0 < v1 <= v2 -> published with max_range = v2
-    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(7.5, 21.0)))
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(7.5, 21.0), 16))
     assert len(published) == 1 and abs(published[0].max_range - 21.0) < 1e-6
     # corrupt: v1 beyond the observable window -> no spec-invalid Range
-    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(30.0, 21.0)))
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(30.0, 21.0), 16))
     # degenerate: non-positive v1 -> skipped
-    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(0.0, 21.0)))
+    GarminSidescanNode._emit_ping(node, ScanLine(2, b'xx', stamp, sub(0.0, 21.0), 16))
     assert len(published) == 1

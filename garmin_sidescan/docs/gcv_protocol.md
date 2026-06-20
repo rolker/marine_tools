@@ -316,18 +316,47 @@ still keys on this byte.
 The real GCV-10/GCV-20 difference is **structural**, in the render layers, and
 independent of range:
 
-| generation | render layers | later-layer (`SH`/`SHS`) headers | echo | samples |
-|------------|---------------|----------------------------------|------|---------|
-| **GCV-10** | 3 | **2** | last ("dark") layer | 8-bit (`UINT8`) |
-| **GCV-20** | ≤2 | **0 or 1** | first (`FH`) layer | 16-bit LE (`UINT16`) |
+| stream | render layers | later-layer (`SH`/`SHS`) headers | echo | samples |
+|--------|---------------|----------------------------------|------|---------|
+| **GCV-10** side-scan | 3 | **2** | last ("dark") layer | 8-bit (`UINT8`) |
+| **GCV-10** water-column | 1 | **0** | first (`FH`) layer | 16-bit LE (`UINT16`) |
+| **GCV-20** (all) | ≤2 | **0 or 1** | first (`FH`) layer | 16-bit LE (`UINT16`) |
 
-Verified: every GCV-10 fixture packet has two later-layer headers; every
-GCV-20 packet (fixtures *and* the 06-10 bag, across depth/range changes) has at
-most one. So a packet is classified **per-packet by counting its `SH`/`SHS`
-headers (≥2 → GCV-10, ≤1 → GCV-20)** — implemented as
-`decode.generation_from_layers()`, voted over a few packets by the node's
-`auto` device-detect. (GCV-10 evidence is one 16-packet fixture; widen before
-relying on it.)
+Verified on **two independent GCV-10 captures** (`dumpcap_file.pcap` survey,
+7,560 packets; `gcv10_20260605-050008.pcap` bench, 4,074 side-scan packets) and
+every GCV-20 capture (fixtures *and* the 06-10 bag): every GCV-10 **side-scan**
+packet has two later-layer headers; every GCV-20 packet has at most one — so the
+`SH`/`SHS` count is a **side-scan** generation signal (`decode.generation_from_layers()`).
+
+> **The down-look (water column) is the exception, and it is 16-bit on both
+> generations.** A GCV-10 water-column (`0x0d`) packet is a **single echo layer**
+> (one `FH`, no `SH`/`SHS`), so `generation_from_layers()` reports it as `gcv20`.
+> That is *right for the extractor* — it really is a 16-bit echo layer like any
+> GCV-20 channel — but it means decode must pick the extractor **per packet**
+> from its own structure (`PingAssembler`), not once per device: the 3-layer dark
+> form → `dark_layer`/8-bit; every echo form (all GCV-20 channels **and** the
+> GCV-10 water-column) → `echo_layer`/16-bit. A single device-wide extractor
+> blanked the GCV-10 water-column (`dark_layer` finds no `SH`/`SHS` → empty) —
+> issue #60.
+
+#### Sample width verified empirically (8-bit side-scan / 16-bit echo)
+
+The widths above — not just the layer *count* — were confirmed (2026-06-20) by a
+byte-parity + autocorrelation test on the extracted layer, with a GCV-20
+positive control:
+
+- **Test.** Split the layer bytes into even/odd-index streams and compare their
+  spread/entropy, plus lag-1 vs lag-2 autocorrelation. A 16-bit-LE echo shows a
+  **smooth-MSB / noisy-LSB** split between parities and `lag1 < lag2`; a true
+  8-bit echo shows **identical parity stats** and `lag1 > lag2` (adjacent bytes
+  are samples).
+- **GCV-10 side-scan = 8-bit** ("dark" layer), both captures — survey: even/odd
+  entropy 7.24 ≈ 7.25, `lag1 0.93 > lag2 0.87`; bench: even/odd std 87.7 = 87.7,
+  `lag1 0.997 > lag2 0.991`.
+- **GCV-10 water-column = 16-bit LE** (bench `0x0d`): MSB std 36.5 < LSB std 74.2,
+  `lag1 −0.29 < lag2 0.41`.
+- **GCV-20 = 16-bit LE** (06-19 wet bag): MSB std 13.0 ≪ LSB std 76.7,
+  `lag1 −0.41 < lag2 0.50`.
 
 ### 4.2 Channel marker — `d807`
 

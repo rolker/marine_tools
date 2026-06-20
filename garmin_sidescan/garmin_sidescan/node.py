@@ -45,7 +45,7 @@ from .commands import (
     TRANSMIT_ON,
 )
 from .decode import (
-    CHANNEL_OFFSET, dark_layer, derive_sample_rate, EB07, echo_layer,
+    CHANNEL_OFFSET, derive_sample_rate, EB07,
     generation_from_layers, GRID_BINS, is_water_column, marker_temperature_c,
     MIN_DATA_LEN, PingAssembler, status_transmitting)
 
@@ -306,11 +306,10 @@ class GarminSidescanNode(Node):
         # with a heartbeat so a steady reading still ticks (see _emit_temperature).
         self._last_temp_c = None
         self._last_temp_t = None
-        # Sample format, set when the assembler is built from the generation
-        # (GCV-20 = 16-bit uint16-LE, GCV-10 = 8-bit). Defaults are harmless
-        # until then; no pings are emitted before the assembler exists.
-        self._sonar_dtype = SonarImageData.DTYPE_UINT8
-        self._bytes_per_sample = 1
+        # Sample format is per-channel, carried on each ScanLine (`bits`) and
+        # applied in _make_sonar_msg -- the GCV-10 side-scan is 8-bit while its
+        # water-column and all GCV-20 channels are 16-bit, so there is no single
+        # device-wide dtype.
         self._running = True
         # diagnostics state
         self._last_ping_t = None          # monotonic time of last emitted ping
@@ -677,21 +676,15 @@ class GarminSidescanNode(Node):
             sock.close()
 
     def _make_assembler(self, gen):
-        # GCV-20 echo is 16-bit (uint16-LE, 2 bytes/sample); GCV-10's dark layer
-        # is 8-bit. The extractor emits raw bytes; dtype/stride say how to read
-        # them in _make_sonar_msg.
-        if gen == 'gcv20':
-            extractor = echo_layer
-            self._sonar_dtype = SonarImageData.DTYPE_UINT16
-            self._bytes_per_sample = 2
-        else:
-            extractor = dark_layer
-            self._sonar_dtype = SonarImageData.DTYPE_UINT8
-            self._bytes_per_sample = 1
+        # Extraction is per-packet: PingAssembler self-selects dark_layer (8-bit)
+        # vs echo_layer (16-bit) from each packet's render-layer structure, so
+        # the assembler is generation-agnostic. This is what lets the GCV-10
+        # water-column (a 16-bit echo layer) decode even though the device
+        # latches as GCV-10 -- a single device-wide extractor blanked it.
         self.get_logger().info(
-            f'imagery decode: {gen} ({extractor.__name__}, '
-            f'{8 * self._bytes_per_sample}-bit)')
-        return PingAssembler(extractor)
+            f'imagery decode: device {gen}; per-channel extraction '
+            '(GCV-10 side=8-bit dark, water-column/GCV-20=16-bit echo)')
+        return PingAssembler()
 
     def _detect_generation(self, payload):
         """
@@ -748,7 +741,8 @@ class GarminSidescanNode(Node):
         self._ping_count[side] += 1
         self._last_ping_t = time.monotonic()
         self._pub_sonar[side].publish(
-            self._make_sonar_msg(side, line.samples, line.stamp, line.subheader))
+            self._make_sonar_msg(side, line.samples, line.stamp, line.subheader,
+                                 line.bits))
         # Nadir bottom range: the per-ping sub-header v1 varint. It is shared
         # across channels (the boat's depth), but published once per ping from
         # the down-look -- the beam that actually measures it. max_range is
@@ -787,7 +781,7 @@ class GarminSidescanNode(Node):
         msg.variance = 0.0          # unknown (0 = "variance unknown" per the spec)
         self._pub_temperature.publish(msg)
 
-    def _make_sonar_msg(self, side, samples, stamp, sub=None):
+    def _make_sonar_msg(self, side, samples, stamp, sub=None, bits=16):
         msg = RawSonarImage()
         msg.header.stamp = stamp.to_msg()
         # Per-channel frame so TF orients each transducer (see FRAME_SUFFIX).
@@ -809,7 +803,8 @@ class GarminSidescanNode(Node):
         # range is its auto-ranged water-column extent, never the commanded
         # swath, so a wrong-but-confident ~2x scale must not be published --
         # better "unavailable" than wrong.
-        bins = len(samples) // self._bytes_per_sample
+        bytes_per_sample = bits // 8
+        bins = len(samples) // bytes_per_sample
         if bins > GRID_BINS:
             # The device is not expected to exceed the fixed grid; if it does,
             # the grid model is violated and the scale below is wrong for the
@@ -837,7 +832,8 @@ class GarminSidescanNode(Node):
         msg.tx_angles = [0.0]
         msg.rx_angles = [0.0]
         msg.image.is_bigendian = False        # GCV samples are little-endian
-        msg.image.dtype = self._sonar_dtype
+        msg.image.dtype = (SonarImageData.DTYPE_UINT16 if bits == 16
+                           else SonarImageData.DTYPE_UINT8)
         msg.image.beam_count = 1
         msg.image.data = bytes(samples)
         return msg
