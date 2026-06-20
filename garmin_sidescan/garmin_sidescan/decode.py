@@ -534,6 +534,7 @@ class PingAssembler:
         self._t0 = 0.0
         self._cur_sub = None
         self._cur_bits = 16
+        self._cur_extract = force_extractor or dark_layer
 
     def _emit(self, out):
         if self._cur_ch is not None and self._acc:
@@ -559,28 +560,33 @@ class PingAssembler:
                 self._cur_ch = None
         elif payload[:2] == EB07 and len(payload) > MIN_DATA_LEN:
             ch = payload[CHANNEL_OFFSET]
-            # Pick the extractor from THIS packet's structure (unless pinned):
-            # the 3-layer "dark" form (>=2 later-layer headers, i.e.
-            # generation_from_layers == 'gcv10') is the GCV-10 8-bit side-scan;
-            # every other sample packet is a 16-bit echo layer -- all GCV-20
-            # channels and, crucially, the GCV-10 water-column (a single echo
-            # layer with no later-layer header, which the old device-wide
-            # dark_layer extractor blanked).
-            if self._force is not None:
-                extract = self._force
-            else:
-                extract = (dark_layer if generation_from_layers(payload) == 'gcv10'
-                           else echo_layer)
-            block = extract(payload)
             if ch != self._cur_ch:
                 self._emit(out)
                 self._cur_ch = ch
                 self._t0 = recv_time
-                self._cur_bits = 8 if extract is dark_layer else 16
+                # Pin the extractor for the whole run from its first packet's
+                # render-layer structure (unless force-pinned): the 3-layer
+                # "dark" form (>=2 later-layer headers, generation_from_layers
+                # == 'gcv10') is the GCV-10 8-bit side-scan; every other sample
+                # packet is a 16-bit echo layer -- all GCV-20 channels and,
+                # crucially, the GCV-10 water-column (a single echo layer the
+                # old device-wide dark_layer extractor blanked). A run is one
+                # channel with one render-layer form, so pinning keeps _cur_bits
+                # and the leading-strip in step with the accumulated bytes even
+                # if a later (e.g. dropped/garbled) packet would classify
+                # differently.
+                self._cur_extract = (
+                    self._force if self._force is not None
+                    else (dark_layer if generation_from_layers(payload) == 'gcv10'
+                          else echo_layer))
+                self._cur_bits = 8 if self._cur_extract is dark_layer else 16
+                block = self._cur_extract(payload)
                 # The per-ping leading header rides only the first packet of a
                 # scan line, and only on the echo_layer (16-bit) streams.
-                if extract is echo_layer:
+                if self._cur_extract is echo_layer:
                     block = strip_leading_ping_header(block)
+            else:
+                block = self._cur_extract(payload)
             if self._cur_sub is None:
                 # Every packet of a run repeats the same sub-header values, so
                 # the first packet that parses tags the whole run (a garbled

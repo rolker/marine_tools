@@ -848,7 +848,6 @@ class GarminSidescanNode(Node):
             name='garmin_sidescan: imagery', hardware_id=self._gcv_ip,
             level=lvl, message=msg, values=[
                 KeyValue(key='device', value=self._detected_gen or 'detecting'),
-                KeyValue(key='dtype_bits', value=str(8 * self._bytes_per_sample)),
                 KeyValue(key='last_ping_age_s',
                          value='n/a' if ping_age is None else f'{ping_age:.1f}'),
                 KeyValue(key='pings_port_stbd_down',
