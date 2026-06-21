@@ -111,17 +111,57 @@ dynamically: the node publishes a `RadarControlSet` on `state` and accepts
 ## Protocol notes
 
 Decode is validated against a real GCV-10 survey capture (see
-`test/test_decode.py`). Two fields are deliberately **not** taken from the
-imagery stream because they are not reliably present there:
+`test/test_decode.py`). These fields are not present in the imagery stream and
+are sourced separately:
 
-- **Frequency** is not encoded in the imagery sub-header, so it cannot be
-  derived from the side-scan/down-look mode without baking in a transducer
-  assumption. It is a per-channel parameter (`freq_*_hz`), default `0.0` =
-  unavailable. Set it explicitly for a known transducer if a populated
-  `ping_info.frequency` is needed.
+- **Frequency** is not encoded in the imagery sub-header. It is filled from a
+  `(generation, channel) → Hz` table (see [Sensor constants](#sensor-constants))
+  once the device generation is latched, so `ping_info.frequency` is populated
+  automatically for known generations. The per-channel `freq_*_hz` parameters
+  (default `0.0`) override the table when set to a non-zero value; `0.0` keeps
+  the table fallback (and yields `0.0` = unavailable if the generation is still
+  unknown). This replaces the earlier behaviour where frequency was left at
+  `0.0` unless a param was set — the table avoids forcing operators to know the
+  band while still letting them override per transducer.
 - **Timestamp**: the stream carries no usable per-ping clock, so each scan line
   is stamped with the ROS receive time of its first packet. On an NTP-synced
   host this is accurate to a few ms; note it is receive (not transmit) time.
+
+### Sensor constants
+
+Frequency and beamwidths are not in the imagery stream, so the driver carries a
+small table of per-generation constants (`_FREQ_HZ`, `_RX_BEAMWIDTH_RAD`,
+`_TX_BEAMWIDTH_RAD` in `node.py`), applied once the generation is latched.
+
+**Frequency** (band-centre, Hz):
+
+| Generation | Channel | Frequency | Note |
+|-----------|---------|-----------|------|
+| GCV-20 | port / stbd (SideVü) | 1,120,000 | band 1,060–1,170 kHz; "1,200 kHz" is a rounded marketing label, so the band centre 1,120 kHz is used |
+| GCV-20 | down (ClearVü) | 820,000 | band 760–880 kHz |
+| GCV-10 | port / stbd (SideVü) | 455,000 | nominal Garmin spec-sheet figure |
+| GCV-10 | down (ClearVü) | 800,000 | nominal Garmin spec-sheet figure |
+
+**Beamwidths** — full −3 dB widths in **radians**, per `PingInfo.msg`. A
+sidescan does no across-track beamforming, so the across-track *receive* beam's
+−3 dB directivity **is** the wide fan; the along-track *transmit* beam is the
+narrow resolution dimension:
+
+- `ping_info.rx_beamwidths = [across-track full −3 dB width]` (the wide fan).
+- `ping_info.tx_beamwidths = [along-track full −3 dB width]` (narrow).
+
+| Generation | Channel | rx (across-track) | tx (along-track) |
+|-----------|---------|-------------------|------------------|
+| GCV-20 | port / stbd (SideVü) | 55° (`radians(55.0)`) | 0.44° (`radians(0.44)`) |
+| GCV-20 | down (ClearVü) | 46° (`radians(46.0)`) | 0.74° (`radians(0.74)`) |
+| GCV-10 | — | not populated | not populated |
+
+GCV-10 beamwidths are deliberately omitted (spec unconfirmed); the fields are
+left empty (= unavailable) rather than stamped with a guess. The values are full
+−3 dB widths in radians, **not** half-angles. Consumers that misread this are
+fixed on their own side, not by bending the producer: CUBE currently reads
+`rx_beamwidths` as degrees (rolker/cube_bathymetry#30), and `rviz_sonar_image`
+treats it as a half-angle — both are consumer bugs handled in those packages.
 
 ### Range scale, near-field gate, and `sound_speed`
 
@@ -155,7 +195,7 @@ correction must match this parameter, or it double-corrects the range.
 | `gcv_ip` | `172.16.3.0` | GCV-20; GCV-10 = `172.16.3.196` |
 | `iface_ip` | `''` | local NIC IP for the multicast join (set on multi-homed hosts) |
 | `port_channels` / `stbd_channels` / `down_channels` | `[0]` / `[1]` / `[2]` | GCV-20 map; GCV-10 survey data used port=`[3]`, stbd=`[1]` |
-| `freq_port_hz` / `freq_stbd_hz` / `freq_down_hz` | `0.0` | set per transducer; 0 = unavailable |
+| `freq_port_hz` / `freq_stbd_hz` / `freq_down_hz` | `0.0` | per-transducer override; `0.0` uses the generation table (see [Sensor constants](#sensor-constants)) |
 | `sample_rate_hz` | `0.0` | last-resort fallback when neither the sub-header v2 nor a commanded range gives a scale; 0 = unavailable |
 | `nadir_frame_id` | `''` | frame for `nadir_depth` (+X down); empty derives `<frame_id>_nadir` |
 | `nadir_beam_width_rad` | `0.0` | `Range.field_of_view` for `nadir_depth` |
