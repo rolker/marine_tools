@@ -137,7 +137,7 @@ small table of per-generation constants (`_FREQ_HZ`, `_RX_BEAMWIDTH_RAD`,
 
 | Generation | Channel | Frequency | Note |
 |-----------|---------|-----------|------|
-| GCV-20 | port / stbd (SideVü) | 1,120,000 | band 1,060–1,170 kHz; "1,200 kHz" is a rounded marketing label, so the band centre 1,120 kHz is used |
+| GCV-20 | port / stbd (SideVü) | 1,120,000 | band 1,060–1,170 kHz (mid ~1,115); "1,200 kHz" is a rounded marketing label — we use ~1,120 kHz, the live 742xs readout near the band centre |
 | GCV-20 | down (ClearVü) | 820,000 | band 760–880 kHz |
 | GCV-10 | port / stbd (SideVü) | 455,000 | nominal Garmin spec-sheet figure |
 | GCV-10 | down (ClearVü) | 800,000 | nominal Garmin spec-sheet figure |
@@ -149,6 +149,11 @@ narrow resolution dimension:
 
 - `ping_info.rx_beamwidths = [across-track full −3 dB width]` (the wide fan).
 - `ping_info.tx_beamwidths = [along-track full −3 dB width]` (narrow).
+
+Note: the **rx = across-track / tx = along-track** axis assignment is a producer
+convention (the physical sidescan beam is the same array for tx and rx); it is
+not derivable from `PingInfo.msg`, so a consumer averaging/comparing the two
+fields should be aware of which axis each carries.
 
 | Generation | Channel | rx (across-track) | tx (along-track) |
 |-----------|---------|-------------------|------------------|

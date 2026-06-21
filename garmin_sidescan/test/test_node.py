@@ -64,3 +64,11 @@ def test_unknown_generation_leaves_zero_freq_and_no_beamwidth():
     assert freq == 0.0
     assert rx is None
     assert tx is None
+
+
+def test_gcv10_fills_freq_but_not_beamwidth():
+    """Partial coverage: GCV-10 has a frequency but no confirmed beamwidth."""
+    freq, rx, tx = _resolve_freq_bw('gcv10', 'down', 0.0)
+    assert freq == 800_000.0
+    assert rx is None
+    assert tx is None
