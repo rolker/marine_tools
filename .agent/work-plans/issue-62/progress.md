@@ -31,3 +31,64 @@ issue: 62
 - [ ] (suggestion) Override asymmetry: frequency has `freq_*_hz` override, beamwidth has none; a non-GT34UHD-TM GCV-20 gets a wrong beamwidth with no escape hatch. Add a `beamwidth_*_rad` override or loudly document the transducer-specific assumption. — `plan.md:117-119`
 - [ ] (suggestion) `rx_beamwidths` semantic is a cross-package interface decision (cube_bathymetry, kongsberg, any RawSonarImage consumer); plan marks ADR-0001 "marginal". Per ADR-0008 + consequences map, record an ADR or explicit cross-package note. — `plan.md:197`
 - [ ] (minor) GCV-20 SideVü band midpoint of 1,060-1,170 kHz is 1,115 kHz; plan uses 1,120,000 Hz — within band, documented as marketing-rounding, acceptable. — `plan.md:76-77`
+
+## Implementation
+**Status**: complete
+**When**: 2026-06-21 05:00 +00:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Branch**: feature/issue-62 at `c3dcec5`
+**Commit**: `c3dcec5` — garmin_sidescan: fill ping_info frequency + beamwidths from generation table (#62)
+
+### What changed
+- `garmin_sidescan/garmin_sidescan/node.py`:
+  - Added module-level `_FREQ_HZ` (gen, side → Hz; GCV-20 SideVü 1.12 MHz /
+    ClearVü 820 kHz, GCV-10 455 / 800 kHz) and the **settled** beamwidth tables
+    `_RX_BEAMWIDTH_RAD` (across-track wide fan: 55°/55°/46°) and
+    `_TX_BEAMWIDTH_RAD` (along-track narrow: 0.44°/0.44°/0.74°), full −3 dB
+    widths in radians per `PingInfo.msg`. GCV-10 beamwidths omitted (unconfirmed).
+  - Added pure, ROS-free helper `_resolve_freq_bw(gen, side, freq_override)` →
+    `(freq, rx_or_None, tx_or_None)`: non-zero param overrides the freq table;
+    unknown generation → freq 0.0 and both beamwidths `None`.
+  - `_make_sonar_msg` now computes the effective generation (explicit `device`
+    param wins over the auto-detect vote) and stamps `ping_info.frequency`,
+    `rx_beamwidths`, `tx_beamwidths` via the helper. Updated the `freq_*_hz`
+    param comment to mention the table fallback.
+- `garmin_sidescan/README.md`: rewrote the self-contradicting "Protocol notes"
+  frequency paragraph (it documented the *opposite* decision — review-plan
+  must-fix #1) and added a "Sensor constants" subsection (frequency table +
+  marketing-label note, rx=across / tx=along axis convention in radians, GCV-10
+  omission, and a pointer that CUBE's degrees read (cube#30) and rviz's
+  half-angle read are consumer bugs handled elsewhere). Updated the `freq_*_hz`
+  Key-parameters row.
+- `garmin_sidescan/test/test_node.py` (new): table coverage (all freq + the 3
+  rx + 3 tx entries present/positive/sane, rx > tx, rx < π, GCV-10 absent),
+  table-fills-when-param-zero (gcv20 port → 1.12e6 / rad(55) / rad(0.44); down
+  channel too), explicit-param-overrides-table, and unknown-generation →
+  freq 0.0 + both beamwidths empty. Tests hit the pure helper (no ROS spin).
+
+### Build / test status
+- **Lint**: `ament_flake8` and `ament_pep257` both pass on `node.py` and the new
+  `test/test_node.py` (exit 0).
+- **Helper logic**: verified standalone (extracted the tables + `_resolve_freq_bw`
+  via AST, ran every test assertion — all pass) since it is deliberately ROS-free.
+- **Field names**: confirmed against `/opt/ros/jazzy/share/marine_acoustic_msgs/
+  msg/PingInfo.msg` — `frequency`, `tx_beamwidths`, `rx_beamwidths`, documented
+  there as "-3db beamwidths" (radians), matching the convention used here.
+- **`colcon test` NOT run in-container**: importing `node.py` pulls in two
+  lower-layer deps that are not built in this worktree's install spaces —
+  `marine_control_py` (core_ws, a shared lower layer) and
+  `marine_radar_control_msgs` (needs the rosidl toolchain). `marine_acoustic_msgs`
+  and `rcl_interfaces` are present. Building the lower layers is a workspace-
+  provisioning step (and would write into the shared `main/core_ws/install`), not
+  part of this code change. **Host must run `colcon test` for `garmin_sidescan`
+  with the layers built to confirm the four pytest cases pass under a real spin.**
+
+### Notes for review
+- The beamwidth convention follows the SETTLED operator decision (plan commit
+  `10a175e`): tx=along-track, rx=across-track, full −3 dB radians. The stale
+  "Step 4" text in `plan.md` (still naming `_BEAMWIDTH_RAD` / a 27.5° half-angle)
+  was superseded by the settled tables at `plan.md:46-63` and was not followed.
+- Review-plan must-fix #2 (the cube/kongsberg `rx_beamwidths` semantics dispute)
+  is, per the dispatch instructions, treated as a **consumer-side** concern fixed
+  in cube_bathymetry (cube#30) / rviz_sonar_image — deliberately NOT touched here.
