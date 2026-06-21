@@ -79,6 +79,64 @@ SIDES = ('port', 'stbd', 'down')
 # non-traditional/backwards install -- lives entirely in TF, never here.
 FRAME_SUFFIX = {'port': 'port', 'stbd': 'starboard', 'down': 'down'}
 
+# (generation, side) -> centre frequency in Hz.  Frequency is not carried in
+# the imagery stream, so it is looked up from the latched generation when the
+# freq_*_hz param is left at 0.0 (an explicit non-zero param overrides this).
+# The GCV-20 SideVu band is 1,060-1,170 kHz; "1,200 kHz" is a rounded marketing
+# label -- use the band centre 1,120 kHz.  ClearVu (down) band is 760-880 kHz,
+# centre 820 kHz.  GCV-10 values are nominal Garmin spec-sheet figures.
+_FREQ_HZ = {
+    ('gcv20', 'port'): 1_120_000.0,
+    ('gcv20', 'stbd'): 1_120_000.0,
+    ('gcv20', 'down'): 820_000.0,
+    ('gcv10', 'port'): 455_000.0,
+    ('gcv10', 'stbd'): 455_000.0,
+    ('gcv10', 'down'): 800_000.0,
+}
+
+# (generation, side) -> full -3 dB beamwidth in radians (PingInfo.msg = radians).
+# A sidescan does no across-track beamforming, so the across-track *receive*
+# beam's -3 dB directivity IS the wide fan -> rx_beamwidths; the along-track
+# *transmit* beam is the narrow resolution dim -> tx_beamwidths.  These are the
+# FULL -3 dB widths, NOT half-angles.  GCV-10 beamwidths are not populated (spec
+# unconfirmed) -- omission keeps the "empty = unavailable" convention.
+_RX_BEAMWIDTH_RAD = {                          # across-track (wide receive fan)
+    ('gcv20', 'port'): math.radians(55.0),     # SideVu
+    ('gcv20', 'stbd'): math.radians(55.0),
+    ('gcv20', 'down'): math.radians(46.0),     # ClearVu
+}
+_TX_BEAMWIDTH_RAD = {                          # along-track (narrow resolution)
+    ('gcv20', 'port'): math.radians(0.44),     # SideVu
+    ('gcv20', 'stbd'): math.radians(0.44),
+    ('gcv20', 'down'): math.radians(0.74),     # ClearVu
+}
+
+
+def _resolve_freq_bw(gen, side, freq_override):
+    """
+    Resolve (frequency_hz, rx_beamwidth_rad, tx_beamwidth_rad) for a channel.
+
+    Pure helper (no ROS dependency) so it is unit-testable without a node.
+
+    ``freq_override`` is the explicit ``freq_*_hz`` param: any non-zero value
+    wins; only when it is 0.0 does the generation table fill the frequency.
+    Beamwidths come from the table whenever the generation is known; ``rx`` and
+    ``tx`` are returned as ``None`` when unavailable (unknown generation, or a
+    generation whose beamwidths are not characterised), so the caller leaves the
+    corresponding ``*_beamwidths`` field empty rather than stamping a wrong value.
+
+    Both beamwidths are full -3 dB widths in radians (PingInfo.msg): ``rx`` is
+    across-track (the wide receive fan), ``tx`` is along-track (narrow). CUBE
+    reading rx_beamwidths as degrees (cube#30) and rviz_sonar_image as a
+    half-angle are consumer bugs fixed separately -- the producer follows the .msg.
+    """
+    freq = freq_override
+    if freq == 0.0 and gen is not None:
+        freq = _FREQ_HZ.get((gen, side), 0.0)
+    rx = _RX_BEAMWIDTH_RAD.get((gen, side)) if gen is not None else None
+    tx = _TX_BEAMWIDTH_RAD.get((gen, side)) if gen is not None else None
+    return freq, rx, tx
+
 
 def build_nadir_range(depth_m, frame_id, stamp, field_of_view, max_range):
     """
@@ -175,8 +233,10 @@ class GarminSidescanNode(Node):
         self.declare_parameter('stbd_channels', [1])
         self.declare_parameter('down_channels', [2])
 
-        # frequency is NOT carried in the imagery stream; set per transducer or
-        # leave 0.0 = unavailable (RawSonarImage/PingInfo convention).
+        # frequency is NOT carried in the imagery stream. Leave 0.0 to fall back
+        # to the generation->frequency table (_FREQ_HZ, filled once the device
+        # generation is latched); a non-zero value here overrides the table per
+        # transducer (RawSonarImage/PingInfo convention: 0.0 = unavailable).
         self.declare_parameter('freq_port_hz', 0.0)
         self.declare_parameter('freq_stbd_hz', 0.0)
         self.declare_parameter('freq_down_hz', 0.0)
@@ -786,7 +846,16 @@ class GarminSidescanNode(Node):
         msg.header.stamp = stamp.to_msg()
         # Per-channel frame so TF orients each transducer (see FRAME_SUFFIX).
         msg.header.frame_id = f'{self._frame_id}_{FRAME_SUFFIX[side]}'
-        msg.ping_info.frequency = self._freq[side]
+        # Effective generation: an explicit gcv20/gcv10 device param wins over the
+        # auto-detected vote; None until auto-detect converges. Fills frequency and
+        # beamwidths from the sensor-constant tables (see _resolve_freq_bw).
+        gen = self._device if self._device in ('gcv20', 'gcv10') else self._detected_gen
+        freq, rx_bw, tx_bw = _resolve_freq_bw(gen, side, self._freq[side])
+        msg.ping_info.frequency = freq
+        if rx_bw is not None:
+            msg.ping_info.rx_beamwidths = [rx_bw]   # across-track (wide receive fan)
+        if tx_bw is not None:
+            msg.ping_info.tx_beamwidths = [tx_bw]   # along-track (narrow resolution)
         sv = self._sound_speed
         msg.ping_info.sound_speed = sv
         # The GCV frames each ping as a fixed GRID_BINS-sample line spanning
