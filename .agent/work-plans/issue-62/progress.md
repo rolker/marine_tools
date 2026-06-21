@@ -92,3 +92,28 @@ issue: 62
 - Review-plan must-fix #2 (the cube/kongsberg `rx_beamwidths` semantics dispute)
   is, per the dispatch instructions, treated as a **consumer-side** concern fixed
   in cube_bathymetry (cube#30) / rviz_sonar_image — deliberately NOT touched here.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-06-21 05:27 +00:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-62 at `68254a4`
+**Mode**: pre-push
+**Depth**: Standard (reason: cross-package message-interface change — rx/tx_beamwidths semantics, flagged must-fix at plan review)
+**Must-fix**: 1 | **Suggestions**: 5
+**Round**: 1 | **Ship**: continue — producer code is spec-correct, but one cross-package rollout consequence (CUBE/rviz misread) needs verification before push, plus minor doc/test items
+
+### Findings
+- [ ] (must-fix) Populating `rx_beamwidths`/`tx_beamwidths` changes output for consumers that currently misread it — CUBE reads it as degrees (cube_bathymetry#30), rviz as a half-angle. Code is correct per `PingInfo.msg`; verify those consumer fixes are merged (gh unauthenticated here, unconfirmed) or coordinate deployment ordering before pushing, else CUBE footprint/error is corrupted (kongsberg leaves it empty for this reason). Residue of plan-review must-fix #2. — `garmin_sidescan/garmin_sidescan/node.py:855-858`
+- [ ] (suggestion) README arithmetic contradiction: band "1,060–1,170 kHz" with "band centre 1,120 kHz", but the midpoint is 1,115 kHz — reword for self-consistency. — `garmin_sidescan/README.md` (Sensor constants)
+- [ ] (suggestion) No test for the partial-coverage branch (`gcv10` → real freq but `rx`/`tx` None); add `_resolve_freq_bw('gcv10','down',0.0) == (800000.0, None, None)`. — `garmin_sidescan/test/test_node.py`
+- [ ] (suggestion) Override asymmetry: freq has a `freq_*_hz` escape hatch, beamwidth has none; consider a `beamwidth_*_rad` override / enable flag. — `garmin_sidescan/garmin_sidescan/node.py:88-110,240-242`
+- [ ] (suggestion) rx=across / tx=along is a producer convention not derivable from `PingInfo.msg`; add a one-line caveat for averaging/comparing consumers. — `garmin_sidescan/README.md` (beamwidth section)
+- [ ] (suggestion) Negative `freq_*_hz` passes the `==0.0` override gate and publishes verbatim (pre-existing); a `>=0` guard / `FloatingPointRange(from_value=0.0)` would close it. — `garmin_sidescan/garmin_sidescan/node.py:134`
+
+### Notes
+- Static analysis clean under the authoritative ament profile (`ament_flake8` + `ament_pep257`, all three changed `.py` files, no problems). Plain `flake8` import-order/docstring plugins (I101/I201/D1xx) are not in the ament config and mostly hit untouched pre-existing import lines — not applicable.
+- `colcon test` still not run in-container (lower-layer deps `marine_control_py` / `marine_radar_control_msgs` unbuilt — see Implementation entry); helper logic re-verified standalone. Host should run the four `test_node.py` cases under a real spin.
+- Reviewed against `origin/jazzy` (8 commits ahead, clean merge-base); the repo symref default `noetic` is the ROS1 line and not the base for this ROS2 work.
