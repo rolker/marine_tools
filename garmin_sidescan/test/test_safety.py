@@ -420,7 +420,7 @@ def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
 
     def fake(side):
         return types.SimpleNamespace(
-            _frame_id='gs', _freq={side: 0.0},
+            _frame_id='gs', _freq={side: 0.0}, _device='auto', _detected_gen=None,
             _sound_speed=1500.0,
             _controls={'range': '50.0'}, _sample_rate=0.0,
             _make_sonar_msg=GarminSidescanNode._make_sonar_msg)
@@ -450,7 +450,8 @@ def test_make_sonar_msg_encodes_near_field_gate():
                     bottom_range_m=0.381, display_range_m=1.843,
                     near_field_m=0.0985)
     node = types.SimpleNamespace(
-        _frame_id='gs', _freq={'down': 0.0}, _sound_speed=1500.0,
+        _frame_id='gs', _freq={'down': 0.0}, _device='auto', _detected_gen=None,
+        _sound_speed=1500.0,
         _controls={'range': '0.0'}, _sample_rate=0.0,
         get_logger=lambda: _FakeLogger())
     samples = bytes(2 * 1943)                    # 1943 uint16 bins
@@ -478,7 +479,8 @@ def test_make_sonar_msg_bits_sets_dtype_and_stride():
     from builtin_interfaces.msg import Time
     from marine_acoustic_msgs.msg import SonarImageData
     node = types.SimpleNamespace(
-        _frame_id='gs', _freq={'port': 0.0}, _sound_speed=1500.0,
+        _frame_id='gs', _freq={'port': 0.0}, _device='auto', _detected_gen=None,
+        _sound_speed=1500.0,
         _controls={'range': '0.0'}, _sample_rate=1000.0,
         get_logger=lambda: _FakeLogger())
     stamp = types.SimpleNamespace(to_msg=lambda: Time())
