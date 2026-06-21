@@ -43,21 +43,24 @@ overrides the table value).
 | gcv10     | stbd   | ~455 kHz nom  | 455,000               | SideVü |
 | gcv10     | down   | ~800 kHz nom  | 800,000               | ClearVü |
 
-### Beamwidth values (GT34UHD-TM, across-track fan half-angle)
+### Beamwidth values (GT34UHD-TM) — full −3 dB widths, radians (PingInfo.msg is authoritative)
 
-| Generation | Role   | Az (°) | Fan (°) | Half-angle (rad) | Note |
-|-----------|--------|--------|---------|-----------------|------|
-| gcv20     | port   | 0.44   | 55      | 0.480 (~27.5°)  | SideVü |
-| gcv20     | stbd   | 0.44   | 55      | 0.480 (~27.5°)  | SideVü |
-| gcv20     | down   | 0.74   | 46      | 0.401 (~23°)    | ClearVü |
-| gcv10     | —      | n/a    | n/a     | not populated   | spec not confirmed; leave 0.0 |
+**Convention (operator-settled 2026-06-21):** a sidescan does no across-track
+beamforming, so the across-track *receive* beam's −3 dB directivity **is** the wide fan.
+Carry both axes across the two fields:
+- `rx_beamwidths = [across-track full −3 dB beamwidth, rad]` — the wide receive fan.
+- `tx_beamwidths = [along-track full −3 dB beamwidth, rad]` — the narrow resolution dim.
 
-Convention used: `rx_beamwidths = [across_track_half_angle_rad]`, the wedge half-angle
-that `rviz_sonar_image` (fan = `rx_angles ± rx_beamwidths`) and `cube_bathymetry` consume.
-Along-track azimuth half-width is not populated in `rx_beamwidths` (the field has one
-element per beam; a second element for along-track would require a spec extension — leave
-a code comment noting the limitation and the recommendation to propose an upstream
-`PingInfo.msg` comment clarifying `rx_beamwidths` for single-beam/sidescan).
+Both are the **full** −3 dB width in **radians** — NOT a half-angle. (The earlier
+half-angle / `rviz_sonar_image ±rx_beamwidths` framing was wrong; that half-vs-full read
+and CUBE's degrees-vs-radians read (cube#30) are **consumer bugs**, fixed separately — the
+producer follows the .msg.)
+
+| Generation | Role | Along-track → `tx_beamwidths` | Across-track → `rx_beamwidths` |
+|-----------|------|-------------------------------|--------------------------------|
+| gcv20 | port/stbd (SideVü) | 0.44° → 0.00768 rad | 55° → 0.9599 rad |
+| gcv20 | down (ClearVü)      | 0.74° → 0.01292 rad | 46° → 0.8029 rad |
+| gcv10 | — | not populated (spec unconfirmed) | not populated |
 
 ## Approach
 
@@ -79,16 +82,18 @@ _FREQ_HZ = {
     ('gcv10', 'down'):    800_000.0,
 }
 
-# (generation, side) → across-track fan half-angle in radians.
-# Convention: rx_beamwidths[0] = half the total fan angle, so the full fan is
-# 2 × rx_beamwidths[0].  This matches what rviz_sonar_image and cube_bathymetry
-# consume (fan wedge = rx_angles ± rx_beamwidths).
-# GCV-20 GT34UHD-TM: SideVü 55° fan → 27.5° ≈ 0.480 rad; ClearVü 46° → 23° ≈ 0.401 rad.
-# GCV-10 beamwidths not confirmed from spec; leave unpopulated.
-_BEAMWIDTH_RAD = {
-    ('gcv20', 'port'): math.radians(27.5),   # SideVü across-track half-angle
-    ('gcv20', 'stbd'): math.radians(27.5),
-    ('gcv20', 'down'): math.radians(23.0),   # ClearVü across-track half-angle
+# (generation, side) → full −3 dB beamwidth in radians (PingInfo.msg = radians).
+# Sidescan: rx = across-track (the wide receive fan / directivity); tx = along-track
+# (the narrow resolution dim).  FULL −3 dB widths, not half-angles.  GCV-10 unconfirmed.
+_RX_BEAMWIDTH_RAD = {                          # across-track (wide fan)
+    ('gcv20', 'port'): math.radians(55.0),     # SideVü
+    ('gcv20', 'stbd'): math.radians(55.0),
+    ('gcv20', 'down'): math.radians(46.0),     # ClearVü
+}
+_TX_BEAMWIDTH_RAD = {                          # along-track (narrow resolution)
+    ('gcv20', 'port'): math.radians(0.44),     # SideVü
+    ('gcv20', 'stbd'): math.radians(0.44),
+    ('gcv20', 'down'): math.radians(0.74),     # ClearVü
 }
 ```
 
@@ -114,17 +119,20 @@ if freq == 0.0 and gen is not None:
 msg.ping_info.frequency = freq
 ```
 
-3. Beamwidth — populate `rx_beamwidths` from table when available (explicit params take
-   precedence if a `beamwidth_*_rad` parameter is added; for this issue no such param
-   exists — only the table populates it):
+3. Beamwidth — populate `rx_beamwidths` (across-track wide fan) **and** `tx_beamwidths`
+   (along-track narrow) from the tables once the generation is known (full −3 dB, radians):
 
 ```python
-bw = _BEAMWIDTH_RAD.get((gen, side)) if gen else None
-if bw is not None:
-    msg.ping_info.rx_beamwidths = [bw]
-# (along-track azimuth half-width is not added here: PingInfo.rx_beamwidths carries
-# one value per beam; a second element for azimuth would need an upstream spec
-# clarification.  Recommend proposing a PingInfo.msg comment upstream.)
+if gen is not None:
+    rx = _RX_BEAMWIDTH_RAD.get((gen, side))
+    tx = _TX_BEAMWIDTH_RAD.get((gen, side))
+    if rx is not None:
+        msg.ping_info.rx_beamwidths = [rx]   # across-track (wide receive fan)
+    if tx is not None:
+        msg.ping_info.tx_beamwidths = [tx]   # along-track (narrow resolution)
+# Both are full −3 dB widths in radians (PingInfo.msg). CUBE reads rx_beamwidths as
+# degrees (cube#30) and rviz_sonar_image as a half-angle — consumer bugs, fixed
+# separately, not reasons to bend the producer.
 ```
 
 Note: `rx_beamwidths` is NOT set if the generation is unknown (pre-detect warmup) — this
