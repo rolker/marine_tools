@@ -1,4 +1,5 @@
-"""Export operator-marked sonar contacts (and deployment log entries) to GeoJSON.
+r"""
+Export operator-marked sonar contacts (+ deployment log entries) to GeoJSON.
 
 Two feature sources land in one ``FeatureCollection`` so they overlay on the
 same map (QGIS, web, CAMP):
@@ -46,9 +47,9 @@ from rclpy.duration import Duration
 import rclpy.time
 from tf2_ros import Buffer
 
+from .bag_to_xtf import _lookup_pose, _stamp_ns
 from ..reader import iter_messages
 from ..xtf.geo import ecef_pose_to_geo
-from .bag_to_xtf import _lookup_pose, _stamp_ns
 
 _DEFAULT_CONTACTS = '/operator/sonar_waterfall/contacts'
 _DEFAULT_TRACK_FRAME = 'bizzy/base_link'
