@@ -73,10 +73,48 @@ def test_sonar_info_intensity_semantics_and_sentinels():
     assert math.isnan(msg.tvg_absorption_db_per_km)
     assert math.isnan(msg.source_level_db)
     assert msg.angular_normalization == SonarInfo.ANGULAR_NORMALIZATION_UNKNOWN
-    # Calibration + curve fields stay at their documented "absent" encodings.
+    # Calibration + curve fields stay at their documented "absent" encodings,
+    # and the curve provenance is honestly unknown with NaN set EXPLICITLY
+    # (uma#268 producer obligation; the rosidl default 0.0 is a plausible
+    # alpha, not a sentinel).
     assert msg.calibration_ref == ''
     assert len(msg.angular_response_angle_deg) == 0
     assert len(msg.beam_pattern_angle_deg) == 0
+    assert msg.angular_response_tl == SonarInfo.ANGULAR_RESPONSE_TL_UNKNOWN
+    assert math.isnan(msg.angular_response_absorption_db_per_m)
+
+
+def test_sonar_info_angular_response_tier1():
+    angular = ([(0.5, 0.0), (30.5, -12.0)], False, 0.0)
+    msg = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), angular)
+    assert list(msg.angular_response_angle_deg) == [0.5, 30.5]
+    assert list(msg.angular_response_db_rel_nadir) == [0.0, -12.0]
+    assert len(msg.angular_response_angle_deg) \
+        == len(msg.angular_response_db_rel_nadir)
+    assert msg.angular_response_tl == SonarInfo.ANGULAR_RESPONSE_TL_IN
+    # Tier-1: absorption not meaningful -> NaN, not the CSV default 0.0.
+    assert math.isnan(msg.angular_response_absorption_db_per_m)
+
+
+def test_sonar_info_angular_response_tier2():
+    angular = ([(0.5, 0.0), (30.5, -6.0)], True, 0.00025)
+    msg = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), angular)
+    assert msg.angular_response_tl == SonarInfo.ANGULAR_RESPONSE_TL_REMOVED
+    # Verbatim alpha (consumers never recompute it, cube#87).
+    assert abs(msg.angular_response_absorption_db_per_m - 0.00025) < 1e-9
+
+
+def test_sonar_info_empty_curve_triple_matches_none():
+    # An explicitly-empty loader result behaves exactly like angular=None.
+    # (No whole-message equality: the NaN sentinels make msg == msg False.)
+    a = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), ([], False, 0.0))
+    b = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg())
+    for msg in (a, b):
+        assert len(msg.angular_response_angle_deg) == 0
+        assert len(msg.angular_response_db_rel_nadir) == 0
+        assert msg.angular_response_tl \
+            == SonarInfo.ANGULAR_RESPONSE_TL_UNKNOWN
+        assert math.isnan(msg.angular_response_absorption_db_per_m)
 
 
 def test_acquisition_signature_change_detection():

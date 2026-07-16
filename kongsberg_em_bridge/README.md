@@ -27,6 +27,7 @@ wire-format translator: geometry and TPU happen downstream
 | `frame_id` | `m3` | Frame for both published topics. |
 | `skip_invalid_beams` | `true` | Drop beams the sonar flagged invalid (required by the CUBE error model). |
 | `sonar_info_period` | `10.0` | SonarInfo heartbeat seconds; must be shorter than the recorder's shortest split segment. `<= 0` disables (not recommended when recording). |
+| `angular_response_curve_file` | `''` | Empirical angular-response curve CSV (from `cube_bathymetry`'s `derive_angular_response.py`) declared in SonarInfo with its TL provenance; empty = no curve. Loaded once at startup. |
 | `save_all_dir` | `''` | Directory for raw `.all` recording (genuine Kongsberg framing, loadable by Caris/Qimera/MB-System). Empty disables. |
 | `save_all_max_seconds` / `save_all_max_bytes` | `0` / `0` | Optional `.all` segment rollover triggers; `0` disables each. |
 | `record_on_start` | `false` | Record `.all` from startup (otherwise arm via `~/set_recording`). |
