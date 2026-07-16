@@ -103,12 +103,21 @@ def parse_n78(p: bytes) -> dict:
     off = 32
     for _ in range(ntx):
         (tilt_raw,) = struct.unpack_from('<h', p, off)        # 0.01 deg
-        # sector: siglen[off+4], tx_delay[off+8], centre_freq[off+12] (float32)
-        tx_delay, ctr_freq = struct.unpack_from('<ff', p, off + 8)
+        # sector floats: siglen[off+4] (s), tx_delay[off+8] (s),
+        # centre_freq[off+12] (Hz); then waveform id[off+18] (uint8:
+        # 0=CW, 1=FM up sweep, 2=FM down sweep) and bandwidth[off+20]
+        # (float32 Hz). Signal length + waveform + bandwidth feed the
+        # SonarInfo acquisition block (marine_tools#69 / ADR-0009).
+        siglen, tx_delay, ctr_freq = struct.unpack_from('<fff', p, off + 4)
+        waveform = p[off + 18]
+        (bandwidth,) = struct.unpack_from('<f', p, off + 20)
         sectors.append({
             'tilt_deg': tilt_raw * 0.01,
+            'signal_length': siglen,
             'tx_delay': tx_delay,
             'centre_frequency': ctr_freq,
+            'waveform': waveform,
+            'bandwidth': bandwidth,
         })
         off += 24
 
