@@ -149,7 +149,7 @@ def sonar_info_from_parsed(parsed, frame_id, stamp, angular=None):
     msg.tvg_absorption_db_per_km = math.nan
     msg.source_level_db = math.nan
     msg.angular_normalization = SonarInfo.ANGULAR_NORMALIZATION_UNKNOWN
-    points, tl_removed, absorption = angular or ([], False, 0.0)
+    points, tl_removed, absorption = angular or ([], False, None)
     for angle_deg, db_rel in points:
         msg.angular_response_angle_deg.append(float(angle_deg))
         msg.angular_response_db_rel_nadir.append(float(db_rel))
@@ -159,8 +159,12 @@ def sonar_info_from_parsed(parsed, frame_id, stamp, angular=None):
     elif tl_removed:
         msg.angular_response_tl = SonarInfo.ANGULAR_RESPONSE_TL_REMOVED
         # Verbatim from the CSV header: consumers apply alpha as-is in
-        # 40*log10(R) + 2*alpha*R and never recompute it (cube#87).
-        msg.angular_response_absorption_db_per_m = float(absorption)
+        # 40*log10(R) + 2*alpha*R and never recompute it (cube#87). A tier-2
+        # header missing its absorption yields None from the loader -> NaN
+        # here, so the consumer sees "alpha unknown" instead of a fabricated
+        # 0.0 that would silently drop the absorption term.
+        msg.angular_response_absorption_db_per_m = (
+            math.nan if absorption is None else float(absorption))
     else:
         msg.angular_response_tl = SonarInfo.ANGULAR_RESPONSE_TL_IN
         msg.angular_response_absorption_db_per_m = math.nan

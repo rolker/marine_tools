@@ -40,7 +40,7 @@ def test_tier1_roundtrip(tmp_path):
         _write(tmp_path, TIER1_CSV))
     assert points == [(0.5, 0.0), (10.5, -4.0), (30.5, -12.0)]
     assert tl_removed is False
-    assert alpha == 0.0
+    assert alpha is None  # header absent -> honest None, never a made-up 0.0
 
 
 def test_tier2_provenance_header(tmp_path):
@@ -60,13 +60,31 @@ def test_tl_removed_value_variants(tmp_path):
         assert tl_removed is expected, value
 
 
-def test_malformed_absorption_keeps_default(tmp_path):
+def test_malformed_or_missing_absorption_yields_none(tmp_path):
+    # A tier-2 header without a parseable absorption must yield None so the
+    # producer can publish an honest NaN (SonarInfo sentinel convention) --
+    # deliberate divergence from the C++ loader's silent 0.0 default.
+    for text in ('# tl_removed: true\n# absorption_db_per_m: banana\n'
+                 '0.0,-20.0,1,0.0\n',
+                 '# tl_removed: true\n0.0,-20.0,1,0.0\n'):
+        _, tl_removed, alpha = load_angular_response_curve(
+            _write(tmp_path, text))
+        assert tl_removed is True
+        assert alpha is None
+
+
+def test_derive_tool_output_formats(tmp_path):
+    # The exact formats write_csv emits: %+.3f data rows (leading '+') and
+    # %.6g scientific-notation alphas.
     path = _write(tmp_path, '# tl_removed: true\n'
-                            '# absorption_db_per_m: banana\n'
-                            '0.0,-20.0,1,0.0\n')
-    _, tl_removed, alpha = load_angular_response_curve(path)
+                            '# absorption_db_per_m: 2.5e-05\n'
+                            'abs_angle_deg_center,mean_bs_db,n,db_relative_to_nadir\n'
+                            '0.5,-20.000,100,+0.000\n'
+                            '10.5,-24.000,90,-4.000\n')
+    points, tl_removed, alpha = load_angular_response_curve(path)
+    assert points == [(0.5, 0.0), (10.5, -4.0)]
     assert tl_removed is True
-    assert alpha == 0.0
+    assert abs(alpha - 2.5e-05) < 1e-12
 
 
 def test_skips_malformed_rows_and_sorts(tmp_path):
@@ -89,6 +107,6 @@ def test_stof_leading_prefix_tolerance(tmp_path):
 
 
 def test_missing_and_empty_path():
-    assert load_angular_response_curve('') == ([], False, 0.0)
+    assert load_angular_response_curve('') == ([], False, None)
     assert load_angular_response_curve('/nonexistent/nope.csv') \
-        == ([], False, 0.0)
+        == ([], False, None)

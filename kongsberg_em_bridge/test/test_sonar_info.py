@@ -84,8 +84,18 @@ def test_sonar_info_intensity_semantics_and_sentinels():
     assert math.isnan(msg.angular_response_absorption_db_per_m)
 
 
+def test_sonar_info_angular_response_tier2_missing_absorption():
+    # tl_removed curve whose absorption header was absent/unparseable:
+    # publish NaN, never a fabricated 0.0 (which would silently drop the
+    # absorption term in the consumer's TL add-back).
+    angular = ([(0.5, 0.0)], True, None)
+    msg = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), angular)
+    assert msg.angular_response_tl == SonarInfo.ANGULAR_RESPONSE_TL_REMOVED
+    assert math.isnan(msg.angular_response_absorption_db_per_m)
+
+
 def test_sonar_info_angular_response_tier1():
-    angular = ([(0.5, 0.0), (30.5, -12.0)], False, 0.0)
+    angular = ([(0.5, 0.0), (30.5, -12.0)], False, None)
     msg = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), angular)
     assert list(msg.angular_response_angle_deg) == [0.5, 30.5]
     assert list(msg.angular_response_db_rel_nadir) == [0.0, -12.0]
@@ -107,7 +117,7 @@ def test_sonar_info_angular_response_tier2():
 def test_sonar_info_empty_curve_triple_matches_none():
     # An explicitly-empty loader result behaves exactly like angular=None.
     # (No whole-message equality: the NaN sentinels make msg == msg False.)
-    a = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), ([], False, 0.0))
+    a = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg(), ([], False, None))
     b = sonar_info_from_parsed(_parsed(), 'm3', TimeMsg())
     for msg in (a, b):
         assert len(msg.angular_response_angle_deg) == 0
