@@ -3,12 +3,13 @@
 <package format="3">
   <name>kongsberg_em_bridge</name>
   <version>0.0.1</version>
-  <description>Decode a Kongsberg .all UDP stream (Raw Range and Angle 78) from an M3 multibeam and publish marine_acoustic_msgs/SonarDetections for the cube_bathymetry pipeline.</description>
+  <description>Decode a Kongsberg .all UDP stream (Raw Range and Angle 78) from an M3 multibeam and publish marine_acoustic_msgs/SonarDetections for the cube_bathymetry pipeline, plus a latched marine_interfaces/SonarInfo acquisition-metadata companion (ADR-0009).</description>
   <maintainer email="roland@ccom.unh.edu">Roland Arsenault</maintainer>
   <license>BSD-3-Clause</license>
 
   <depend>rclpy</depend>
   <depend>marine_acoustic_msgs</depend>
+  <depend>marine_interfaces</depend>
   <depend>builtin_interfaces</depend>
   <depend>std_srvs</depend>
 

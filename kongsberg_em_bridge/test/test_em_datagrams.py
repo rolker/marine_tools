@@ -11,7 +11,8 @@ from kongsberg_em_bridge import em_datagrams as em
 
 
 def _build_n78(beams, *, ntx_tilt_deg=0.0, ctr_freq=500000.0, tx_delay=0.001,
-               sound_speed=1490.9, date=20260604, time_ms=1000, ping=7):
+               sound_speed=1490.9, date=20260604, time_ms=1000, ping=7,
+               siglen=0.0001, waveform=0, bandwidth=12000.0):
     """
     Construct a synthetic Raw Range and Angle 78 datagram.
 
@@ -31,8 +32,8 @@ def _build_n78(beams, *, ntx_tilt_deg=0.0, ctr_freq=500000.0, tx_delay=0.001,
     sector = struct.pack(
         '<hHfffHBBf',
         round(ntx_tilt_deg * 100), 0,       # tilt 0.01 deg, focus range
-        0.0001, tx_delay, ctr_freq,         # siglen, tx delay, centre freq
-        0, 0, 0, 12000.0)                   # mean abs, waveform, sector#, bw
+        siglen, tx_delay, ctr_freq,         # siglen, tx delay, centre freq
+        0, waveform, 0, bandwidth)          # mean abs, waveform, sector#, bw
     body = b''
     for angle_deg, det_info, twtt, refl_db in beams:
         body += struct.pack(
@@ -57,12 +58,27 @@ def test_parse_n78_basic():
     assert abs(out['sound_speed'] - 1490.9) < 0.05
     assert abs(out['sectors'][0]['centre_frequency'] - 500000.0) < 1.0
     assert abs(out['sectors'][0]['tx_delay'] - 0.001) < 1e-6
+    # Acquisition fields for SonarInfo (marine_tools#69): builder defaults.
+    assert abs(out['sectors'][0]['signal_length'] - 0.0001) < 1e-9
+    assert out['sectors'][0]['waveform'] == 0
+    assert abs(out['sectors'][0]['bandwidth'] - 12000.0) < 1e-3
     b0, b1 = out['beams']
     assert abs(b0['pointing_angle_deg'] - (-30.0)) < 1e-3
     assert abs(b0['twtt'] - 0.020) < 1e-6
     assert b0['valid'] is True
     assert b1['valid'] is False        # det_info bit 7 set
     assert out['unix_time'] is not None
+
+
+def test_parse_n78_acquisition_fields_roundtrip():
+    # Non-default siglen/waveform/bandwidth survive the sector decode
+    # (FM up sweep; values in seconds / spec id / Hz).
+    dg = _build_n78([(0.0, 0x00, 0.020, -25.0)],
+                    siglen=0.0025, waveform=1, bandwidth=30000.0)
+    sector = em.parse_n78(dg)['sectors'][0]
+    assert abs(sector['signal_length'] - 0.0025) < 1e-9
+    assert sector['waveform'] == 1
+    assert abs(sector['bandwidth'] - 30000.0) < 1e-3
 
 
 def test_parse_n78_rejects_wrong_type():

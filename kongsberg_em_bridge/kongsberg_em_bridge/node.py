@@ -12,6 +12,13 @@ Listens for the M3's UDP-exported ``.all`` stream, decodes the N/78 datagram
 downstream ``cube_bathymetry/detections_to_pointcloud`` node turns that into a
 ``PointCloud2`` with CUBE-model uncertainty -- so this node does no geometry or
 TPU itself; it is purely a wire-format translator. See marine_tools#1.
+
+A latched ``marine_interfaces/SonarInfo`` companion is published on
+``sonar_info`` (ADR-0009): the acquisition settings (pulse length, bandwidth,
+signal type per TX sector) needed for GeoCoder-style radiometric backscatter
+correction, plus what the ``intensities`` values mean. Re-published on change
+and on a slow heartbeat so every rosbag2 split segment captures one. See
+marine_tools#69.
 """
 
 import datetime
@@ -25,9 +32,11 @@ import time
 from builtin_interfaces.msg import Time as TimeMsg
 from kongsberg_em_bridge import em_datagrams as em
 from marine_acoustic_msgs.msg import DetectionFlag, PingInfo, SonarDetections
+from marine_interfaces.msg import SonarInfo
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (DurabilityPolicy, qos_profile_sensor_data, QoSProfile,
+                       ReliabilityPolicy)
 from std_srvs.srv import SetBool
 
 
@@ -68,6 +77,71 @@ def save_rollover_due(elapsed_s, bytes_written, max_seconds, max_bytes):
     return False, ''
 
 
+# Kongsberg N/78 signal waveform identifier -> SonarInfo signal type.
+_WAVEFORM_TO_SIGNAL_TYPE = {
+    0: SonarInfo.SIGNAL_TYPE_CW,
+    1: SonarInfo.SIGNAL_TYPE_FM_UP,
+    2: SonarInfo.SIGNAL_TYPE_FM_DOWN,
+}
+
+
+def sonar_model_name(model):
+    """
+    Map the .all model number to a SonarInfo.sonar_model string.
+
+    30 = M3 (per the live captures the N/78 decode was validated against);
+    anything else passes through untranslated as ``kongsberg-em<model>``.
+    """
+    return 'kongsberg-m3' if model == 30 else f'kongsberg-em{model}'
+
+
+def acquisition_signature(parsed):
+    """
+    Return the SonarInfo-relevant slice of an N/78 ping as a hashable tuple.
+
+    Drives republish-on-change: two pings with equal signatures need no new
+    SonarInfo. Pure so it is unit-tested without an rclpy node.
+    """
+    return (parsed['model'],
+            tuple((s['signal_length'], s['waveform'], s['bandwidth'])
+                  for s in parsed['sectors']))
+
+
+def sonar_info_from_parsed(parsed, frame_id, stamp):
+    """
+    Build the latched ``SonarInfo`` companion (ADR-0009) for an N/78 ping.
+
+    Acquisition settings come from the datagram's TX-sector blocks; the
+    intensity-semantics axes describe what this bridge's
+    ``SonarDetections.intensities`` actually are (N/78 per-beam reflectivity,
+    published as already-scaled dB floats: a relative, uncalibrated power
+    ratio). Correction state is honest-unknown per the SonarInfo conventions
+    block -- the bridge applies nothing, but what gain/normalization the
+    sonar applied before exporting reflectivity is unverified -- and the NaN
+    sentinels are set explicitly (rosidl float defaults would silently claim
+    0 dB values). Pure so it is unit-tested without an rclpy node.
+    """
+    msg = SonarInfo()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.sonar_model = sonar_model_name(parsed['model'])
+    for sector in parsed['sectors']:
+        msg.pulse_lengths.append(float(sector['signal_length']))
+        msg.bandwidths.append(float(sector['bandwidth']))
+        msg.tx_signal_types.append(_WAVEFORM_TO_SIGNAL_TYPE.get(
+            sector['waveform'], SonarInfo.SIGNAL_TYPE_UNKNOWN))
+    msg.intensity_quantity = SonarInfo.QUANTITY_POWER
+    msg.intensity_scale = SonarInfo.INTENSITY_SCALE_DB
+    msg.intensity_reference = SonarInfo.REFERENCE_UNCALIBRATED_RELATIVE
+    msg.scale = 1.0    # intensities are published as physical dB already
+    msg.offset = 0.0
+    msg.tvg_model = SonarInfo.TVG_UNKNOWN
+    msg.tvg_absorption_db_per_km = math.nan
+    msg.source_level_db = math.nan
+    msg.angular_normalization = SonarInfo.ANGULAR_NORMALIZATION_UNKNOWN
+    return msg
+
+
 class KongsbergEmBridge(Node):
     """Decode M3 ``.all`` N/78 datagrams from UDP into ``SonarDetections``."""
 
@@ -101,11 +175,35 @@ class KongsbergEmBridge(Node):
         # startup, or arm it at runtime via the set_recording service. #54.
         self.declare_parameter('record_on_start', False)
 
+        # SonarInfo heartbeat period in seconds (ADR-0009 recommends <= 10 s:
+        # rosbag2 does not re-persist a latched message into new split
+        # segments, so change-only publishing would leave later segments with
+        # no SonarInfo). <= 0 disables the heartbeat (change-only; not
+        # recommended when recording).
+        self.declare_parameter('sonar_info_period', 10.0)
+
         self.frame_id = self.get_parameter('frame_id').value
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
 
         self.publisher = self.create_publisher(
             SonarDetections, 'detections', qos_profile_sensor_data)
+
+        # Latched per-sensor metadata companion (ADR-0009 / marine_tools#69).
+        self.sonar_info_pub = self.create_publisher(
+            SonarInfo, 'sonar_info',
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Guards the last-published state across the recv thread (change
+        # detection in _publish) and the executor thread (heartbeat timer);
+        # both publish under the lock so a heartbeat stamp update can never
+        # tear a concurrent serialization.
+        self._sonar_info_lock = threading.Lock()
+        self._last_sonar_info = None
+        self._last_acq_sig = None
+        period = float(self.get_parameter('sonar_info_period').value)
+        self._sonar_info_timer = (
+            self.create_timer(period, self._sonar_info_heartbeat)
+            if period > 0 else None)
 
         self._save_dir = str(self.get_parameter('save_all_dir').value).strip()
         self._save_max_seconds = float(
@@ -141,7 +239,8 @@ class KongsbergEmBridge(Node):
         self._thread.start()
         self.get_logger().info(
             f'kongsberg_em_bridge listening on {addr}:{port} (UDP), '
-            f'publishing SonarDetections on "detections", frame "{self.frame_id}"')
+            f'publishing SonarDetections on "detections" + latched SonarInfo '
+            f'on "sonar_info", frame "{self.frame_id}"')
 
     def _open_save_file(self, save_dir):
         """
@@ -333,10 +432,35 @@ class KongsbergEmBridge(Node):
         msg.nanosec = nsec
         return msg
 
+    def _sonar_info_heartbeat(self):
+        """Re-publish the last SonarInfo with a fresh stamp (ADR-0009)."""
+        with self._sonar_info_lock:
+            if self._last_sonar_info is None:
+                return    # no ping decoded yet -- nothing to declare
+            self._last_sonar_info.header.stamp = self.get_clock().now().to_msg()
+            self.sonar_info_pub.publish(self._last_sonar_info)
+
+    def _maybe_publish_sonar_info(self, parsed, stamp):
+        """Publish a fresh SonarInfo when the acquisition settings change."""
+        sig = acquisition_signature(parsed)
+        if sig == self._last_acq_sig:
+            return
+        info = sonar_info_from_parsed(parsed, self.frame_id, stamp)
+        with self._sonar_info_lock:
+            self._last_acq_sig = sig
+            self._last_sonar_info = info
+            self.sonar_info_pub.publish(info)
+        self.get_logger().info(
+            f'sonar_info updated: model={info.sonar_model}, '
+            f'pulse_lengths={list(info.pulse_lengths)} s, '
+            f'bandwidths={list(info.bandwidths)} Hz, '
+            f'signal_types={list(info.tx_signal_types)}')
+
     def _publish(self, parsed):
         msg = SonarDetections()
         msg.header.stamp = self._stamp(parsed)
         msg.header.frame_id = self.frame_id
+        self._maybe_publish_sonar_info(parsed, msg.header.stamp)
 
         info = PingInfo()
         info.frequency = float(parsed['sectors'][0]['centre_frequency']
