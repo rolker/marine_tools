@@ -30,6 +30,7 @@ import threading
 import time
 
 from builtin_interfaces.msg import Time as TimeMsg
+from kongsberg_em_bridge import angular_response
 from kongsberg_em_bridge import em_datagrams as em
 from marine_acoustic_msgs.msg import DetectionFlag, PingInfo, SonarDetections
 from marine_interfaces.msg import SonarInfo
@@ -107,7 +108,7 @@ def acquisition_signature(parsed):
                   for s in parsed['sectors']))
 
 
-def sonar_info_from_parsed(parsed, frame_id, stamp):
+def sonar_info_from_parsed(parsed, frame_id, stamp, angular=None):
     """
     Build the latched ``SonarInfo`` companion (ADR-0009) for an N/78 ping.
 
@@ -119,7 +120,16 @@ def sonar_info_from_parsed(parsed, frame_id, stamp):
     block -- the bridge applies nothing, but what gain/normalization the
     sonar applied before exporting reflectivity is unverified -- and the NaN
     sentinels are set explicitly (rosidl float defaults would silently claim
-    0 dB values). Pure so it is unit-tested without an rclpy node.
+    0 dB values).
+
+    ``angular`` is an optional ``(points, tl_removed, absorption_db_per_m)``
+    triple from ``angular_response.load_angular_response_curve``
+    (marine_tools#71): the sensor's empirical angular-response calibration,
+    declared with its TL provenance (uma#268) so consumers know whether the
+    curve is a tier-2 TL-removed residual. None / empty points leaves the
+    curve fields empty with honestly-UNKNOWN provenance.
+
+    Pure so it is unit-tested without an rclpy node.
     """
     msg = SonarInfo()
     msg.header.stamp = stamp
@@ -139,6 +149,25 @@ def sonar_info_from_parsed(parsed, frame_id, stamp):
     msg.tvg_absorption_db_per_km = math.nan
     msg.source_level_db = math.nan
     msg.angular_normalization = SonarInfo.ANGULAR_NORMALIZATION_UNKNOWN
+    points, tl_removed, absorption = angular or ([], False, None)
+    for angle_deg, db_rel in points:
+        msg.angular_response_angle_deg.append(float(angle_deg))
+        msg.angular_response_db_rel_nadir.append(float(db_rel))
+    if not points:
+        msg.angular_response_tl = SonarInfo.ANGULAR_RESPONSE_TL_UNKNOWN
+        msg.angular_response_absorption_db_per_m = math.nan
+    elif tl_removed:
+        msg.angular_response_tl = SonarInfo.ANGULAR_RESPONSE_TL_REMOVED
+        # Verbatim from the CSV header: consumers apply alpha as-is in
+        # 40*log10(R) + 2*alpha*R and never recompute it (cube#87). A tier-2
+        # header missing its absorption yields None from the loader -> NaN
+        # here, so the consumer sees "alpha unknown" instead of a fabricated
+        # 0.0 that would silently drop the absorption term.
+        msg.angular_response_absorption_db_per_m = (
+            math.nan if absorption is None else float(absorption))
+    else:
+        msg.angular_response_tl = SonarInfo.ANGULAR_RESPONSE_TL_IN
+        msg.angular_response_absorption_db_per_m = math.nan
     return msg
 
 
@@ -184,6 +213,15 @@ class KongsbergEmBridge(Node):
         # <= 0 disables the heartbeat (change-only; not recommended when
         # recording).
         self.declare_parameter('sonar_info_period', 10.0)
+        # Empirical angular-response calibration curve CSV (written by
+        # cube_bathymetry's derive_angular_response.py) to declare in
+        # SonarInfo with its TL provenance -- the CameraInfo model: the
+        # driver publishes the sensor's calibration so it rides in the bags
+        # beside the data it corrects (marine_tools#71, consumers
+        # cube_bathymetry#102). Empty = no curve (fields stay empty with
+        # honest-unknown provenance). Loaded once at startup: calibration,
+        # not an operator setting.
+        self.declare_parameter('angular_response_curve_file', '')
 
         self.frame_id = self.get_parameter('frame_id').value
         self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
@@ -203,6 +241,20 @@ class KongsbergEmBridge(Node):
         self._sonar_info_lock = threading.Lock()
         self._last_sonar_info = None
         self._last_acq_sig = None
+        curve_file = str(
+            self.get_parameter('angular_response_curve_file').value).strip()
+        self._angular_response = angular_response.load_angular_response_curve(
+            curve_file)
+        if curve_file and not self._angular_response[0]:
+            self.get_logger().warning(
+                f'angular_response_curve_file={curve_file!r} yielded an '
+                f'EMPTY curve -- SonarInfo will declare no angular response')
+        elif self._angular_response[0]:
+            points, tl_removed, alpha = self._angular_response
+            self.get_logger().info(
+                f'angular-response curve: {len(points)} points from '
+                f'{curve_file!r} (tl_removed={tl_removed}, '
+                f'absorption={alpha} dB/m)')
         period = float(self.get_parameter('sonar_info_period').value)
         self._sonar_info_timer = (
             self.create_timer(period, self._sonar_info_heartbeat)
@@ -465,7 +517,8 @@ class KongsbergEmBridge(Node):
         sig = acquisition_signature(parsed)
         if sig == self._last_acq_sig:
             return
-        info = sonar_info_from_parsed(parsed, self.frame_id, stamp)
+        info = sonar_info_from_parsed(
+            parsed, self.frame_id, stamp, self._angular_response)
         with self._sonar_info_lock:
             self._last_acq_sig = sig
             self._last_sonar_info = info
