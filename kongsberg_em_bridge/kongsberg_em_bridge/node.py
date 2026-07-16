@@ -178,8 +178,11 @@ class KongsbergEmBridge(Node):
         # SonarInfo heartbeat period in seconds (ADR-0009 recommends <= 10 s:
         # rosbag2 does not re-persist a latched message into new split
         # segments, so change-only publishing would leave later segments with
-        # no SonarInfo). <= 0 disables the heartbeat (change-only; not
-        # recommended when recording).
+        # no SonarInfo). The per-segment guarantee only holds while this
+        # period is shorter than the recorder's shortest split segment --
+        # size-based splits can produce segments shorter than a lazy period.
+        # <= 0 disables the heartbeat (change-only; not recommended when
+        # recording).
         self.declare_parameter('sonar_info_period', 10.0)
 
         self.frame_id = self.get_parameter('frame_id').value
@@ -433,12 +436,29 @@ class KongsbergEmBridge(Node):
         return msg
 
     def _sonar_info_heartbeat(self):
-        """Re-publish the last SonarInfo with a fresh stamp (ADR-0009)."""
-        with self._sonar_info_lock:
-            if self._last_sonar_info is None:
-                return    # no ping decoded yet -- nothing to declare
-            self._last_sonar_info.header.stamp = self.get_clock().now().to_msg()
-            self.sonar_info_pub.publish(self._last_sonar_info)
+        """
+        Re-publish the last SonarInfo so bag split segments capture it.
+
+        The re-publish keeps the stamp of the change it describes: pings and
+        change-publishes are stamped from the sonar's 1PPS-disciplined clock
+        (see _stamp), so stamping heartbeats from the system clock instead
+        could place them AFTER a segment's pings whenever the clocks diverge,
+        silently breaking the "most recent SonarInfo at or before the ping
+        stamp" association rule. rosbag2 assigns messages to segments by
+        receive time, so the unchanged header stamp does not hinder the
+        split-segment purpose. Guarded like the recv-thread publish: a
+        publish-time error (e.g. rclpy context mid-shutdown) must not
+        propagate out of the timer callback.
+        """
+        try:
+            with self._sonar_info_lock:
+                if self._last_sonar_info is None:
+                    return    # no ping decoded yet -- nothing to declare
+                self.sonar_info_pub.publish(self._last_sonar_info)
+        except Exception as exc:  # noqa: B902 - intentional: shutdown race
+            self.get_logger().warning(
+                f'sonar_info heartbeat publish failed: {exc}',
+                throttle_duration_sec=10.0)
 
     def _maybe_publish_sonar_info(self, parsed, stamp):
         """Publish a fresh SonarInfo when the acquisition settings change."""
@@ -450,11 +470,16 @@ class KongsbergEmBridge(Node):
             self._last_acq_sig = sig
             self._last_sonar_info = info
             self.sonar_info_pub.publish(info)
+        # Throttled like the decode-health line below: alternating multi-mode
+        # pinging legitimately changes the signature every ping (each change
+        # re-publishes, correctly), and an unthrottled line would flood the
+        # console at survey ping rates.
         self.get_logger().info(
             f'sonar_info updated: model={info.sonar_model}, '
             f'pulse_lengths={list(info.pulse_lengths)} s, '
             f'bandwidths={list(info.bandwidths)} Hz, '
-            f'signal_types={list(info.tx_signal_types)}')
+            f'signal_types={list(info.tx_signal_types)}',
+            throttle_duration_sec=30.0)
 
     def _publish(self, parsed):
         msg = SonarDetections()

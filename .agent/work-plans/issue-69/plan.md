@@ -45,8 +45,13 @@ change that makes those bags actually contain pulse length.
        sonar side is unverified); curves empty; calibration empty.
    - Publish on ping when the signature changes (stamped with the ping
      stamp), plus a heartbeat timer (`sonar_info_period` parameter,
-     default 10.0 s per ADR-0009) re-publishing the last message with a
-     fresh stamp so every rosbag2 split segment captures one. Shared
+     default 10.0 s per ADR-0009) re-publishing the last message so every
+     rosbag2 split segment captures one. The heartbeat keeps the change's
+     original (sonar-clock) stamp — review round-1: stamping heartbeats
+     from the system clock could place them after a segment's pings when
+     the clocks diverge, breaking the at-or-before association rule;
+     rosbag2 assigns segments by receive time, so the stamp need not
+     change. Timer callback guarded like the recv-thread publish. Shared
      state between the recv thread and the timer guarded by a lock.
    - `sonar_model` derived from the datagram model field (30 = M3 per the
      live captures the parser was validated against → `"kongsberg-m3"`;
