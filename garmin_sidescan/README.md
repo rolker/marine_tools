@@ -8,6 +8,13 @@ its own when out of the water, so no external sound-speed interlock is needed.)
 The chartplotter is required only to power up / wake the Marine Network; it is
 otherwise inaccessible, so **this node performs all sonar control.**
 
+The core GCV protocol — the imagery stream (`eb07`/`d807` render-layer
+model) and the TCP command frames — was reverse-engineered by **Dan
+Tauriello**; the status/config decodes came from later wet-capture analysis.
+This driver builds on that work — see
+[`docs/gcv_protocol.md`](docs/gcv_protocol.md) for the protocol reference
+and full attribution.
+
 ## Network & data streams
 
 Garmin Marine Network: a flat `172.16.0.0/16` LAN; devices self-assign IPs (last
@@ -59,6 +66,7 @@ Published (relative to the node namespace):
 | `sonar_image_starboard` | `marine_acoustic_msgs/RawSonarImage` | side-scan starboard |
 | `sonar_image_down` | `marine_acoustic_msgs/RawSonarImage` | down-look (water-column) beam; its v2 is the water-column range (≠ the side-scan swath) |
 | `nadir_depth` | `sensor_msgs/Range` | per-ping bottom range from the down-look sub-header **v1** (M3-validated to ~1%); beam axis = `+X` of the dedicated `<frame_id>_nadir` frame (point it down in the URDF). Uncorrected for draft/tide/offsets |
+| `water_temperature` | `sensor_msgs/Temperature` | transducer-surface water temperature from the `d807` telemetry marker (~0.7 Hz, deduplicated); validated against an AML CTD cast + the boat's SVS (#37). Analyst note: present in BizzyBoat deployment bags only from **2026-06-15** onward |
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
