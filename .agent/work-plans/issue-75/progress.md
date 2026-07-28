@@ -28,3 +28,23 @@ issue: 75
 
 ### Open questions
 - [ ] No open questions — plan is review-plan-ready.
+
+## Plan Review
+**Status**: complete
+**When**: 2026-07-28 18:31 +0000
+**By**: Claude Code Agent (Claude Opus)
+
+**Plan**: `.agent/work-plans/issue-75/plan.md` at `a7fabb8`
+**PR**: PR-less (--issue 75, layer worktree `feature/issue-75`)
+**Verdict**: changes-requested
+
+<!-- Independent review: fresh-context Opus sub-agent. The author By line reads
+"Claude Code Agent (Claude Sonnet)"; the agent-name prefix collides (all agents
+share "Claude Code Agent"), but this is NOT an in-context author self-review
+(different model, fresh context, dispatched as independent reviewer), so the
+self-review annotation is intentionally omitted. -->
+
+### Findings
+- [ ] (must-fix) Topic name `~/raw` is inconsistent with this node's own publishers and the plan's rationale for it is factually wrong — this node publishes `sound_speed`, `temperature`, `fluid_pressure` as **bare relative** names (namespace-scoped), so `~/raw` (a private name) resolves to `<ns>/sound_speed_bridge/raw`, nested one level below its sibling data topics rather than beside them. The plan's parenthetical "(relative, resolves via node namespace like the others)" is incorrect. The garmin precedent uses `~/` for *all* its topics, so it is internally consistent; copying only garmin's topic name without its surrounding convention creates the inconsistency here. Because the topic name is an external contract (BizzyBoat bag-record list, unh_echoboats_project11#396), settle it deliberately before implementing — recommend `raw` (bare relative) to sit as a sibling of `sound_speed`. Correct the plan's rationale either way. — `plan.md:32`
+- [ ] (suggestion) Test approach mismatches the actual node-test precedent in this package family. The plan proposes "patching `rclpy.node.Node` methods at import time," but the established pattern is `zda_serial_bridge/test/test_node.py`: a live `rclpy.init()`/`shutdown()` autouse fixture, `@patch('...node.serial.Serial')`, instantiate the **real** `SoundSpeedBridgeNode()`, then swap the target publisher with a MagicMock (`node._raw_pub = MagicMock()`) and assert on `publish.call_args`, wrapped in `try/finally: node.destroy_node()`. Follow that pattern and cite it. Note `SoundSpeedBridgeNode.__init__` starts a real serial thread (`node.py:115-117`); set the patched serial mock's `read` to return `b''` so the background loop spins harmlessly instead of feeding a MagicMock into `parser.feed()` and raising a thread traceback. — `plan.md:40`
+- [ ] (suggestion) Publish idiom: garmin uses `UInt8MultiArray(data=payload)` with `payload` as `bytes` directly (`garmin_sidescan/node.py:709`). The plan's `data=list(reading.raw_bytes)` also works but boxes each byte into a Python int; `data=bytes(reading.raw_bytes)` matches garmin and is cheaper. Minor. — `plan.md:35`
