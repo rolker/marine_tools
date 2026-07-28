@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import FluidPressure, Temperature
 import serial
+from std_msgs.msg import UInt8MultiArray
 
 from .parsers import PARSERS, SoundSpeedReading
 from .sinks import decode_template, FORMATTERS
@@ -96,6 +97,12 @@ class SoundSpeedBridgeNode(Node):
         self._temp_pub = self.create_publisher(Temperature, 'temperature', topic_qos)
         self._pressure_pub = self.create_publisher(
             FluidPressure, 'fluid_pressure', topic_qos)
+        # Raw framed sentence passthrough (exact wire bytes, incl. the
+        # original terminator), published even when parsing fails — bags
+        # that record it capture the serial traffic for post-hoc diagnosis
+        # of baud/framing/garbage problems. Bare relative name so it sits
+        # beside sound_speed, not under the node name.
+        self._raw_pub = self.create_publisher(UInt8MultiArray, 'raw', topic_qos)
         self._diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         self._lock = threading.Lock()
@@ -186,6 +193,8 @@ class SoundSpeedBridgeNode(Node):
 
         if math.isnan(reading.sound_speed_m_s):
             self._parse_error_count += 1
+
+        self._raw_pub.publish(UInt8MultiArray(data=reading.raw_bytes))
 
         stamp_sec = reading.receive_time_ns // 1_000_000_000
         stamp_nanosec = reading.receive_time_ns % 1_000_000_000
