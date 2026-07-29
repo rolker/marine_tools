@@ -101,3 +101,35 @@ self-review annotation is intentionally omitted. -->
 ### Next step
 Re-review the fixes with a fresh-context sub-agent:
 `.agent/scripts/dispatch_subagent.sh --mode in-process --issue 75 --skill review-code`
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-07-29 09:04 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-75 at `bf752b4`
+**Mode**: pre-push
+**Depth**: Standard (reason: `plan.md` in diff — project-repo override trigger; code delta 101 lines / 3 files)
+**Must-fix**: 2 | **Suggestions**: 7
+**Round**: 2 | **Ship**: recommended — both must-fixes are mechanical claim-accuracy corrections at known sites (one in-repo, one owed to echoboats#396); the design question they expose routes to a follow-up issue, not another review round
+**Specialists**: Static Analysis (clean, 42 passed incl. flake8/pep257 + xmllint), Claude Adversarial Lens A + Lens B (2 passes), Governance, Plan Drift. Local Adversarial skipped (request timed out, 900s limit). Copilot off (default).
+**Round-1 fix verified**: `7be05b3` busy-spin fix is correct — `_stop_event.set()` / bounded join / `assert not is_alive()` is deterministic; Lens A independently confirmed it improves on the `zda_serial_bridge` precedent.
+
+### Findings
+- [ ] (must-fix, cross-pass confirmed Lens A + Lens B) `raw` carries **framed sentences only**, not the wire stream, and publishes **nothing** when the stream never frames (wrong baud) — the headline case the feature exists to diagnose. Verified: `parsers.py:88` `lstrip(b'\n')` + `parsers.py:97-98` empty-sentence `continue` drop inter-sentence padding (22 wire bytes in → 18 published for `b'1500.123\r\r\n1499.000\r\r\n'`); terminator-free garbage yields zero readings. Correct the three overstated claim sites to state the limitation. — `sound_speed_bridge/node.py:100-105`, `test/test_node.py:3-6`, `plan.md:12`
+- [ ] (must-fix, owed cross-repo consequence of the above) Consumer-side record entry documents the topic as carrying "wrong-baud garbage" and tells operators an absent topic means "an older driver on gabby, not a probe fault" — misleading in exactly the wrong-baud case, where the topic is silent *and* the probe is at fault. Not editable from this worktree; flag for correction under rolker/unh_echoboats_project11#396. — `unh_echoboats_project11/bizzyboat_project11/config/bizzyboat.yaml:572-577`
+- [ ] (suggestion, Lens B) Unbounded parser buffer → unbounded `UInt8MultiArray` on a RELIABLE, always-recorded topic. Misconfigured `regex_line_terminator` (field-tunable; BizzyBoat sets `crlf`) grows the buffer ~1 KB/s at 9600 baud, then publishes one multi-MB message into the bag. Root cause pre-existing; this PR routes it onto DDS. File a follow-up: cap the buffer, emit truncated fragment, WARN + diagnostics counter. — `sound_speed_bridge/parsers.py:82,162`
+- [ ] (suggestion, Lens A) Move the raw publish after `self._pub.publish(msg)`. `_serial_loop` catches only `(serial.SerialException, OSError)`, so a non-caught exception from the new publish kills the serial thread permanently and leaves `_serial_connected` True — diagnostics then report "No reading for Xs" instead of a fault. A diagnostic-only publisher must not preempt the primary path. — `sound_speed_bridge/node.py:197`
+- [ ] (suggestion, Lens A) Tests cannot detect a topic-name or message-type regression — `_raw_pub` is mocked before anything inspects the real publisher, and the topic name is the external contract with echoboats#396. Assert `topic_name` + `msg_type` in `_make_node` before the swap. — `sound_speed_bridge/test/test_node.py:32-49`
+- [ ] (suggestion, Lens B) Shutdown race: the best-effort 2 s join can be outlasted by a wedged UART, then `super().destroy_node()` destroys publishers while the daemon serial thread may still be in `_handle_reading` → `InvalidHandle`. `if self._stop_event.is_set(): return` at the top of `_handle_reading` closes it for all four publishers. — `sound_speed_bridge/node.py:188,305-312`
+- [ ] (suggestion, Lens B) `_make_node` constructs the node outside the tests' `try/finally`; if its `assert not is_alive()` fires the node is never destroyed and a live thread leaks into the next test's context. Convert to a pytest fixture with teardown. — `sound_speed_bridge/test/test_node.py:32-49,53,74`
+- [ ] (suggestion, Lens A) `test_raw_publishes_on_parse_success` doesn't pin `_parse_error_count == 0` — one line pins the `math.isnan` branch from both sides. — `sound_speed_bridge/test/test_node.py:64`
+- [ ] (suggestion, lead) No package README, so the new `raw` topic — an external contract — is documented only in a code comment; `garmin_sidescan/README.md` carries a topic table. Pre-existing gap. — `sound_speed_bridge/`
+
+### Plan adherence
+No drift. Files changed match plan.md's "Files to Change" table exactly; steps 1-4 implemented as written, including both prior plan-review corrections. If the raw publish is moved (suggestion above), update plan step 3's "before the SoundSpeed publish" wording to match.
+
+### Next step
+Dispatch `address-findings` for the open items above, then re-run `review-code`; do not push until a pre-push review comes back approved.
+`.agent/scripts/dispatch_subagent.sh --mode in-process --issue 75 --skill address-findings`
