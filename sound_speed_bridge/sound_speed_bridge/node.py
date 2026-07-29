@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import FluidPressure, Temperature
 import serial
+from std_msgs.msg import UInt8MultiArray
 
 from .parsers import PARSERS, SoundSpeedReading
 from .sinks import decode_template, FORMATTERS
@@ -96,6 +97,17 @@ class SoundSpeedBridgeNode(Node):
         self._temp_pub = self.create_publisher(Temperature, 'temperature', topic_qos)
         self._pressure_pub = self.create_publisher(
             FluidPressure, 'fluid_pressure', topic_qos)
+        # Per-sentence raw passthrough: the bytes of each *framed* sentence
+        # (including its terminator), published even when the sentence fails
+        # to parse. This is not a tap on the wire stream — the parser strips
+        # inter-sentence padding and drops empty sentences, so concatenating
+        # these messages does not byte-exactly reconstruct what arrived on
+        # the UART, and a stream that never frames at all (e.g. wrong baud)
+        # publishes nothing here. It does capture garbled-but-framed traffic
+        # in the bag for post-hoc diagnosis. See rolker/marine_tools#77 for a
+        # true byte-stream tap. Bare relative name so it sits beside
+        # sound_speed, not under the node name.
+        self._raw_pub = self.create_publisher(UInt8MultiArray, 'raw', topic_qos)
         self._diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         self._lock = threading.Lock()
@@ -179,6 +191,12 @@ class SoundSpeedBridgeNode(Node):
         self._serial_connected = False
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
+        # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
+        # wedged in the UART layer can outlast it, after which the publishers
+        # are destroyed while this daemon thread still runs. Once the stop
+        # event is set, publishing is no longer safe.
+        if self._stop_event.is_set():
+            return
         with self._lock:
             self._last_reading = reading
             self._last_reading_time_ns = self.get_clock().now().nanoseconds
@@ -197,6 +215,11 @@ class SoundSpeedBridgeNode(Node):
         msg.sound_speed = float(reading.sound_speed_m_s)
         msg.variance = float(self._variance)
         self._pub.publish(msg)
+
+        # Diagnostic-only publish, deliberately after the primary SoundSpeed
+        # publish: _serial_loop catches only (SerialException, OSError), so an
+        # unexpected error here must not be able to preempt the primary path.
+        self._raw_pub.publish(UInt8MultiArray(data=reading.raw_bytes))
 
         if reading.temperature_c is not None:
             tmsg = Temperature()
