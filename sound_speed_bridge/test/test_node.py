@@ -26,16 +26,23 @@ def _ros_context():
 
 def _make_node(mock_serial_cls) -> SoundSpeedBridgeNode:
     """
-    Build a real node with the serial port mocked out.
+    Build a real node with the serial port mocked out and its serial thread stopped.
 
-    The node's background serial thread starts in ``__init__``; the mocked
-    port's ``read`` must return ``b''`` so that thread idles instead of
-    feeding a MagicMock into ``parser.feed()``.
+    The node's background serial thread starts in ``__init__``. The mocked
+    port's ``read`` returns ``b''`` so the loop never feeds a MagicMock into
+    ``parser.feed()``, but ``b''`` also returns instantly — leaving the thread
+    running would busy-spin at full CPU for the node's lifetime. These tests
+    drive :meth:`SoundSpeedBridgeNode._handle_reading` directly and never need
+    the thread, so it is stopped deterministically right after construction.
     """
     port = MagicMock()
     port.read.return_value = b''
     mock_serial_cls.return_value.__enter__.return_value = port
-    return SoundSpeedBridgeNode()
+    node = SoundSpeedBridgeNode()
+    node._stop_event.set()
+    node._serial_thread.join(timeout=2.0)
+    assert not node._serial_thread.is_alive()
+    return node
 
 
 @patch('sound_speed_bridge.node.serial.Serial')
