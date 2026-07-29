@@ -43,14 +43,22 @@ def _make_node(mock_serial_cls) -> SoundSpeedBridgeNode:
     port.read.return_value = b''
     mock_serial_cls.return_value.__enter__.return_value = port
     node = SoundSpeedBridgeNode()
-    node._stop_event.set()
-    node._serial_thread.join(timeout=2.0)
-    assert not node._serial_thread.is_alive()
-    # External contract with unh_echoboats_project11#396's record list: the
-    # topic must stay a bare relative `raw` of type UInt8MultiArray. Checked
-    # on the real publisher, before any test swaps in a mock.
-    assert node._raw_pub.topic_name == '/raw'
-    assert node._raw_pub.msg_type is UInt8MultiArray
+    try:
+        node._stop_event.set()
+        node._serial_thread.join(timeout=2.0)
+        assert not node._serial_thread.is_alive()
+        # The thread has exited its loop, so clearing the event cannot revive
+        # it — but it must be cleared for _handle_reading's shutdown guard to
+        # let the direct-call tests through.
+        node._stop_event.clear()
+        # External contract with unh_echoboats_project11#396's record list: the
+        # topic must stay a bare relative `raw` of type UInt8MultiArray. Checked
+        # on the real publisher, before any test swaps in a mock.
+        assert node._raw_pub.topic_name == '/raw'
+        assert node._raw_pub.msg_type is UInt8MultiArray
+    except BaseException:
+        node.destroy_node()
+        raise
     return node
 
 
@@ -98,4 +106,32 @@ def test_raw_publishes_on_parse_failure(mock_serial_cls):
         assert bytes(msg.data) == b'GARBAGE\r'
         assert node._parse_error_count == 1
     finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_handle_reading_noop_after_stop(mock_serial_cls):
+    """
+    A reading delivered after the stop event is set publishes nothing.
+
+    destroy_node()'s 2 s join is best-effort, so a wedged serial thread may
+    deliver one last reading after the publishers are destroyed — the
+    shutdown guard in _handle_reading must swallow it.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        node._raw_pub = MagicMock()
+        node._pub = MagicMock()
+        node._stop_event.set()
+        reading = SoundSpeedReading(
+            sound_speed_m_s=1500.123,
+            raw_mm_s=1500123,
+            raw_bytes=b'1500.123\r',
+            receive_time_ns=1_700_000_000_000_000_000,
+        )
+        node._handle_reading(reading)
+        assert node._raw_pub.publish.call_count == 0
+        assert node._pub.publish.call_count == 0
+    finally:
+        node._stop_event.clear()
         node.destroy_node()

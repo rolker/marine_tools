@@ -191,6 +191,12 @@ class SoundSpeedBridgeNode(Node):
         self._serial_connected = False
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
+        # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
+        # wedged in the UART layer can outlast it, after which the publishers
+        # are destroyed while this daemon thread still runs. Once the stop
+        # event is set, publishing is no longer safe.
+        if self._stop_event.is_set():
+            return
         with self._lock:
             self._last_reading = reading
             self._last_reading_time_ns = self.get_clock().now().nanoseconds
