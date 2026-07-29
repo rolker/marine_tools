@@ -199,8 +199,6 @@ class SoundSpeedBridgeNode(Node):
         if math.isnan(reading.sound_speed_m_s):
             self._parse_error_count += 1
 
-        self._raw_pub.publish(UInt8MultiArray(data=reading.raw_bytes))
-
         stamp_sec = reading.receive_time_ns // 1_000_000_000
         stamp_nanosec = reading.receive_time_ns % 1_000_000_000
 
@@ -211,6 +209,11 @@ class SoundSpeedBridgeNode(Node):
         msg.sound_speed = float(reading.sound_speed_m_s)
         msg.variance = float(self._variance)
         self._pub.publish(msg)
+
+        # Diagnostic-only publish, deliberately after the primary SoundSpeed
+        # publish: _serial_loop catches only (SerialException, OSError), so an
+        # unexpected error here must not be able to preempt the primary path.
+        self._raw_pub.publish(UInt8MultiArray(data=reading.raw_bytes))
 
         if reading.temperature_c is not None:
             tmsg = Temperature()

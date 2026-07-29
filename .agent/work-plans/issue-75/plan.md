@@ -47,7 +47,9 @@ data is in the bag for the deployment where the problem occurs.
    the node name (`<ns>/sound_speed_bridge/raw`), inconsistent with this
    node's own convention.
 
-3. **Publish in `_handle_reading()`** — before the `SoundSpeed` publish,
+3. **Publish in `_handle_reading()`** — after the `SoundSpeed` publish (a
+   diagnostic-only publisher must not be able to preempt the primary path;
+   `_serial_loop` catches only `SerialException`/`OSError`),
    publish `UInt8MultiArray(data=reading.raw_bytes)` on `self._raw_pub`
    (`raw_bytes` is already `bytes`; passing it directly matches
    `garmin_sidescan/node.py:709` and avoids boxing each byte into a Python
