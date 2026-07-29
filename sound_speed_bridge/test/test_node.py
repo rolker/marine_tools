@@ -70,6 +70,7 @@ def test_raw_publishes_on_parse_success(mock_serial_cls):
         assert node._raw_pub.publish.call_count == 1
         msg = node._raw_pub.publish.call_args.args[0]
         assert bytes(msg.data) == b'1500.123\r'
+        assert node._parse_error_count == 0
     finally:
         node.destroy_node()
 
