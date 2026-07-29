@@ -80,3 +80,24 @@ self-review annotation is intentionally omitted. -->
 
 ### False positives
 - (none)
+
+## Implementation
+**Status**: complete
+**When**: 2026-07-29 08:04 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**PR**: #76 at `7be05b3`
+**Addressed**: `## Integrated Review` (2026-07-29 08:00 -04:00, PR #76 @ `f419337`)
+**Commits**: `7be05b3`
+
+### Actions
+- [x] (low, Copilot R1) Test serial mock busy-spin — `_make_node` now sets `node._stop_event`, joins `node._serial_thread` (timeout 2.0s) and asserts it exited, right after construction; docstring corrected to explain that `b''` prevents MagicMock reaching `parser.feed()` but does *not* keep the thread idle. — `sound_speed_bridge/test/test_node.py:27-44`
+- [x] (suggestion, Local Review (Pre-Push) @ `5c316cd`) Real publish transport path not exercised — `sound_speed_bridge/test/test_node.py:52,83` (deferred: the endorsed `zda_serial_bridge` test precedent does the same MagicMock swap, and the review itself rates a subscription round-trip test a nicety rather than a correction; adding it is out of scope for this fix pass)
+
+### Verification
+- `python3 -m pytest test/ -q` in `sound_speed_bridge`: **42 passed** (1.11s), including flake8/pep257 style tests over the edited file.
+- No `.pre-commit-config.yaml` in this repo (no hooks to run); nothing bypassed.
+
+### Next step
+Re-review the fixes with a fresh-context sub-agent:
+`.agent/scripts/dispatch_subagent.sh --mode in-process --issue 75 --skill review-code`
