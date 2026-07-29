@@ -63,3 +63,20 @@ self-review annotation is intentionally omitted. -->
 
 ### Findings
 - [ ] (suggestion) Tests swap `node._raw_pub` for a MagicMock, so the real `publish()` transport path isn't exercised (construction + `bytes(msg.data)` round-trip is). Matches the endorsed `zda_serial_bridge` test precedent — acceptable as-is; a subscription round-trip test would be a nicety, not a correction. — `sound_speed_bridge/test/test_node.py:46,71`
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-07-29 08:00 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**PR**: #76 at `f419337`
+**Sources**: 3 (Copilot R1 @ `f419337`, Local Review (Pre-Push) @ `5c316cd`, CI rollup @ `f419337`)
+**Cross-source confirmations**: 0
+**CI**: all-pass (build-and-test success, copilot-pull-request-reviewer success)
+
+### Findings
+- [ ] (low, Copilot R1) Test serial mock busy-spins: `port.read.return_value = b''` returns instantly, so `_serial_loop`'s inner `while` loop spins at full CPU for the node's lifetime in each test (real `serial.Serial(..., timeout=1.0)` would block). Tests call `_handle_reading()` directly and never need the thread. Fix: after constructing the node in `_make_node`, stop the thread deterministically — `node._stop_event.set(); node._serial_thread.join(timeout=2.0)` — and update the docstring, which currently states the `b''` return is the mechanism for keeping the thread idle. Note this contradicts the earlier `## Plan Review` suggestion (plan.md:40) that prescribed `read -> b''`; the stop-the-thread form supersedes it. — `sound_speed_bridge/test/test_node.py:27-38`
+- [ ] (suggestion, Local Review (Pre-Push) @ `5c316cd`) Carried forward, non-blocking: tests swap `node._raw_pub` for a MagicMock, so the real publish transport path isn't exercised. Endorsed `zda_serial_bridge` precedent does the same; a subscription round-trip test would be a nicety, not a correction. — `sound_speed_bridge/test/test_node.py:46,71`
+
+### False positives
+- (none)
