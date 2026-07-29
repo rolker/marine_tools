@@ -9,8 +9,16 @@ https://github.com/rolker/marine_tools/issues/75
 The AML SVS driver's `SoundSpeedReading.raw_bytes` field already captures the
 exact framed serial sentence (including terminator) on every parse, success or
 failure. It exists today for the UDP passthrough sink. It is not published on
-any ROS topic, so deployment bags contain no record of raw wire traffic — making
-post-hoc RCA of baud/framing problems require a manual serial capture.
+any ROS topic, so deployment bags contain no record of the bytes the probe
+actually sent — making post-hoc RCA of garbled sentences require a manual
+serial capture.
+
+Scope limit: this is a *per-framed-sentence* passthrough, not a byte-stream
+tap. The parser strips inter-sentence padding and drops empty sentences, so
+concatenating the published messages does not byte-exactly reconstruct the
+wire stream; and a stream that never frames at all (e.g. wrong baud) yields
+no readings and therefore publishes nothing. Covering that case needs a tap
+inside `_serial_loop` — filed as rolker/marine_tools#77.
 
 Both parsers (`aml`, `regex`) populate `raw_bytes` unconditionally
 (`parsers.py:95-110`, `parsers.py:169-176`), so the node can publish it

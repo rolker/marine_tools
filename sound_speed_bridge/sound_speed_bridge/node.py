@@ -97,11 +97,16 @@ class SoundSpeedBridgeNode(Node):
         self._temp_pub = self.create_publisher(Temperature, 'temperature', topic_qos)
         self._pressure_pub = self.create_publisher(
             FluidPressure, 'fluid_pressure', topic_qos)
-        # Raw framed sentence passthrough (exact wire bytes, incl. the
-        # original terminator), published even when parsing fails — bags
-        # that record it capture the serial traffic for post-hoc diagnosis
-        # of baud/framing/garbage problems. Bare relative name so it sits
-        # beside sound_speed, not under the node name.
+        # Per-sentence raw passthrough: the bytes of each *framed* sentence
+        # (including its terminator), published even when the sentence fails
+        # to parse. This is not a tap on the wire stream — the parser strips
+        # inter-sentence padding and drops empty sentences, so concatenating
+        # these messages does not byte-exactly reconstruct what arrived on
+        # the UART, and a stream that never frames at all (e.g. wrong baud)
+        # publishes nothing here. It does capture garbled-but-framed traffic
+        # in the bag for post-hoc diagnosis. See rolker/marine_tools#77 for a
+        # true byte-stream tap. Bare relative name so it sits beside
+        # sound_speed, not under the node name.
         self._raw_pub = self.create_publisher(UInt8MultiArray, 'raw', topic_qos)
         self._diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 

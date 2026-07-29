@@ -1,10 +1,13 @@
 """
 Node-level tests for the raw sentence passthrough publisher.
 
-The ``raw`` topic exists so deployment bags capture the exact serial wire
-traffic — including parse failures, the key diagnostic case — making
-post-hoc RCA of baud/framing problems possible without a live serial
-capture. These tests exercise
+The ``raw`` topic exists so deployment bags capture the bytes of each
+framed serial sentence — including sentences that fail to parse, the key
+diagnostic case — making post-hoc RCA of garbled traffic possible without
+a live serial capture. It is a per-sentence passthrough, not a wire tap:
+inter-sentence padding is stripped by the parser and a stream that never
+frames (e.g. wrong baud) publishes nothing (see rolker/marine_tools#77).
+These tests exercise
 :meth:`SoundSpeedBridgeNode._handle_reading` directly with mocked serial
 I/O, following the ``zda_serial_bridge/test/test_node.py`` pattern.
 """
