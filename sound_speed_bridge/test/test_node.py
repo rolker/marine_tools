@@ -18,6 +18,7 @@ import pytest
 import rclpy
 from sound_speed_bridge.node import SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import SoundSpeedReading
+from std_msgs.msg import UInt8MultiArray
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +46,11 @@ def _make_node(mock_serial_cls) -> SoundSpeedBridgeNode:
     node._stop_event.set()
     node._serial_thread.join(timeout=2.0)
     assert not node._serial_thread.is_alive()
+    # External contract with unh_echoboats_project11#396's record list: the
+    # topic must stay a bare relative `raw` of type UInt8MultiArray. Checked
+    # on the real publisher, before any test swaps in a mock.
+    assert node._raw_pub.topic_name == '/raw'
+    assert node._raw_pub.msg_type is UInt8MultiArray
     return node
 
 
