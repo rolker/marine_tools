@@ -48,10 +48,10 @@ relay runs. Use this when QINSy is off and nothing else is bound to COM1.
 
 ```powershell
 # defaults: COM1 @ 9600 -> 192.168.1.234:31100 out source NIC 192.168.1.8
-pwsh -File tools\m3_zda_udp_relay.ps1
+powershell -ExecutionPolicy Bypass -File tools\m3_zda_udp_relay.ps1
 
 # override port/baud, or thin a faster source toward 1 Hz
-pwsh -File tools\m3_zda_udp_relay.ps1 -ComPort COM5 -BaudRate 4800 -MinIntervalMs 900
+powershell -ExecutionPolicy Bypass -File tools\m3_zda_udp_relay.ps1 -ComPort COM5 -BaudRate 4800 -MinIntervalMs 900
 ```
 
 Key parameters (see `Get-Help .\m3_zda_udp_relay.ps1 -Full`): `-ComPort`,

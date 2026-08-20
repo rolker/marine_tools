@@ -65,14 +65,14 @@
 
 .EXAMPLE
     # On mercat, with the discovered defaults (COM1 -> head 192.168.1.234:31100):
-    pwsh -File m3_zda_udp_relay.ps1
+    powershell -ExecutionPolicy Bypass -File m3_zda_udp_relay.ps1
 
 .EXAMPLE
     # Different port/baud, thin a 5 Hz source toward 1 Hz:
-    pwsh -File m3_zda_udp_relay.ps1 -ComPort COM5 -BaudRate 4800 -MinIntervalMs 900
+    powershell -ExecutionPolicy Bypass -File m3_zda_udp_relay.ps1 -ComPort COM5 -BaudRate 4800 -MinIntervalMs 900
 
 .NOTES
-    Stdlib/.NET only - no Python, no modules. PowerShell 5.1 or 7+.
+    Stdlib/.NET only - no Python, no modules. Windows PowerShell 5.1 (System.IO.Ports ships with it; pwsh 7 needs the out-of-band System.IO.Ports NuGet package, so use powershell.exe).
     On the head: set Time Sync Mode = 1PPS (Device Properties -> Sonar Setup),
     and confirm head firmware >= 1.5. A green SYNC OK in the M3 software is not
     proof the head is 1PPS-locked -- verify via the head's Output Messages.
@@ -132,7 +132,7 @@ try {
     throw
 }
 
-$sent = 0L; $bad = 0L; $dropped = 0L
+$sent = 0L; $bad = 0L; $dropped = 0L; $filtered = 0L
 $lastSentTicks = 0L                                  # for MinIntervalMs throttle
 $lastGood      = [DateTime]::Now
 $staleWarned   = $false
@@ -160,30 +160,41 @@ try {
 
         try {
             while ($true) {
+                # Heartbeat runs on EVERY iteration, data or not: a busy port
+                # carrying the wrong feed (a full nav stream with no ZDA -- the
+                # realistic mis-plug) never times out, and must trip the stale
+                # warning and stats exactly like a silent port.
+                if (-not $staleWarned -and
+                    (([DateTime]::Now - $lastGood).TotalSeconds -ge $StaleWarnSec)) {
+                    Log ("WARN: no valid ZDA forwarded in {0:n0}s (source down? wrong baud/port/feed?)" -f `
+                         ([DateTime]::Now - $lastGood).TotalSeconds)
+                    $staleWarned = $true
+                }
+                if ($statSw.Elapsed.TotalSeconds -ge 10) {
+                    Log ("stats: {0} sent, {1} non-zda filtered, {2} bad-cksum, {3} udp-dropped" -f `
+                         $sent, $filtered, $bad, $dropped)
+                    $statSw.Restart()
+                }
+
                 $line = $null
                 try {
                     $line = $port.ReadLine()
                 } catch [TimeoutException] {
-                    # No data this window -- heartbeat, and warn if ZDA has gone stale.
-                    if (-not $staleWarned -and
-                        (([DateTime]::Now - $lastGood).TotalSeconds -ge $StaleWarnSec)) {
-                        Log ("WARN: no valid ZDA forwarded in {0:n0}s (source down? wrong baud/port?)" -f `
-                             ([DateTime]::Now - $lastGood).TotalSeconds)
-                        $staleWarned = $true
-                    }
-                    if ($statSw.Elapsed.TotalSeconds -ge 10) {
-                        Log ("stats: {0} sent, {1} bad-cksum, {2} udp-dropped" -f $sent, $bad, $dropped)
-                        $statSw.Restart()
-                    }
-                    continue
+                    continue                         # no data this window
                 }
 
                 if ($null -eq $line) { continue }
                 $line = $line.TrimEnd("`r", "`n").Trim()
                 if ($line.Length -eq 0) { continue }
 
-                if (-not $AllSentences -and $line -notmatch '^\$..ZDA,') { continue }
+                if (-not $AllSentences -and $line -notmatch '^\$..ZDA,') { $filtered++; continue }
                 if (-not $NoChecksum -and -not (Test-NmeaChecksum $line)) { $bad++; continue }
+                # Drop any line-noise trailing the checksum: the head must see
+                # exactly $...*hh.
+                $star = $line.IndexOf('*')
+                if ($star -ge 0 -and $line.Length -gt ($star + 3)) {
+                    $line = $line.Substring(0, $star + 3)
+                }
 
                 if ($MinIntervalMs -gt 0) {
                     $nowTicks = [DateTime]::UtcNow.Ticks
@@ -208,10 +219,6 @@ try {
                     }
                 }
 
-                if ($statSw.Elapsed.TotalSeconds -ge 10) {
-                    Log ("stats: {0} sent, {1} bad-cksum, {2} udp-dropped" -f $sent, $bad, $dropped)
-                    $statSw.Restart()
-                }
             }
         } catch {
             Log "serial error on ${ComPort}: $($_.Exception.Message); reopening in ${ReconnectDelaySec}s"

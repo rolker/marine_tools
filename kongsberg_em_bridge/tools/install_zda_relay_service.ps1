@@ -74,6 +74,11 @@ if (Get-Service -Name ([System.Management.Automation.WildcardPattern]::Escape($S
 
 Write-Host "Installing service '$ServiceName'..."
 & $Nssm install $ServiceName $powershell $appParams
+# PS 5.1: $ErrorActionPreference does not fail native commands -- gate on the
+# exit code or a failed install barrels through every `nssm set` to "Done".
+if ($LASTEXITCODE -ne 0) {
+    throw "nssm install failed (exit $LASTEXITCODE) -- service not configured."
+}
 
 # Run from the relay's dir; auto-start at boot; restart on any exit.
 & $Nssm set $ServiceName AppDirectory   (Split-Path $RelayScript)
