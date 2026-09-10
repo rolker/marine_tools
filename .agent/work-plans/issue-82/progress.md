@@ -131,3 +131,113 @@ down on shipping the table now because of points 1 and 2 above.
 | Principle alignment | Good | See central-question discussion above |
 | ADR compliance | N/A | No new packages/topics/params/interfaces triggered |
 | ROS conventions | Good | No topic/QoS/parameter changes; message field usage matches `PingInfo.msg`'s documented contract |
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-10 14:56 -04:00
+**By**: Claude Opus 5 (1M context)
+
+**Branch**: feature/issue-82 at `e6dbeb1` (unpushed, PR-less)
+**Issues**: #82 and #83 — one branch, three commits, one PR to close both
+**Scope**: `kongsberg_em_bridge` only
+
+### Commits
+
+- `bad7c42` — plan: extend `plan.md` to cover #83, record the operator's two
+  overrides (ship ahead of the `cube_bathymetry#154` gate; remove
+  `skip_invalid_beams` outright, his words quoted verbatim), apply the plan
+  review's must-fix, and close the cardinality open question.
+- `5810ff9` — #82, beamwidths.
+- `e6dbeb1` — #83, publish invalid beams.
+
+### #82 — beamwidths (commit `5810ff9`)
+
+- Added `_RX_BEAMWIDTH_RAD` / `_TX_BEAMWIDTH_RAD`, keyed by the `.all` model
+  number (the key `sonar_model_name` already uses), plus the pure
+  `_resolve_beamwidths(model)` — the table-and-resolver shape from
+  `garmin_sidescan`'s `_resolve_freq_bw`, not its publish-site line (that
+  driver has one beam per message; this one has many).
+- Model 30 (M3) maps explicitly to `None` on both axes: uncharacterised, not
+  forgotten. **No beamwidth figure was invented, estimated or derived.** The
+  fields stay empty and the CUBE error model takes its documented `Device`
+  fallback. Unmapped model numbers resolve the same way.
+- Rewrote the stale comment at the old `node.py:544-548`: the unit-mismatch
+  rationale and the closed umbrella `cube_bathymetry#30` citation are gone,
+  replaced by `cube_bathymetry#144` / PR #153 and a plain statement that
+  populating radians is safe now and what is missing is a cited figure.
+- Extracted the message construction from the `_publish` method into a pure
+  module-level `detections_from_parsed()`, mirroring the module's existing
+  `sonar_info_from_parsed`. This is what makes the publish path testable
+  without an rclpy node; `_publish` keeps stamping, SonarInfo change
+  detection, publishing and the health heartbeat.
+- **Plan review's must-fix applied**: the beamwidth arrays are appended
+  inside the publish loop alongside every sibling per-beam array, never sized
+  from `len(parsed['beams'])`.
+- `kongsberg_em_bridge/README.md`: new "Sensor constants → Beamwidths"
+  section mirroring `garmin_sidescan/README.md:140-176`.
+- Tests (`test/test_detections.py`, new): M3 → `(None, None)`; unknown model
+  → `(None, None)`; publish leaves both fields empty for both (#82's explicit
+  Acceptance item); and, with a monkeypatched table entry, the arrays are one
+  element per published beam carrying the radians value unmodified.
+
+### #83 — publish invalid beams (commit `e6dbeb1`)
+
+- `skip_invalid_beams` **removed entirely** — declaration, `self.skip_invalid`,
+  the builder argument, and the skip branch. Per the operator's correction
+  mid-task, superseding the earlier "default it to False and keep it as an
+  escape hatch" instruction. Grep confirms no launch file, config or test
+  referenced it.
+- Comment at the old declaration site now says what is true: the driver
+  reports what the sonar reported, filtering is the consumer's job, and
+  `cube_bathymetry#154` is the consumer that does not yet do it — named as a
+  bug we own, not a constraint to design around.
+- Unconditional startup warning naming `rolker/cube_bathymetry#154` and
+  stating the failure mode in words (a consumer ignoring `DetectionFlag`
+  reads an invalid beam's zero travel time as a sounding at zero depth,
+  seafloor at the surface). With the parameter gone this is the only
+  in-band signal, and it sits in the log beside the data.
+- README: parameter row removed; new "Invalid beams" section stating that
+  every beam is published with its honest flag, that the consumer is **not**
+  yet fixed, and naming `#154`.
+- Tests: an invalid beam is published carrying `DETECT_BAD_SONAR` (and keeps
+  its zero travel time) rather than vanishing; per-beam array alignment
+  pinned across `flags`, `two_way_travel_times`, `tx_delays`, `intensities`,
+  `tx_angles`, `rx_angles` over mixed, all-invalid and all-valid pings, and
+  again with the beamwidth arrays populated.
+
+### Operator override, recorded
+
+`marine_tools#83`'s gate on `cube_bathymetry#154` is real and `#154` is open.
+The operator decided (2026-09-10) to ship the driver first regardless: there
+is no near-term plan to collect M3 data, and if any is collected before the
+consumer is fixed, the resulting bad data is what will motivate fixing it.
+That decision is recorded in `plan.md`, not relitigated here; no second gate
+was added and the change was not hedged. His removal direction is quoted
+verbatim in the plan: "Remove it, I need to keep things as lean and as clean
+as practicle. Also, it's a bug that a consumer doesn't respect the flag so we
+shouldn't be working around bugs we can fix ourselves."
+
+### Build and test — real results
+
+```
+./sensors_ws/build.sh marine_tools          → 1 package finished (warnings only, pre-existing -Wsign-compare in marine_tools C++)
+./sensors_ws/build.sh kongsberg_em_bridge   → 1 package finished
+./sensors_ws/test.sh  kongsberg_em_bridge   → 51 tests, 0 errors, 0 failures, 0 skipped
+./sensors_ws/test.sh  marine_tools          → 0 errors, 0 failures, 0 skipped
+```
+
+One intermediate failure was hit and fixed properly, not suppressed: flake8
+`Q003` on an escaped apostrophe in the new warning string (switched that
+line's outer quotes). No test was skipped, disabled or loosened.
+
+### Deliberately not done
+
+- No M3 beamwidth figure populated — none is sourced, and inventing one is
+  out of bounds. The table entry exists as an explicit `None` so a future
+  cited figure is a one-line change plus a table-coverage test.
+- The DeltaT half of #82 stays in `rolker/imagenex_deltat#1` — different
+  repo, cannot be reached from a marine_tools PR.
+- `cube_bathymetry#154` itself is untouched; it is the consumer's fix and
+  belongs to that repo.
+- Nothing pushed, no PR opened — the host does that. The PR body carries the
+  closing keywords for both #82 and #83; the commits deliberately do not.
