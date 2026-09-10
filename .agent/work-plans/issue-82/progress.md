@@ -72,3 +72,62 @@ issue: 82
 ### Open questions
 - [ ] None blocking implementation — datasheet-figure availability is resolved by operator decision (ship the M3 uncharacterised/empty, do not guess).
 - [ ] Confirm `PingInfo.rx_beamwidths`/`tx_beamwidths` array cardinality (per-beam vs per-sector) against the installed `marine_acoustic_msgs/msg/PingInfo.msg` before finalizing the `_publish()` wiring — a verify-before-code step, not a design choice.
+
+## Plan Review
+**Status**: complete
+**When**: 2026-09-10 14:31 -04:00
+**By**: Claude Code Agent (Claude Sonnet)
+
+**Plan**: `.agent/work-plans/issue-82/plan.md` at `cf9c25f`
+**PR**: PR-less
+**Verdict**: approve-with-suggestions
+
+### Findings
+- [ ] (suggestion) Cardinality is now resolvable, not just flagged — `cube_bathymetry/error_model.cpp:277` reads `detections.ping_info.rx_beamwidths[i]` with `i` the same per-beam index used for `two_way_travel_times[i]`/`flags[i]`, i.e. `rx_beamwidths`/`tx_beamwidths` must be sized to the *published* (post-filter) beam count, not per-sector. `ros2sonic/r2sonic/src/conversions.cpp:14-18` confirms the same per-beam convention independently (`resize(num_beams)`). Update the plan's Open Questions / step 2 to state this as resolved fact rather than "confirm during implementation." — `plan.md:112-121` ("Open Questions")
+- [ ] (must-fix) The plan's illustrative step-2 code sizes the array off the wrong count: `[rx_bw] * len(parsed['beams'])` uses the *raw* pre-filter beam count, but `_publish` (`node.py:554-570`) skips invalid beams when `skip_invalid_beams` is True (default), so the actually-published `msg.two_way_travel_times`/`msg.flags`/etc. are shorter than `parsed['beams']` whenever any beam is invalid. Because every element of the fill is numerically identical this doesn't misalign values today, but it leaves `rx_beamwidths`/`tx_beamwidths` a different length than every other per-beam array in the same message, which is sloppy and inconsistent with how those arrays are actually built (appended one at a time, inside the filter loop). Implementation should build the beamwidth arrays from `len(msg.two_way_travel_times)` (or append inside the same loop), not `len(parsed['beams'])`. — `plan.md:75-91` (Approach step 2)
+- [ ] (suggestion) The plan's own caution that the `garmin_sidescan` template doesn't transfer cleanly deserves to be stated more concretely now that it's verified: `garmin_sidescan` publishes `RawSonarImage` (one beam per message, hence the literal singleton `[rx_bw]` at `garmin_sidescan/node.py:855-858`), while `kongsberg_em_bridge` publishes `SonarDetections` with many, variably-filtered beams per message. The only part of the precedent that actually transfers is the table/resolver *shape* (dict keyed by device variant → `None` when uncharacterised); the publish-site array construction is structurally different and needs its own pattern, not a copy of Garmin's line. Minor wording tightening, not a design change. — `plan.md:56-62` (Context)
+
+### Central question: is the empty table worth shipping?
+
+Yes — approve it, alongside the comment fix and README. Two things distinguish
+this from ordinary speculative generality:
+
+1. **It is not a novel pattern invented here.** `garmin_sidescan` already
+   ships this exact shape in production for its own uncharacterised device
+   (GCV-10: `_RX_BEAMWIDTH_RAD`/`_TX_BEAMWIDTH_RAD` omit the `('gcv10', *)`
+   keys entirely, `.get()` returns `None`, fields stay empty — verified at
+   `garmin_sidescan/node.py:97-107` and documented at
+   `garmin_sidescan/README.md:140-176`). Applying the same convention to a
+   sibling driver in the same repo is consistency with an established
+   in-repo pattern, not speculative generality from nothing.
+2. **It converts a claim into an enforced invariant.** The whole issue
+   exists because a code comment's claim ("leaving them empty avoids a unit
+   mismatch") silently went stale the moment `cube_bathymetry#144`/#153
+   changed the ground truth, and nothing caught it. A comment-only fix
+   repeats the same failure mode: it is another unenforced claim that can
+   go stale again with no test to catch it. The resolver + the
+   uncharacterised-device test make "M3 stays empty until a sourced figure
+   exists" a checked fact, not prose — matching "Enforcement over
+   documentation" directly, and it is exactly what the issue's Acceptance
+   criterion ("An uncharacterised device leaves the fields empty, with a
+   test") asks for verbatim.
+
+The cost is genuinely small (one dict with one `None` mapping, a pure
+resolver function, three small tests), so the "only what's needed" tension
+is real but minor — not enough to withhold approval. If the operator instead
+wants to land only the comment fix and README now and defer the table until
+a datasheet figure exists, that is a legitimate, smaller alternative; I come
+down on shipping the table now because of points 1 and 2 above.
+
+### Other dimensions
+
+| Dimension | Verdict | Notes |
+|---|---|---|
+| Scope | Good | Single package, ~3 files, matches the `garmin_sidescan` precedent's footprint |
+| Issue alignment | Good | Directly implements the issue's own Acceptance items for the M3 half; DeltaT split confirmed correctly scoped to `imagenex_deltat#1` |
+| File targeting | Good | `parsed['model']` is genuinely device-reported (unpacked from the N/78 header, `em_datagrams.py:87`) and distinguishable (model 30 → `kongsberg-m3`, verified via `sonar_model_name`) — the table key is readable at the point it would be stamped |
+| Consequences | Good | README, stale-comment, and test consequences all captured; no missed cross-reference found |
+| Documentation & instruction impact | Good | Non-silent; "None" for instruction candidates is justified (following an existing documented precedent, not establishing a new one) |
+| Principle alignment | Good | See central-question discussion above |
+| ADR compliance | N/A | No new packages/topics/params/interfaces triggered |
+| ROS conventions | Good | No topic/QoS/parameter changes; message field usage matches `PingInfo.msg`'s documented contract |
