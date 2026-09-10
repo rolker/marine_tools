@@ -96,6 +96,49 @@ def sonar_model_name(model):
     return 'kongsberg-m3' if model == 30 else f'kongsberg-em{model}'
 
 
+# .all model number -> full -3 dB beamwidth in radians (PingInfo.msg = radians,
+# and these are FULL widths, not half-angles).  The M3 datagram stream carries
+# no beamwidth of its own -- reading a raw .all capture, the only datagram types
+# present are attitude, surface sound speed, raw range and angle 78, XYZ88 and
+# clock; there is no runtime-parameters datagram, which is where a Kongsberg
+# system would state its beamwidths.  So a figure can only come from a device
+# table like this one.
+#
+# Model 30 (the M3) is mapped explicitly to None: it is UNCHARACTERISED, not
+# forgotten.  No sourced M3 beamwidth figure exists -- not in a datasheet on
+# hand, not anywhere in the workspace -- and a wrong beamwidth stamped
+# confidently is worse than an absent one, because absence is handled
+# explicitly by the consumer while a wrong number is not.  Same convention
+# garmin_sidescan already ships for its uncharacterised GCV-10 generation.
+# Fill these in when a datasheet figure and its conditions can be cited
+# (marine_tools#82); an unmapped model number resolves to None the same way.
+_RX_BEAMWIDTH_RAD = {30: None}    # across-track (receive), M3 uncharacterised
+_TX_BEAMWIDTH_RAD = {30: None}    # along-track (transmit), M3 uncharacterised
+
+
+def _resolve_beamwidths(model):
+    """
+    Resolve ``(rx_beamwidth_rad, tx_beamwidth_rad)`` for an ``.all`` model.
+
+    Pure helper (no ROS dependency, no ``self``) so it is unit-testable
+    without a node, mirroring ``garmin_sidescan``'s ``_resolve_freq_bw``.
+
+    Either element is ``None`` when unavailable -- an unknown model number, or
+    a known model whose beamwidths are not characterised (the M3 today) -- and
+    the caller then leaves the corresponding ``*_beamwidths`` field EMPTY
+    rather than stamping a guess.  An empty field is what makes the CUBE error
+    model take its documented ``Device`` beamwidth fallback; a wrong value
+    would silently override it.
+
+    Values are full -3 dB widths in radians per ``PingInfo.msg``.  Populating
+    them in radians is safe as of cube_bathymetry#144 (fixed by
+    rolker/cube_bathymetry#153): the consumer normalizes units once at the
+    ``Device`` boundary and validates each per-beam value before trusting it,
+    so the historical "consumer multiplies radians by pi/180" hazard is gone.
+    """
+    return _RX_BEAMWIDTH_RAD.get(model), _TX_BEAMWIDTH_RAD.get(model)
+
+
 def acquisition_signature(parsed):
     """
     Return the SonarInfo-relevant slice of an N/78 ping as a hashable tuple.
@@ -168,6 +211,73 @@ def sonar_info_from_parsed(parsed, frame_id, stamp, angular=None):
     else:
         msg.angular_response_tl = SonarInfo.ANGULAR_RESPONSE_TL_IN
         msg.angular_response_absorption_db_per_m = math.nan
+    return msg
+
+
+def detections_from_parsed(parsed, frame_id, stamp, skip_invalid):
+    """
+    Build one ping's ``SonarDetections`` from a parsed N/78 datagram.
+
+    Pure (no rclpy node) like ``sonar_info_from_parsed``, so the per-beam
+    array construction -- including the invariant that every per-beam array in
+    the message is the same length -- is unit-testable without an executor.
+    """
+    msg = SonarDetections()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+
+    info = PingInfo()
+    info.frequency = float(parsed['sectors'][0]['centre_frequency']
+                           if parsed['sectors'] else 0.0)
+    info.sound_speed = float(parsed['sound_speed'])
+    # Beamwidths come from a device table, not the wire (see
+    # _resolve_beamwidths -- the M3's datagram stream carries none). Both are
+    # None for the M3 today: UNCHARACTERISED, so the fields stay empty and the
+    # CUBE error model takes its documented Device-beamwidth fallback rather
+    # than a guessed number.
+    #
+    # This is no longer the unit-mismatch workaround the comment here used to
+    # describe (which cited the closed umbrella cube_bathymetry#30):
+    # cube_bathymetry#144, fixed by rolker/cube_bathymetry#153, made the
+    # consumer read radians per PingInfo.msg and validate each per-beam value
+    # before trusting it. Populating radians here is now safe -- what is
+    # missing is a sourced figure, not a safe consumer.
+    rx_bw, tx_bw = _resolve_beamwidths(parsed['model'])
+
+    sectors = parsed['sectors']
+    for beam in parsed['beams']:
+        if skip_invalid and not beam['valid']:
+            continue
+        sector = sectors[beam['tx_sector']] if beam['tx_sector'] < len(sectors) \
+            else (sectors[0] if sectors else {'tilt_deg': 0.0, 'tx_delay': 0.0})
+        flag = DetectionFlag()
+        flag.flag = (DetectionFlag.DETECT_OK if beam['valid']
+                     else DetectionFlag.DETECT_BAD_SONAR)
+        msg.flags.append(flag)
+        msg.two_way_travel_times.append(float(beam['twtt']))
+        msg.tx_delays.append(float(sector['tx_delay']))
+        msg.intensities.append(float(beam['reflectivity_db']))
+        # Deterministic convention mapping (no tuning knobs):
+        #   Kongsberg .all (EM Datagram Formats 850-160692, Note 1):
+        #     beam pointing angle +ve to PORT, transmit tilt +ve FORWARD.
+        #   marine_acoustic_msgs/SonarDetections:
+        #     rx_angles +ve to STARBOARD, tx_angles +ve FORWARD.
+        # So negate the rx (pointing) angle; tx (tilt) carries through.
+        # Any physical mount orientation belongs in the URDF base_link->frame
+        # transform (a normally-mounted downward M3 is roll=pi), not here.
+        msg.tx_angles.append(math.radians(sector['tilt_deg']))
+        msg.rx_angles.append(-math.radians(beam['pointing_angle_deg']))
+        # Appended in the SAME loop as every sibling per-beam array (never
+        # sized from len(parsed['beams']), the raw pre-filter count), so the
+        # beamwidth arrays cannot drift out of length with the beams they
+        # describe. cube_bathymetry indexes them with the same per-beam index
+        # it uses for two_way_travel_times.
+        if rx_bw is not None:
+            info.rx_beamwidths.append(rx_bw)
+        if tx_bw is not None:
+            info.tx_beamwidths.append(tx_bw)
+
+    msg.ping_info = info
     return msg
 
 
@@ -535,45 +645,10 @@ class KongsbergEmBridge(Node):
             throttle_duration_sec=30.0)
 
     def _publish(self, parsed):
-        msg = SonarDetections()
-        msg.header.stamp = self._stamp(parsed)
-        msg.header.frame_id = self.frame_id
-        self._maybe_publish_sonar_info(parsed, msg.header.stamp)
-
-        info = PingInfo()
-        info.frequency = float(parsed['sectors'][0]['centre_frequency']
-                               if parsed['sectors'] else 0.0)
-        info.sound_speed = float(parsed['sound_speed'])
-        # tx/rx_beamwidths left empty on purpose: the CUBE error model treats
-        # those array values as DEGREES (PingInfo.msg says radians) and falls
-        # back to its Device beamwidth when they are absent -- so leaving them
-        # empty avoids a unit mismatch. Tracked in cube_bathymetry#30.
-        msg.ping_info = info
-
-        sectors = parsed['sectors']
-        for beam in parsed['beams']:
-            if self.skip_invalid and not beam['valid']:
-                continue
-            sector = sectors[beam['tx_sector']] if beam['tx_sector'] < len(sectors) \
-                else (sectors[0] if sectors else {'tilt_deg': 0.0, 'tx_delay': 0.0})
-            flag = DetectionFlag()
-            flag.flag = (DetectionFlag.DETECT_OK if beam['valid']
-                         else DetectionFlag.DETECT_BAD_SONAR)
-            msg.flags.append(flag)
-            msg.two_way_travel_times.append(float(beam['twtt']))
-            msg.tx_delays.append(float(sector['tx_delay']))
-            msg.intensities.append(float(beam['reflectivity_db']))
-            # Deterministic convention mapping (no tuning knobs):
-            #   Kongsberg .all (EM Datagram Formats 850-160692, Note 1):
-            #     beam pointing angle +ve to PORT, transmit tilt +ve FORWARD.
-            #   marine_acoustic_msgs/SonarDetections:
-            #     rx_angles +ve to STARBOARD, tx_angles +ve FORWARD.
-            # So negate the rx (pointing) angle; tx (tilt) carries through.
-            # Any physical mount orientation belongs in the URDF base_link->frame
-            # transform (a normally-mounted downward M3 is roll=pi), not here.
-            msg.tx_angles.append(math.radians(sector['tilt_deg']))
-            msg.rx_angles.append(-math.radians(beam['pointing_angle_deg']))
-
+        stamp = self._stamp(parsed)
+        self._maybe_publish_sonar_info(parsed, stamp)
+        msg = detections_from_parsed(parsed, self.frame_id, stamp,
+                                     self.skip_invalid)
         self.publisher.publish(msg)
         self._ping_count += 1
         # Decode-health heartbeat, time-throttled rather than every N pings:
@@ -581,8 +656,9 @@ class KongsbergEmBridge(Node):
         # which floods the console. ~30 s keeps a liveness signal without spam.
         self.get_logger().info(
             f'ping {parsed["ping"]}: {len(msg.two_way_travel_times)} detections '
-            f'(of {parsed["nrx"]} beams), c={info.sound_speed:.1f} m/s, '
-            f'f={info.frequency / 1000.0:.0f} kHz',
+            f'(of {parsed["nrx"]} beams), '
+            f'c={msg.ping_info.sound_speed:.1f} m/s, '
+            f'f={msg.ping_info.frequency / 1000.0:.0f} kHz',
             throttle_duration_sec=30.0)
 
 
