@@ -7,7 +7,7 @@ issue: 82
 ## Issue Review
 **Status**: complete
 **When**: 2026-09-10 14:12 -04:00
-**By**: Claude Code Agent (Claude Sonnet 5)
+**By**: Claude Code Agent (Claude Sonnet)
 
 **Issue**: #82
 **Comment**: (best-effort post follows this entry; not recorded inline)
