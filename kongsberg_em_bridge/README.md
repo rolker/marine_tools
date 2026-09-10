@@ -10,8 +10,32 @@ wire-format translator: geometry and TPU happen downstream
 
 | Topic | Type | QoS | Content |
 |---|---|---|---|
-| `detections` | `marine_acoustic_msgs/SonarDetections` | sensor data (best effort) | Per-ping two-way travel times, tx/rx angles, per-beam reflectivity (dB) as `intensities`, validity flags. |
+| `detections` | `marine_acoustic_msgs/SonarDetections` | sensor data (best effort) | Per-ping two-way travel times, tx/rx angles, per-beam reflectivity (dB) as `intensities`, validity flags. Every beam the sonar reported is published — see [Invalid beams](#invalid-beams). |
 | `sonar_info` | `marine_interfaces/SonarInfo` | reliable, `transient_local`, depth 1 | Latched acquisition metadata (ADR-0009): pulse length, bandwidth, signal type per TX sector; intensity semantics of `detections.intensities`; honest-unknown correction state. Re-published on acquisition change (stamped with the ping) and on a slow heartbeat so every rosbag2 split segment captures one. |
+
+### Invalid beams
+
+Every beam the sonar reported is published, carrying its honest
+`DetectionFlag`: `DETECT_OK`, or `DETECT_BAD_SONAR` for a beam the sonar
+flagged invalid. There is no parameter to filter them — the driver reports
+what the sensor reported, and deciding what to do with a flagged beam is the
+consumer's job. Dropping them here destroyed the fact both live and in the
+bag (the data of record), and left the flag field decorative, since every
+published beam was then `DETECT_OK`.
+
+**The consumer is not fixed yet.** `cube_bathymetry`'s error model does not
+consult `DetectionFlag`
+([rolker/cube_bathymetry#154](https://github.com/rolker/cube_bathymetry/issues/154)),
+so it will read an invalid beam's zero two-way travel time as a sounding at
+zero depth — seafloor at the surface. That is a bug in the consumer, tracked
+and fixed there rather than worked around here; the node says so in a warning
+at startup, so it is visible in the log beside the data. Until `#154` lands,
+treat M3 data ingested by the CUBE error model with that in mind.
+
+All per-beam arrays (`flags`, `two_way_travel_times`, `tx_delays`,
+`intensities`, `tx_angles`, `rx_angles`, and the beamwidth arrays when
+populated) are built in one loop and are always the same length — one element
+per beam the sonar reported. A test pins that invariant.
 
 ## Sensor constants
 
@@ -67,7 +91,6 @@ whenever a datasheet figure and its conditions turn up (marine_tools#82).
 |---|---|---|
 | `bind_address` / `bind_port` | `0.0.0.0` / `20002` | UDP socket for the M3's exported `.all` stream. |
 | `frame_id` | `m3` | Frame for both published topics. |
-| `skip_invalid_beams` | `true` | Drop beams the sonar flagged invalid (required by the CUBE error model). |
 | `sonar_info_period` | `10.0` | SonarInfo heartbeat seconds; must be shorter than the recorder's shortest split segment. `<= 0` disables (not recommended when recording). |
 | `angular_response_curve_file` | `''` | Empirical angular-response curve CSV (from `cube_bathymetry`'s `derive_angular_response.py`) declared in SonarInfo with its TL provenance; empty = no curve. Loaded once at startup. |
 | `save_all_dir` | `''` | Directory for raw `.all` recording (genuine Kongsberg framing, loadable by Caris/Qimera/MB-System). Empty disables. |

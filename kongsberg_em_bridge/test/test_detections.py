@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Unit tests for the pure SonarDetections builder (marine_tools#82).
+Unit tests for the pure SonarDetections builder (marine_tools#82, #83).
 
 ``detections_from_parsed`` / ``_resolve_beamwidths`` are module-level pure
 functions, so -- like ``test_sonar_info.py`` -- these tests need no rclpy node
@@ -47,13 +47,11 @@ def test_resolve_beamwidths_unknown_model():
 def test_publish_leaves_beamwidths_empty_for_uncharacterised_device():
     # The issue's explicit acceptance item: an uncharacterised device leaves
     # the fields empty, so the consumer takes its documented fallback.
-    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg(sec=100),
-                                 skip_invalid=True)
+    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg(sec=100))
     assert len(msg.ping_info.rx_beamwidths) == 0
     assert len(msg.ping_info.tx_beamwidths) == 0
     # Unknown models likewise.
-    msg = detections_from_parsed(_parsed(model=2040), 'm3', TimeMsg(),
-                                 skip_invalid=True)
+    msg = detections_from_parsed(_parsed(model=2040), 'm3', TimeMsg())
     assert len(msg.ping_info.rx_beamwidths) == 0
     assert len(msg.ping_info.tx_beamwidths) == 0
 
@@ -61,16 +59,15 @@ def test_publish_leaves_beamwidths_empty_for_uncharacterised_device():
 def test_beamwidth_arrays_track_published_beams_when_characterised(
         monkeypatch):
     # If a sourced figure is ever added to the table, the arrays must be one
-    # element per PUBLISHED beam -- built by appending in the publish loop,
-    # never sized from the raw pre-filter beam count -- and must carry the
-    # table's radians value unmodified (no hidden degree conversion).
+    # element per published beam -- built by appending in the publish loop,
+    # alongside every sibling per-beam array -- and must carry the table's
+    # radians value unmodified (no hidden degree conversion).
     from kongsberg_em_bridge import node as node_mod
     monkeypatch.setitem(node_mod._RX_BEAMWIDTH_RAD, 30, 0.0175)
     monkeypatch.setitem(node_mod._TX_BEAMWIDTH_RAD, 30, 0.035)
-    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg(),
-                                 skip_invalid=True)
+    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg())
     n = len(msg.two_way_travel_times)
-    assert n == 2                       # the invalid beam was filtered out
+    assert n == 3                       # every beam published, invalid too
     assert len(msg.ping_info.rx_beamwidths) == n
     assert len(msg.ping_info.tx_beamwidths) == n
     assert abs(msg.ping_info.rx_beamwidths[0] - 0.0175) < 1e-6
@@ -78,9 +75,64 @@ def test_beamwidth_arrays_track_published_beams_when_characterised(
 
 
 def test_ping_info_basics():
-    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg(sec=7),
-                                 skip_invalid=True)
+    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg(sec=7))
     assert msg.header.frame_id == 'm3'
     assert msg.header.stamp.sec == 7
     assert abs(msg.ping_info.sound_speed - 1500.0) < 1e-3
     assert abs(msg.ping_info.frequency - 500000.0) < 1e-3
+
+
+def _per_beam_arrays(msg):
+    """Every array in the message that carries one element per beam."""
+    return {
+        'flags': msg.flags,
+        'two_way_travel_times': msg.two_way_travel_times,
+        'tx_delays': msg.tx_delays,
+        'intensities': msg.intensities,
+        'tx_angles': msg.tx_angles,
+        'rx_angles': msg.rx_angles,
+    }
+
+
+def test_invalid_beam_is_published_with_bad_sonar_flag():
+    # marine_tools#83: an invalid beam must be reported, not destroyed. It
+    # was previously dropped, which made the flag field decorative and left
+    # the bag -- the data of record -- unable to say the beam ever existed.
+    from marine_acoustic_msgs.msg import DetectionFlag
+    beams = [_beam(), _beam(valid=False, twtt=0.0), _beam()]
+    msg = detections_from_parsed(_parsed(beams=beams), 'm3', TimeMsg())
+    assert len(msg.flags) == 3
+    assert [f.flag for f in msg.flags] == [
+        DetectionFlag.DETECT_OK,
+        DetectionFlag.DETECT_BAD_SONAR,
+        DetectionFlag.DETECT_OK,
+    ]
+    # The invalid beam is there, carrying the travel time the sonar gave it.
+    assert msg.two_way_travel_times[1] == 0.0
+
+
+def test_per_beam_arrays_stay_aligned():
+    # The arrays are built in one loop and must not diverge -- checked over
+    # a mix of valid and invalid beams, and over an all-invalid ping.
+    for beams in ([_beam(), _beam(valid=False, twtt=0.0), _beam(), _beam()],
+                  [_beam(valid=False, twtt=0.0)] * 3,
+                  [_beam()] * 2):
+        msg = detections_from_parsed(_parsed(beams=beams), 'm3', TimeMsg())
+        lengths = {name: len(arr)
+                   for name, arr in _per_beam_arrays(msg).items()}
+        assert set(lengths.values()) == {len(beams)}, lengths
+
+
+def test_per_beam_arrays_stay_aligned_with_beamwidths(monkeypatch):
+    # Same invariant once the beamwidth arrays are populated: they are
+    # per-beam too, and must match the rest element for element.
+    from kongsberg_em_bridge import node as node_mod
+    monkeypatch.setitem(node_mod._RX_BEAMWIDTH_RAD, 30, 0.0175)
+    monkeypatch.setitem(node_mod._TX_BEAMWIDTH_RAD, 30, 0.035)
+    beams = [_beam(), _beam(valid=False, twtt=0.0), _beam()]
+    msg = detections_from_parsed(_parsed(beams=beams), 'm3', TimeMsg())
+    arrays = _per_beam_arrays(msg)
+    arrays['rx_beamwidths'] = msg.ping_info.rx_beamwidths
+    arrays['tx_beamwidths'] = msg.ping_info.tx_beamwidths
+    lengths = {name: len(arr) for name, arr in arrays.items()}
+    assert set(lengths.values()) == {len(beams)}, lengths

@@ -214,13 +214,16 @@ def sonar_info_from_parsed(parsed, frame_id, stamp, angular=None):
     return msg
 
 
-def detections_from_parsed(parsed, frame_id, stamp, skip_invalid):
+def detections_from_parsed(parsed, frame_id, stamp):
     """
     Build one ping's ``SonarDetections`` from a parsed N/78 datagram.
 
     Pure (no rclpy node) like ``sonar_info_from_parsed``, so the per-beam
     array construction -- including the invariant that every per-beam array in
     the message is the same length -- is unit-testable without an executor.
+
+    Every beam the sonar reported is published, invalid ones included, each
+    carrying its own ``DetectionFlag`` (marine_tools#83).
     """
     msg = SonarDetections()
     msg.header.stamp = stamp
@@ -246,8 +249,9 @@ def detections_from_parsed(parsed, frame_id, stamp, skip_invalid):
 
     sectors = parsed['sectors']
     for beam in parsed['beams']:
-        if skip_invalid and not beam['valid']:
-            continue
+        # Every beam is published, valid or not (marine_tools#83): the flag
+        # below says which, and the per-beam arrays therefore always cover
+        # the full beam count the sonar reported.
         sector = sectors[beam['tx_sector']] if beam['tx_sector'] < len(sectors) \
             else (sectors[0] if sectors else {'tilt_deg': 0.0, 'tx_delay': 0.0})
         flag = DetectionFlag()
@@ -290,10 +294,16 @@ class KongsbergEmBridge(Node):
         self.declare_parameter('bind_address', '0.0.0.0')
         self.declare_parameter('bind_port', 20002)
         self.declare_parameter('frame_id', 'm3')
-        # Drop beams the sonar flagged invalid. Required: the CUBE error model
-        # iterates every element of two_way_travel_times and does NOT consult
-        # flags, so invalid (twtt=0) beams would otherwise become z=0 points.
-        self.declare_parameter('skip_invalid_beams', True)
+        # There is deliberately NO skip_invalid_beams parameter (removed,
+        # marine_tools#83). This node reports what the sonar reported: every
+        # beam is published, carrying its honest DetectionFlag (DETECT_OK or
+        # DETECT_BAD_SONAR). Deciding what to do with a flagged beam is the
+        # consumer's job, not the driver's -- dropping them here destroyed the
+        # fact live and in the bag, which is the data of record, and made the
+        # flag field decorative because every published beam was DETECT_OK.
+        # The CUBE error model does not yet consult the flags
+        # (cube_bathymetry#154); that is a bug we own and fix there, not one
+        # to work around here.
         # Directory in which to record the raw datagram stream as a genuine
         # Kongsberg ``.all`` file (loadable by Caris/Qimera/MB-System). Empty
         # disables recording. Each node run writes a fresh timestamped file so
@@ -334,7 +344,6 @@ class KongsbergEmBridge(Node):
         self.declare_parameter('angular_response_curve_file', '')
 
         self.frame_id = self.get_parameter('frame_id').value
-        self.skip_invalid = bool(self.get_parameter('skip_invalid_beams').value)
 
         self.publisher = self.create_publisher(
             SonarDetections, 'detections', qos_profile_sensor_data)
@@ -406,6 +415,18 @@ class KongsbergEmBridge(Node):
             f'kongsberg_em_bridge listening on {addr}:{port} (UDP), '
             f'publishing SonarDetections on "detections" + latched SonarInfo '
             f'on "sonar_info", frame "{self.frame_id}"')
+        # Said once, loudly, at startup because it is the ONLY in-band signal
+        # left now that skip_invalid_beams is gone (marine_tools#83): whoever
+        # meets strange data in the field finds the pointer here, in the log
+        # beside the data, rather than in an issue tracker they were not
+        # reading.
+        self.get_logger().warning(
+            'publishing ALL beams, including ones the sonar flagged invalid '
+            '(DETECT_BAD_SONAR) -- a consumer that ignores DetectionFlag '
+            "will read an invalid beam's zero two-way travel time as a "
+            'sounding at zero depth, i.e. seafloor at the surface. The CUBE '
+            'error model does not consult the flags yet: '
+            'rolker/cube_bathymetry#154.')
 
     def _open_save_file(self, save_dir):
         """
@@ -647,8 +668,7 @@ class KongsbergEmBridge(Node):
     def _publish(self, parsed):
         stamp = self._stamp(parsed)
         self._maybe_publish_sonar_info(parsed, stamp)
-        msg = detections_from_parsed(parsed, self.frame_id, stamp,
-                                     self.skip_invalid)
+        msg = detections_from_parsed(parsed, self.frame_id, stamp)
         self.publisher.publish(msg)
         self._ping_count += 1
         # Decode-health heartbeat, time-throttled rather than every N pings:
