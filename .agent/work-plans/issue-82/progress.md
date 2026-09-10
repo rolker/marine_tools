@@ -59,3 +59,16 @@ issue: 82
 3. Surface the datasheet-availability question to the operator explicitly before implementation starts — it may block the "cited figure" acceptance criterion for one or both devices even after the ordering gate clears.
 4. When the comment at `node.py:547-550` is rewritten, cite the merged `cube_bathymetry#153` PR (or `#144`), not the stale `#30`.
 5. Add a `kongsberg_em_bridge/README.md` beamwidth section mirroring `garmin_sidescan/README.md:140-176` in the same PR.
+
+## Plan Authored
+**Status**: complete
+**When**: 2026-09-10 14:25 -04:00
+**By**: Claude Code Agent (Claude Sonnet)
+
+**Plan**: `.agent/work-plans/issue-82/plan.md` at `cf9c25f`
+**Branch**: feature/issue-82 at `cf9c25f`
+**Phases**: single
+
+### Open questions
+- [ ] None blocking implementation — datasheet-figure availability is resolved by operator decision (ship the M3 uncharacterised/empty, do not guess).
+- [ ] Confirm `PingInfo.rx_beamwidths`/`tx_beamwidths` array cardinality (per-beam vs per-sector) against the installed `marine_acoustic_msgs/msg/PingInfo.msg` before finalizing the `_publish()` wiring — a verify-before-code step, not a design choice.
