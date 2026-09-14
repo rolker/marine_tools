@@ -288,3 +288,20 @@ line's outer quotes). No test was skipped, disabled or loosened.
 - [ ] (suggestion) out-of-range tx_sector publishes a fabricated tx angle as DETECT_OK — pre-existing behaviour, now pinned by a test; follow-up candidate, not filed (needs a decision on which flag; DETECT_BAD_FILTER is a stretch)
 - [ ] (suggestion) "only datagram types present in a raw capture" — the capture is not named in code or README; the operator knows which `.all` file was read; carried into the PR body as an open question
 - [ ] (suggestion) PR body: bags now carry rejected beams (cube#121 review reasoned from the opposite premise)
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-14 09:50 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+**Verdict**: approved
+
+**Branch**: feature/issue-82 at `ed8dc48`
+**Mode**: pre-push
+**Depth**: Light (reason: round-2 re-read of the four fix commits only; ament flake8 clean, 55 tests pass)
+**Must-fix**: 0 | **Suggestions**: 3 (all applied in `ed8dc48`)
+**Round**: 2 | **Ship**: recommended — no must-fix; round-1 findings verified resolved
+
+### Findings
+- [x] (suggestion) `_positive_or_none` admitted `inf`; now requires finite — `kongsberg_em_bridge/kongsberg_em_bridge/node.py:143`
+- [x] (suggestion) tx_sector fallback test asserted equality against a zero tilt; fixture now tilts — `kongsberg_em_bridge/test/test_detections.py:121`
+- [x] (suggestion) README named `batch_regen`; installed executable is `batch_regen_bag` — `kongsberg_em_bridge/README.md:31`
