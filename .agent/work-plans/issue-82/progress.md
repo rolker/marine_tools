@@ -266,3 +266,25 @@ line's outer quotes). No test was skipped, disabled or loosened.
 - [ ] (suggestion) "only datagram types present in a raw capture" cites no capture; name it — `README.md:40`, `node.py:100`
 - [ ] (suggestion) plan files row names test_sonar_info.py/test_beamwidth.py; tests live in test_detections.py — `.agent/work-plans/issue-82/plan.md`
 - [ ] (suggestion) PR body: bags now carry rejected beams; cube#121 review reasoned from the opposite premise
+
+## Implementation
+**Status**: complete (address-findings pass for Local Review (Pre-Push) round 1)
+**When**: 2026-09-14 09:35 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+**Source**: Local Review (Pre-Push) round 1 at `0575194`
+**Branch**: feature/issue-82 at `22138a7`
+
+### Resolved
+- [x] (must-fix) heartbeat now logs `nvalid` valid of `nrx` beams (all published) — `f9abfbd`
+- [x] (must-fix) operator chose: new follow-up marine_tools#85 tracks the M3 figure; both citations repointed, PR closes #82 and #83 — `22138a7`
+- [x] (suggestion) README: cube#154 hazard covers any CUBE ingest path incl. offline importers; warning retired with #154 — `72705de`
+- [x] (suggestion) cube#154 comment posted: name the three offline tools + "retire the driver warning" acceptance item
+- [x] (suggestion) garmin_sidescan README + node.py: cube#30 citation retired → cube#144/PR#153; rviz half-angle → rviz_sonar_image#9 — `72705de`
+- [x] (suggestion) `_resolve_beamwidths` treats non-positive table values as unavailable — `f9abfbd`
+- [x] (suggestion) tests added: one-sided table, non-positive values, empty sectors, out-of-range tx_sector — `f9abfbd`
+- [x] (suggestion) plan files row synced to test_detections.py — `f88c35d`
+
+### Deferred
+- [ ] (suggestion) out-of-range tx_sector publishes a fabricated tx angle as DETECT_OK — pre-existing behaviour, now pinned by a test; follow-up candidate, not filed (needs a decision on which flag; DETECT_BAD_FILTER is a stretch)
+- [ ] (suggestion) "only datagram types present in a raw capture" — the capture is not named in code or README; the operator knows which `.all` file was read; carried into the PR body as an open question
+- [ ] (suggestion) PR body: bags now carry rejected beams (cube#121 review reasoned from the opposite premise)
