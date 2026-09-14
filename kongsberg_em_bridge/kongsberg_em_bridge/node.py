@@ -140,7 +140,8 @@ def _resolve_beamwidths(model):
         # A placeholder 0.0 (or a negative) left in the table while chasing a
         # datasheet must not ship as a beamwidth: the field stays empty, as
         # the README promises ("never zero-filled").
-        return value if value is not None and value > 0.0 else None
+        return (value if value is not None and math.isfinite(value)
+                and value > 0.0 else None)
 
     return (_positive_or_none(_RX_BEAMWIDTH_RAD.get(model)),
             _positive_or_none(_TX_BEAMWIDTH_RAD.get(model)))

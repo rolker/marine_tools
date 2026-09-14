@@ -29,7 +29,7 @@ consult `DetectionFlag`
 so it will read an invalid beam's zero two-way travel time as a sounding at
 zero depth — seafloor at the surface. That applies to **any CUBE ingest path,
 live or offline**: the same loop runs in the live node and in the offline
-importers (`import_bag`, `batch_regen`, `bag_to_geotiff`), so a bag recorded
+importers (`import_bag`, `batch_regen_bag`, `bag_to_geotiff`), so a bag recorded
 after this change and re-imported before `#154` lands writes those zero-depth
 soundings into the persistent store, not just a transient cloud. That is a bug
 in the consumer, tracked and fixed there rather than worked around here; the

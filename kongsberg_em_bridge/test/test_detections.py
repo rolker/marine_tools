@@ -92,6 +92,9 @@ def test_non_positive_table_values_are_treated_as_unavailable(monkeypatch):
     monkeypatch.setitem(node_mod._RX_BEAMWIDTH_RAD, 30, 0.0)
     monkeypatch.setitem(node_mod._TX_BEAMWIDTH_RAD, 30, -0.02)
     assert _resolve_beamwidths(30) == (None, None)
+    monkeypatch.setitem(node_mod._RX_BEAMWIDTH_RAD, 30, float('nan'))
+    monkeypatch.setitem(node_mod._TX_BEAMWIDTH_RAD, 30, float('inf'))
+    assert _resolve_beamwidths(30) == (None, None)
     msg = detections_from_parsed(_parsed(), 'm3', TimeMsg())
     assert len(msg.ping_info.rx_beamwidths) == 0
     assert len(msg.ping_info.tx_beamwidths) == 0
@@ -115,8 +118,11 @@ def test_out_of_range_tx_sector_falls_back_to_sector_zero():
     # A beam naming a sector the ping does not carry takes sector 0's tilt and
     # delay rather than raising or being dropped.
     beams = [_beam(sector=0), _beam(sector=7)]
-    msg = detections_from_parsed(_parsed(beams=beams), 'm3', TimeMsg())
+    parsed = _parsed(beams=beams)
+    parsed['sectors'][0]['tilt_deg'] = 2.0     # non-zero so the assert bites
+    msg = detections_from_parsed(parsed, 'm3', TimeMsg())
     assert len(msg.flags) == 2
+    assert msg.tx_angles[0] != 0.0
     assert msg.tx_delays[1] == msg.tx_delays[0]
     assert msg.tx_angles[1] == msg.tx_angles[0]
 
