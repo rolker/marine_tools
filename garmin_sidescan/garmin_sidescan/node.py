@@ -127,8 +127,9 @@ def _resolve_freq_bw(gen, side, freq_override):
 
     Both beamwidths are full -3 dB widths in radians (PingInfo.msg): ``rx`` is
     across-track (the wide receive fan), ``tx`` is along-track (narrow). CUBE
-    reading rx_beamwidths as degrees (cube#30) and rviz_sonar_image as a
-    half-angle are consumer bugs fixed separately -- the producer follows the .msg.
+    read rx_beamwidths as degrees until cube_bathymetry#144 (fixed by its
+    PR#153); rviz_sonar_image treating it as a half-angle (rviz_sonar_image#9)
+    is a consumer bug fixed separately -- the producer follows the .msg.
     """
     freq = freq_override
     if freq == 0.0 and gen is not None:

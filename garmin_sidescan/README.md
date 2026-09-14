@@ -172,9 +172,11 @@ fields should be aware of which axis each carries.
 GCV-10 beamwidths are deliberately omitted (spec unconfirmed); the fields are
 left empty (= unavailable) rather than stamped with a guess. The values are full
 −3 dB widths in radians, **not** half-angles. Consumers that misread this are
-fixed on their own side, not by bending the producer: CUBE currently reads
-`rx_beamwidths` as degrees (rolker/cube_bathymetry#30), and `rviz_sonar_image`
-treats it as a half-angle — both are consumer bugs handled in those packages.
+fixed on their own side, not by bending the producer: CUBE read
+`rx_beamwidths` as degrees until rolker/cube_bathymetry#144 (fixed by
+cube_bathymetry PR#153, which normalises units once at the `Device` boundary),
+and `rviz_sonar_image` treats it as a half-angle (rolker/rviz_sonar_image#9) —
+consumer bugs handled in those packages.
 
 ### Range scale, near-field gate, and `sound_speed`
 
