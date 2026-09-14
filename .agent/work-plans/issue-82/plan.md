@@ -244,7 +244,7 @@ but the "empty when uncharacterised" resolution shape is identical.
 | File | Change |
 |------|--------|
 | `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | Add `_RX_BEAMWIDTH_RAD`/`_TX_BEAMWIDTH_RAD` (or combined) table keyed by `.all` model number, `_resolve_beamwidths()` pure helper, wire into `_publish()`, rewrite the stale `node.py:544-548` comment |
-| `kongsberg_em_bridge/test/test_sonar_info.py` or a new `test_beamwidth.py` | Unit tests for `_resolve_beamwidths` (M3 uncharacterised, unknown model) and the empty-fields-on-publish behaviour |
+| `kongsberg_em_bridge/test/test_detections.py` (new; also carries the #83 tests) | Unit tests for `_resolve_beamwidths` (M3 uncharacterised, unknown model) and the empty-fields-on-publish behaviour |
 | `kongsberg_em_bridge/README.md` | New beamwidth/sensor-constants section mirroring `garmin_sidescan/README.md:140-176`; note the M3 is currently uncharacterised. Commit 2: remove the `skip_invalid_beams` parameter row, document that invalid beams are published with `DETECT_BAD_SONAR` and that `cube_bathymetry#154` is still open |
 | `kongsberg_em_bridge/kongsberg_em_bridge/node.py` (commit 2) | Remove the `skip_invalid_beams` parameter, `self.skip_invalid`, and the skip branch; comment at the old declaration site; unconditional startup warning naming `cube_bathymetry#154` |
 | `kongsberg_em_bridge/test/test_detections.py` (commit 2) | Invalid beam published with `DETECT_BAD_SONAR`; per-beam array alignment |
