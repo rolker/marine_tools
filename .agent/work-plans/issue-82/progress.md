@@ -241,3 +241,28 @@ line's outer quotes). No test was skipped, disabled or loosened.
   belongs to that repo.
 - Nothing pushed, no PR opened — the host does that. The PR body carries the
   closing keywords for both #82 and #83; the commits deliberately do not.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-14 09:10 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-82 at `0575194`
+**Mode**: pre-push
+**Depth**: Standard (reason: driver output contract change, ~400 lines, parameter removed)
+**Must-fix**: 2 | **Suggestions**: 9
+**Round**: 1 | **Ship**: continue — two mechanical must-fixes; expect round 2 to ship
+
+### Findings
+- [ ] (must-fix) heartbeat `N detections (of nrx beams)` is tautological now every beam is published; log `nvalid` vs `nrx` — `kongsberg_em_bridge/kongsberg_em_bridge/node.py:677`
+- [ ] (must-fix) README + node.py cite #82 as the follow-up tracker for the M3 figure while the PR closes #82; file a follow-up and cite it, or keep #82 open — `kongsberg_em_bridge/README.md:77`, `node.py:113`
+- [ ] (suggestion) cube#154 hazard also hits offline importers (import_bag, batch_regen, bag_to_geotiff) → store contamination; say "any CUBE ingest path" and name the tools on cube#154 — `kongsberg_em_bridge/README.md:25`
+- [ ] (suggestion) startup warning has no retirement condition; add "remove driver warning" as acceptance item on cube#154 — `node.py:422`
+- [ ] (suggestion) garmin_sidescan still cites the retired cube#30 degrees hazard — `garmin_sidescan/README.md:174`, `garmin_sidescan/garmin_sidescan/node.py:128`
+- [ ] (suggestion) `_resolve_beamwidths` should reject non-positive table values (README promises never zero-filled) — `node.py:281`
+- [ ] (suggestion) add tests: one-sided table (rx only), empty sectors, out-of-range tx_sector — `kongsberg_em_bridge/test/test_detections.py`
+- [ ] (suggestion) out-of-range tx_sector publishes a fabricated tx angle as DETECT_OK; pre-existing, follow-up candidate — `node.py:253`
+- [ ] (suggestion) "only datagram types present in a raw capture" cites no capture; name it — `README.md:40`, `node.py:100`
+- [ ] (suggestion) plan files row names test_sonar_info.py/test_beamwidth.py; tests live in test_detections.py — `.agent/work-plans/issue-82/plan.md`
+- [ ] (suggestion) PR body: bags now carry rejected beams; cube#121 review reasoned from the opposite premise
