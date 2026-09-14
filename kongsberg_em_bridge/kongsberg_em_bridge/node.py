@@ -136,7 +136,14 @@ def _resolve_beamwidths(model):
     ``Device`` boundary and validates each per-beam value before trusting it,
     so the historical "consumer multiplies radians by pi/180" hazard is gone.
     """
-    return _RX_BEAMWIDTH_RAD.get(model), _TX_BEAMWIDTH_RAD.get(model)
+    def _positive_or_none(value):
+        # A placeholder 0.0 (or a negative) left in the table while chasing a
+        # datasheet must not ship as a beamwidth: the field stays empty, as
+        # the README promises ("never zero-filled").
+        return value if value is not None and value > 0.0 else None
+
+    return (_positive_or_none(_RX_BEAMWIDTH_RAD.get(model)),
+            _positive_or_none(_TX_BEAMWIDTH_RAD.get(model)))
 
 
 def acquisition_signature(parsed):
@@ -674,9 +681,12 @@ class KongsbergEmBridge(Node):
         # Decode-health heartbeat, time-throttled rather than every N pings:
         # at survey ping rates a per-100-ping line prints every few seconds,
         # which floods the console. ~30 s keeps a liveness signal without spam.
+        # Every beam is published now (marine_tools#83), so the published
+        # count no longer says anything about detection health; the sonar's
+        # own valid count against its beam count does.
         self.get_logger().info(
-            f'ping {parsed["ping"]}: {len(msg.two_way_travel_times)} detections '
-            f'(of {parsed["nrx"]} beams), '
+            f'ping {parsed["ping"]}: {parsed["nvalid"]} valid '
+            f'of {parsed["nrx"]} beams (all published), '
             f'c={msg.ping_info.sound_speed:.1f} m/s, '
             f'f={msg.ping_info.frequency / 1000.0:.0f} kHz',
             throttle_duration_sec=30.0)

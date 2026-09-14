@@ -74,6 +74,53 @@ def test_beamwidth_arrays_track_published_beams_when_characterised(
     assert abs(msg.ping_info.tx_beamwidths[0] - 0.035) < 1e-6
 
 
+def test_one_sided_table_populates_only_that_array(monkeypatch):
+    # PingInfo.msg declares each beamwidth array independently optional, so a
+    # table with only an rx figure must yield rx per beam and tx EMPTY -- not
+    # zero-filled, not mirrored.
+    from kongsberg_em_bridge import node as node_mod
+    monkeypatch.setitem(node_mod._RX_BEAMWIDTH_RAD, 30, 0.0175)
+    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg())
+    assert len(msg.ping_info.rx_beamwidths) == len(msg.two_way_travel_times)
+    assert len(msg.ping_info.tx_beamwidths) == 0
+
+
+def test_non_positive_table_values_are_treated_as_unavailable(monkeypatch):
+    # A placeholder 0.0 or a negative left in the table must not ship: the
+    # README promises the fields are never zero-filled.
+    from kongsberg_em_bridge import node as node_mod
+    monkeypatch.setitem(node_mod._RX_BEAMWIDTH_RAD, 30, 0.0)
+    monkeypatch.setitem(node_mod._TX_BEAMWIDTH_RAD, 30, -0.02)
+    assert _resolve_beamwidths(30) == (None, None)
+    msg = detections_from_parsed(_parsed(), 'm3', TimeMsg())
+    assert len(msg.ping_info.rx_beamwidths) == 0
+    assert len(msg.ping_info.tx_beamwidths) == 0
+
+
+def test_no_sectors_falls_back_without_dropping_beams():
+    # Corrupt/odd input: no TX sectors at all. Frequency reads 0.0, the
+    # sector-derived per-beam fields fall back to 0, and every beam is still
+    # published with the arrays aligned.
+    parsed = _parsed()
+    parsed['sectors'] = []
+    msg = detections_from_parsed(parsed, 'm3', TimeMsg())
+    assert msg.ping_info.frequency == 0.0
+    assert len(msg.flags) == 3
+    assert list(msg.tx_delays) == [0.0] * 3
+    assert list(msg.tx_angles) == [0.0] * 3
+    assert len(msg.rx_angles) == 3
+
+
+def test_out_of_range_tx_sector_falls_back_to_sector_zero():
+    # A beam naming a sector the ping does not carry takes sector 0's tilt and
+    # delay rather than raising or being dropped.
+    beams = [_beam(sector=0), _beam(sector=7)]
+    msg = detections_from_parsed(_parsed(beams=beams), 'm3', TimeMsg())
+    assert len(msg.flags) == 2
+    assert msg.tx_delays[1] == msg.tx_delays[0]
+    assert msg.tx_angles[1] == msg.tx_angles[0]
+
+
 def test_ping_info_basics():
     msg = detections_from_parsed(_parsed(), 'm3', TimeMsg(sec=7))
     assert msg.header.frame_id == 'm3'
