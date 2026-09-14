@@ -111,7 +111,7 @@ def sonar_model_name(model):
 # explicitly by the consumer while a wrong number is not.  Same convention
 # garmin_sidescan already ships for its uncharacterised GCV-10 generation.
 # Fill these in when a datasheet figure and its conditions can be cited
-# (marine_tools#82); an unmapped model number resolves to None the same way.
+# (marine_tools#85); an unmapped model number resolves to None the same way.
 _RX_BEAMWIDTH_RAD = {30: None}    # across-track (receive), M3 uncharacterised
 _TX_BEAMWIDTH_RAD = {30: None}    # along-track (transmit), M3 uncharacterised
 

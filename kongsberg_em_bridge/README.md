@@ -82,7 +82,7 @@ made the consumer normalize units once at the `Device` boundary and validate
 each per-beam value before trusting it, retiring the historical hazard where a
 correctly-populated radians value was consumed as degrees. What is missing is a
 cited figure, not a safe consumer — so filling in the table is a follow-up
-whenever a datasheet figure and its conditions turn up (marine_tools#82).
+whenever a datasheet figure and its conditions turn up (marine_tools#85).
 
 ## Services
 
