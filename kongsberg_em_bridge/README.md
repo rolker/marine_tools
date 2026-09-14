@@ -46,10 +46,16 @@ per beam the sonar reported. A test pins that invariant.
 
 ### Beamwidths
 
-The M3's `.all` stream carries no beamwidth of its own — reading a raw capture,
-the only datagram types present are attitude, surface sound speed, raw range
-and angle 78, XYZ88 and clock. There is no runtime-parameters datagram, which
-is where a Kongsberg system would state its beamwidths. So `ping_info`'s
+The M3's `.all` stream carries no beamwidth of its own. In the raw capture
+`m3_20260820_205455.all` (BizzyBoat, 2026-08-20, archived under
+`map2026asv/logs/gabby/logs/bizzyboat_sonar/m3_all/`), a scan of the first
+64 MB found 32,721 datagrams of exactly five types — attitude (`A`), clock
+(`C`), surface sound speed (`G`), raw range and angle 78 (`N`) and XYZ88
+(`X`) — all model 30. There is no installation-parameters (`I`) or
+runtime-parameters (`R`) datagram, which is where a Kongsberg system would
+state its beamwidths. That is one recording, not a protocol guarantee; a
+capture from a different M3 firmware or export setting should be re-checked
+the same way. So `ping_info`'s
 beamwidths can only come from a small device table in `node.py`
 (`_RX_BEAMWIDTH_RAD` / `_TX_BEAMWIDTH_RAD`, resolved by
 `_resolve_beamwidths`), keyed by the `.all` model number — the same key

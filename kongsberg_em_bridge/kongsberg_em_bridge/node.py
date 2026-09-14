@@ -98,11 +98,12 @@ def sonar_model_name(model):
 
 # .all model number -> full -3 dB beamwidth in radians (PingInfo.msg = radians,
 # and these are FULL widths, not half-angles).  The M3 datagram stream carries
-# no beamwidth of its own -- reading a raw .all capture, the only datagram types
-# present are attitude, surface sound speed, raw range and angle 78, XYZ88 and
-# clock; there is no runtime-parameters datagram, which is where a Kongsberg
-# system would state its beamwidths.  So a figure can only come from a device
-# table like this one.
+# no beamwidth of its own: the raw capture m3_20260820_205455.all (BizzyBoat,
+# 2026-08-20, see README "Beamwidths") holds only attitude, clock, surface
+# sound speed, N/78 and XYZ88 datagrams -- no installation- or
+# runtime-parameters datagram, which is where a Kongsberg system would state
+# its beamwidths.  So a figure can only come from a device table like this
+# one.
 #
 # Model 30 (the M3) is mapped explicitly to None: it is UNCHARACTERISED, not
 # forgotten.  No sourced M3 beamwidth figure exists -- not in a datasheet on
@@ -227,8 +228,13 @@ def detections_from_parsed(parsed, frame_id, stamp):
     Build one ping's ``SonarDetections`` from a parsed N/78 datagram.
 
     Pure (no rclpy node) like ``sonar_info_from_parsed``, so the per-beam
-    array construction -- including the invariant that every per-beam array in
-    the message is the same length -- is unit-testable without an executor.
+    array construction is unit-testable without an executor -- including the
+    invariant that the required per-beam arrays (``flags``,
+    ``two_way_travel_times``, ``tx_delays``, ``intensities``, ``tx_angles``,
+    ``rx_angles``) and each *populated* beamwidth array are all the same
+    length.  A beamwidth array is either one entry per beam or empty
+    (``PingInfo.msg`` makes each independently optional); it is never a
+    partial fill.
 
     Every beam the sonar reported is published, invalid ones included, each
     carrying its own ``DetectionFlag`` (marine_tools#83).
