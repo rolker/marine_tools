@@ -293,8 +293,7 @@ def test_buffer_counters_surface_in_diagnostics(mock_serial_cls):
     node = _make_node(mock_serial_cls)
     try:
         node._diag_pub = MagicMock()
-        node._parser.buffer_dropped_bytes = 4321
-        node._parser.buffer_trim_count = 7
+        node._parser._trim_stats = (4321, 7)
         node._publish_diagnostics()
         status = node._diag_pub.publish.call_args.args[0].status[0]
         values = {kv.key: kv.value for kv in status.values}
@@ -305,7 +304,7 @@ def test_buffer_counters_surface_in_diagnostics(mock_serial_cls):
 
 
 class _CountingCounters:
-    """Parser stand-in that records how often each trim counter is read."""
+    """Parser stand-in that records how often the trim snapshot is read."""
 
     def __init__(self, dropped, trims):
         self._dropped = dropped
@@ -313,18 +312,25 @@ class _CountingCounters:
         self.reads = 0
 
     @property
-    def buffer_dropped_bytes(self):
+    def trim_stats(self):
         self.reads += 1
-        # Simulate the serial thread bumping the counter between reads: a
-        # second read in the same tick would see a different value.
+        # Simulate the serial thread bumping the pair between reads: a
+        # second read in the same tick would see different values.
         self._dropped += 1000
-        return self._dropped
+        self._trims += 1
+        return (self._dropped, self._trims)
+
+    @property
+    def buffer_dropped_bytes(self):
+        raise AssertionError(
+            'the node must take the trim_stats snapshot, not the '
+            'individual counters: separate reads can straddle a trim')
 
     @property
     def buffer_trim_count(self):
-        self.reads += 1
-        self._trims += 1
-        return self._trims
+        raise AssertionError(
+            'the node must take the trim_stats snapshot, not the '
+            'individual counters: separate reads can straddle a trim')
 
 
 @patch('sound_speed_bridge.node.serial.Serial')
@@ -333,9 +339,11 @@ def test_trim_counters_are_snapshotted_once_per_tick(mock_serial_cls):
     The WARN text and the published KeyValues come from one snapshot.
 
     The two counters are a correlated pair bumped on the serial thread. Read
-    separately -- once for the WARN, again for the KeyValues -- they can
-    describe instants a chunk apart, so an operator correlating the log with
-    /diagnostics sees numbers that do not add up. Each is read exactly once.
+    separately -- once for the WARN, again for the KeyValues, or once per
+    counter -- they can describe instants a chunk apart, so an operator
+    correlating the log with /diagnostics sees numbers that do not add up.
+    The pair is taken as one ``trim_stats`` tuple, exactly once per tick;
+    the stand-in fails loudly if either individual counter is touched.
     """
     node = _make_node(mock_serial_cls)
     logger = MagicMock()
@@ -346,7 +354,7 @@ def test_trim_counters_are_snapshotted_once_per_tick(mock_serial_cls):
 
         node._publish_diagnostics()
 
-        assert node._parser.reads == 2  # one read of each counter
+        assert node._parser.reads == 1  # one snapshot of the pair
         status = node._diag_pub.publish.call_args.args[0].status[0]
         values = {kv.key: kv.value for kv in status.values}
         assert values['buffer_dropped_bytes'] == '1000'
@@ -374,15 +382,13 @@ def test_buffer_trim_warns_once_then_backs_off(mock_serial_cls):
         node._diag_pub = MagicMock()
         node.get_logger = MagicMock(return_value=logger)
 
-        node._parser.buffer_trim_count = 1
-        node._parser.buffer_dropped_bytes = 100
+        node._parser._trim_stats = (100, 1)
         node._publish_diagnostics()
         assert logger.warning.call_count == 1
         assert '100 B since' in logger.warning.call_args.args[0]
 
         # A further trim on the very next tick is inside the back-off.
-        node._parser.buffer_trim_count = 2
-        node._parser.buffer_dropped_bytes = 200
+        node._parser._trim_stats = (200, 2)
         node._publish_diagnostics()
         assert logger.warning.call_count == 1
 
@@ -393,8 +399,7 @@ def test_buffer_trim_warns_once_then_backs_off(mock_serial_cls):
         # Once the interval has elapsed a new trim warns again, reporting
         # only what was dropped since the previous warning.
         node._last_trim_warn_ns -= 10 * 1_000_000_000
-        node._parser.buffer_trim_count = 3
-        node._parser.buffer_dropped_bytes = 350
+        node._parser._trim_stats = (350, 3)
         node._publish_diagnostics()
         assert logger.warning.call_count == 2
         assert '250 B since' in logger.warning.call_args.args[0]
@@ -412,11 +417,10 @@ def test_buffer_trim_warn_backoff_resets_after_a_quiet_period(mock_serial_cls):
         node._diag_pub = MagicMock()
         node.get_logger = MagicMock(return_value=logger)
 
-        node._parser.buffer_trim_count = 1
-        node._parser.buffer_dropped_bytes = 100
+        node._parser._trim_stats = (100, 1)
         node._publish_diagnostics()
         assert logger.warning.call_count == 1
-        node._parser.buffer_trim_count = 2
+        node._parser._trim_stats = (100, 2)
         node._publish_diagnostics()
         assert logger.warning.call_count == 1
 
@@ -435,8 +439,7 @@ def test_buffer_trim_warn_backoff_resets_after_a_quiet_period(mock_serial_cls):
         assert node._trim_warn_interval_s == 0.0
 
         # The next stall warns on its first trim.
-        node._parser.buffer_trim_count = 3
-        node._parser.buffer_dropped_bytes = 500
+        node._parser._trim_stats = (500, 3)
         node._publish_diagnostics()
         assert logger.warning.call_count == 2
     finally:

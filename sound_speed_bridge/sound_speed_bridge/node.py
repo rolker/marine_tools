@@ -702,9 +702,12 @@ class SoundSpeedBridgeNode(Node):
                         f'[{self._valid_min:.1f}, {self._valid_max:.1f}]')
 
         # One snapshot of the correlated counter pair, used for both the
-        # WARN below and the KeyValues published from it.
-        dropped_bytes = self._parser.buffer_dropped_bytes
-        trim_count = self._parser.buffer_trim_count
+        # WARN below and the KeyValues published from it. Read as a single
+        # tuple: the pair is written on the serial thread, and two separate
+        # reads can straddle a trim, reporting a trim count without the
+        # bytes that go with it -- numbers that never coexisted, in a log
+        # line and a KeyValue an operator is expected to correlate.
+        dropped_bytes, trim_count = self._parser.trim_stats
         self._warn_on_buffer_trim(now_ns, trim_count, dropped_bytes)
 
         status = DiagnosticStatus()

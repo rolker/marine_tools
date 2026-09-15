@@ -39,7 +39,7 @@ from abc import ABC, abstractmethod
 from decimal import Decimal, InvalidOperation
 import math
 import re
-from typing import Iterable, List, NamedTuple, Optional
+from typing import Iterable, List, NamedTuple, Optional, Tuple
 
 
 class SoundSpeedReading(NamedTuple):
@@ -96,14 +96,24 @@ class SoundSpeedParser(ABC):
     yielding -- so buffer accumulation, trimming and resync happen on the
     call and never depend on the caller exhausting a generator.
 
-    Trim accounting is exposed as two plain attributes, polled by the
-    node's diagnostics timer: ``buffer_dropped_bytes`` (the actionable
-    magnitude -- how much of the stream was lost, counting both the bytes
-    trimmed off the front of the residue and the head fragment
-    :meth:`_resync` then discards through the next terminator) and
-    ``buffer_trim_count`` (the event count, which counts *trims* only, so
-    it distinguishes one overflow from a sustained stall and is the
-    node's edge trigger for its backed-off WARN).
+    Trim accounting is exposed as :attr:`trim_stats`, a
+    ``(dropped_bytes, trim_count)`` tuple polled by the node's diagnostics
+    timer: ``dropped_bytes`` is the actionable magnitude -- how much of the
+    stream was lost, counting both the bytes trimmed off the front of the
+    residue and the head fragment :meth:`_resync` then discards through the
+    next terminator -- and ``trim_count`` is the event count, which counts
+    *trims* only, so it distinguishes one overflow from a sustained stall
+    and is the node's edge trigger for its backed-off WARN.
+
+    The pair is **one tuple, rebound in a single assignment**, because it is
+    written on the serial thread and read on the diagnostics timer: two
+    independent counters can be sampled between the two writes of one trim,
+    and the operator correlating the WARN text with ``/diagnostics`` then
+    sees a trim count without its bytes. Rebinding one tuple is atomic under
+    the GIL, so every snapshot is a state that actually existed.
+    :attr:`buffer_dropped_bytes` and :attr:`buffer_trim_count` remain as
+    read-only views onto it for callers that want one number; a reader that
+    needs both must take :attr:`trim_stats` once.
     """
 
     DEFAULT_MAX_BUFFER_BYTES = 4096
@@ -144,8 +154,22 @@ class SoundSpeedParser(ABC):
         self._max_buffer_bytes = max_buffer_bytes
         self._buffer = b''
         self._discarding = False
-        self.buffer_dropped_bytes = 0
-        self.buffer_trim_count = 0
+        self._trim_stats: Tuple[int, int] = (0, 0)
+
+    @property
+    def trim_stats(self) -> Tuple[int, int]:
+        """Return ``(dropped_bytes, trim_count)`` as one consistent snapshot."""
+        return self._trim_stats
+
+    @property
+    def buffer_dropped_bytes(self) -> int:
+        """Bytes lost to trims and resyncs (read-only view of :attr:`trim_stats`)."""
+        return self._trim_stats[0]
+
+    @property
+    def buffer_trim_count(self) -> int:
+        """Trim events (read-only view of :attr:`trim_stats`)."""
+        return self._trim_stats[1]
 
     @abstractmethod
     def feed(self, data: bytes, receive_time_ns: int) -> Iterable[SoundSpeedReading]:
@@ -170,7 +194,8 @@ class SoundSpeedParser(ABC):
         runs first), so this discards exactly the tail of the one damaged
         sentence and never a complete one.
 
-        Every byte discarded here is added to ``buffer_dropped_bytes``:
+        Every byte discarded here is added to ``trim_stats``' dropped-byte
+        half:
         those bytes arrived on the wire and never became a reading, which
         is exactly what that counter reports. Only the head fragment
         through (and including) the terminator is counted -- bytes still
@@ -184,7 +209,8 @@ class SoundSpeedParser(ABC):
             return False
         discarded = idx + len(self._terminator)
         self._buffer = self._buffer[discarded:]
-        self.buffer_dropped_bytes += discarded
+        dropped, trims = self._trim_stats
+        self._trim_stats = (dropped + discarded, trims)
         self._discarding = False
         return True
 
@@ -202,8 +228,10 @@ class SoundSpeedParser(ABC):
         if excess <= 0:
             return
         self._buffer = self._buffer[excess:]
-        self.buffer_dropped_bytes += excess
-        self.buffer_trim_count += 1
+        # One rebind, so the diagnostics timer can never observe the count
+        # without the bytes that go with it (see the class docstring).
+        dropped, trims = self._trim_stats
+        self._trim_stats = (dropped + excess, trims + 1)
         self._discarding = True
 
 

@@ -262,3 +262,52 @@ def test_aml_keeps_framing_after_a_non_finite_sentence():
     assert math.isnan(readings[0].sound_speed_m_s)
     assert readings[1].sound_speed_m_s == 1500.25
     assert readings[1].raw_mm_s == 1500250
+
+
+# --- The trim counters are one atomic pair ----------------------------------
+
+
+def test_a_trim_rebinds_the_counter_pair_in_a_single_assignment():
+    """
+    Every observable trim state is a whole pair, never half of one.
+
+    The counters are written on the serial thread and read on the node's
+    diagnostics timer. As two independent attributes, a snapshot taken
+    between the two writes of one trim reports a trim count without the
+    bytes it lost -- a WARN line and a /diagnostics KeyValue the operator
+    is meant to correlate, describing a state that never existed. They are
+    therefore one tuple, rebound in a single (GIL-atomic) assignment.
+    """
+    writes = []
+
+    class _Watched(AMLParser):
+
+        def __setattr__(self, name, value):
+            if name == '_trim_stats':
+                writes.append(value)
+            super().__setattr__(name, value)
+
+    p = _Watched(max_buffer_bytes=256)
+    p.feed(b'x' * 5000, 0)
+    p.feed(b'x' * 5000, 0)
+
+    assert len(writes) > 2, 'no trim happened; the test proves nothing'
+    # Each write is a complete pair, and no state ever shows a trim that
+    # dropped no bytes -- which is exactly what a torn read would produce.
+    for state in writes:
+        assert isinstance(state, tuple) and len(state) == 2
+        dropped, count = state
+        assert count == 0 or dropped > 0
+    assert p.trim_stats == writes[-1]
+
+
+def test_the_public_counters_are_read_only_views_of_the_pair():
+    """The named attributes still work, but only as views -- no second source."""
+    p = AMLParser(max_buffer_bytes=256)
+    p.feed(b'x' * 1000, 0)
+    dropped, count = p.trim_stats
+    assert (p.buffer_dropped_bytes, p.buffer_trim_count) == (dropped, count)
+    with pytest.raises(AttributeError):
+        p.buffer_dropped_bytes = 1
+    with pytest.raises(AttributeError):
+        p.buffer_trim_count = 1
