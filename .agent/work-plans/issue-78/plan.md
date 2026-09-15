@@ -292,10 +292,12 @@ miss — costing one extra discarded sentence per trim.
 
 ### 4. Cap default 4096 bytes, floor 256 bytes
 
-- **Default 4096 (4 KiB)**: 16× the 256 B serial read chunk, 16× the
-  longest legitimate configured regex line (~256 B; AML sentences are
-  under 32 B), and ~5 s of wire at 800 B/s. It bounds the multi-MB hazard
-  by roughly three orders of magnitude.
+- **Default 4096 (4 KiB)**: 16× the 256 B serial read chunk, >100× the
+  sentences of the protocols in use (AML ~11 B, BizzyBoat `$AML,SVM`
+  ~32 B), and ~5 s of wire at 800 B/s. It bounds the multi-MB hazard by
+  roughly three orders of magnitude. It is a default, not a bound on
+  sentence length — `regex_pattern` bounds nothing, so a protocol with
+  longer lines needs a correspondingly larger cap.
 - **Floor 256, `ValueError` below it**: 256 B is the serial read size
   (`node.py:178`). Below that floor, every single read chunk would
   overflow the cap even in healthy traffic. The floor is a sanity bound,

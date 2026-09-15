@@ -251,17 +251,23 @@ class SoundSpeedBridgeNode(Node):
 
         Validated here as well as in the parser constructor so the failure
         names the *parameter* the operator set, not a constructor argument
-        they never see. The floor is the parser's own: a cap below the
-        256-byte serial read (or the longest legitimate sentence) would
-        shred healthy traffic instead of bounding a stall.
+        they never see. The floor is the parser's own: 256 B is the serial
+        read size, so a cap below it would be overflowed by a single
+        healthy read chunk -- shredding good traffic instead of bounding a
+        stall. It is a sanity floor, **not** a guarantee that the
+        configured protocol's sentences fit: nothing bounds the length of a
+        `regex_pattern` line, so the cap must be sized above the longest
+        sentence of the protocol in use (AML ~11 B, BizzyBoat `$AML,SVM`
+        ~32 B).
         """
         value = self.get_parameter('parser_max_buffer_bytes').value
         floor = SoundSpeedParser.MIN_MAX_BUFFER_BYTES
         if not isinstance(value, int) or isinstance(value, bool) or value < floor:
             raise ValueError(
                 f'parser_max_buffer_bytes must be an integer >= {floor} '
-                f'(the serial read size and the longest legitimate '
-                f'sentence); got {value!r}')
+                f'(the serial read size -- a sanity floor, not a '
+                f'line-length guarantee; size the cap above the longest '
+                f'sentence of the configured protocol); got {value!r}')
         return value
 
     def _warn_on_buffer_trim(self, now_ns: int, trim_count: int, dropped: int) -> None:

@@ -119,8 +119,11 @@ class SoundSpeedParser(ABC):
     DEFAULT_MAX_BUFFER_BYTES = 4096
     """Default cap on unframed residue.
 
-    16x the node's 256-byte serial read, 16x the longest legitimate
-    sentence, and ~5 s of wire at the ~800 B/s observed field rate.
+    16x the node's 256-byte serial read, ~5 s of wire at the ~800 B/s
+    observed field rate, and >100x the sentences of the protocols in use
+    (AML ~11 B, BizzyBoat ``$AML,SVM`` ~32 B). It is a default, not a
+    bound on sentence length: ``regex_pattern`` bounds nothing, so a
+    protocol with longer lines needs a correspondingly larger cap.
     """
 
     MIN_MAX_BUFFER_BYTES = 256
@@ -149,7 +152,9 @@ class SoundSpeedParser(ABC):
         if max_buffer_bytes < self.MIN_MAX_BUFFER_BYTES:
             raise ValueError(
                 f'max_buffer_bytes must be >= {self.MIN_MAX_BUFFER_BYTES} '
-                f'(the serial read size and the longest legitimate sentence); '
+                f'(the serial read size -- a sanity floor, not a line-length '
+                f'guarantee; size the cap above the longest sentence of the '
+                f'configured protocol); '
                 f'got {max_buffer_bytes}')
         self._max_buffer_bytes = max_buffer_bytes
         self._buffer = b''
