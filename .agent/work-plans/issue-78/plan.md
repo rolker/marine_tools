@@ -11,6 +11,14 @@ https://github.com/rolker/marine_tools/issues/78
 > Revision 3 (2026-09-15) syncs the plan with the fixes made for the
 > round-1 Local Review (Pre-Push); those are marked **[PR-R1-MF*n*]** /
 > **[PR-R1-S*n*]** against that entry's must-fix and suggestion numbering.
+>
+> Revision 4 (2026-09-15) does two things. It defines the markers the
+> table already carried but no note explained: **[PR-R2-MF1]** /
+> **[PR-R2-S*n*]** are the round-2 Local Review's must-fix and
+> suggestions, **[PR-R3-S*n*]** the round-3 ones. And it records the
+> operator's scope widening (below) — the two pre-existing defects the
+> reviews surfaced are now fixed on this branch, marked **[SW1]** and
+> **[SW2]**.
 
 ## Context
 
@@ -61,6 +69,69 @@ read chunk and the sentence length, not by the stall duration — a stall of
 *any* length is bounded to the cap, so the cap only has to be (a) larger
 than anything legitimate and (b) small enough that the retained glued line
 is a diagnostic sample rather than a memory hazard.
+
+## Scope widening: two pre-existing defects, by operator decision
+
+At the publish gate the operator was asked whether the two pre-existing
+defects the #78 reviews found should be filed as follow-ups or fixed here.
+The decision, verbatim:
+
+> "Fix those before publishing to reduce issue churn and get fixes done
+> quicker."
+
+Both are therefore in scope for this branch. Neither was introduced by
+#78; both sit on its contract, which is why the reviews raised them.
+
+### [SW1] A non-finite sentence kills the serial reader thread
+
+`AMLParser._parse` converted the parsed `Decimal` to integer mm/s
+**outside** its `try`. `nan`, `inf`, `-inf` and `snan` are all valid
+`Decimal` literals, and `1e999` is a *finite* Decimal that overflows to an
+infinite float, so one such sentence raised
+`InvalidOperation`/`OverflowError`/`ValueError` straight out of `feed()`.
+`_serial_loop` catches only `(SerialException, OSError)`, so the exception
+ended the daemon reader thread with `_serial_connected` still **True**:
+the node reports a healthy serial link and never publishes another reading
+for the rest of the deployment. Eager `feed()` (step 2) widens the loss
+from one sentence to the whole read chunk, which is what put it on this
+branch's contract.
+
+Fix: both numeric conversions move inside the guarded region and the
+result is checked for finiteness; a sentence that cannot yield a finite
+number is a parse failure like any other — NaN reading, `raw_bytes`
+preserved, counted by the existing parse-error path.
+
+`RegexParser` has the same class of hazard one step downstream, and it was
+checked as the review asked: `float()` accepts `'nan'`/`'inf'` and
+overflows `'1e999'`, so a loose pattern published an **infinite** sound
+speed. That is not merely wrong downstream — `format_valeport` and
+`format_template` `round()` it *on the serial thread*, raising
+`OverflowError` past the same catch, so the thread dies there instead. A
+non-finite value (including one produced by `sound_speed_scale`) is
+therefore NaN too. Optional `temperature`/`pressure` captures follow the
+same rule: an unreported field beats `inf` in a `Temperature` /
+`FluidPressure` message.
+
+### [SW2] A deliberate SIGINT stop exits 1
+
+All four nodes in this repo share one `main()` shape. rclpy installs its
+own SIGINT handler, which shuts the context down *before* `main()` sees
+anything, so a deliberate stop produced two failures at once: `spin()`
+raised an uncaught `ExternalShutdownException`, and the `finally`'s
+`rclpy.shutdown()` raised `RCLError: rcl_shutdown already called`. Exit
+status **1**, two tracebacks. Under systemd `Restart=on-failure` an
+operator stopping a node is then indistinguishable from a crash — and
+this branch just made a refused parameter exit 1, a signal that noise
+would bury.
+
+Fix, in `sound_speed_bridge`, `zda_serial_bridge`, `kongsberg_em_bridge`
+and `garmin_sidescan`: catch `ExternalShutdownException` alongside
+`KeyboardInterrupt`, and shut down through the idempotent
+`rclpy.try_shutdown()`. `destroy_node()` stays where it is — verified by
+execution to run correctly on an already-shut-down context.
+`kongsberg_em_bridge`'s `if rclpy.ok(): rclpy.shutdown()` becomes
+`try_shutdown()` as well: same intent, without the check-then-act race.
+Nothing else in those nodes changes.
 
 ## Approach
 
@@ -324,18 +395,34 @@ Rationale and the conflict surface:
   `parser_max_buffer_bytes` parameter row **[PR-F12c]**.
 - **rolker/marine_tools#77 / PR #89** — byte-exact wire tap, the recovery
   path for bytes this cap drops.
+- **A third, distinct defect observed in `garmin_sidescan` while verifying
+  [SW2]** — with the sonar absent, a SIGINT still exits 1, but for an
+  unrelated reason: the `_reconcile_transmit_param` timer callback calls
+  `set_parameters()` after the signal handler has shut the context down,
+  and the resulting `RCLError: publisher's context is invalid` propagates
+  out of `spin()`. That is a callback-versus-shutdown race inside the
+  node, not the `main()` contract [SW2] fixes, and it predates this
+  branch. Reported to the operator rather than fixed here: the publish-gate
+  decision widened scope to the two defects the #78 reviews found, and
+  this is a third.
 
 ## Files to Change
 
 | File | Change |
 |------|--------|
 | `sound_speed_bridge/launch/aml_svs.launch.py` | Add the `parser_max_buffer_bytes` launch argument at its default **[PR-R1-S8]** |
-| `sound_speed_bridge/sound_speed_bridge/parsers.py` | Move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
-| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**, exiting **1** via `SystemExit` so `ros2 launch`/systemd see a failure, with the `except` scoped to construction only, not `spin()` **[PR-R2-MF1, PR-R2-S1]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
-| `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap |
-| `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case |
-| `sound_speed_bridge/test/test_node.py` | Parameter validation; counters in `/diagnostics`; WARN once then backed off |
+| `sound_speed_bridge/sound_speed_bridge/parsers.py` | **[SW1]** Non-finite guard: both `_parse`s treat `nan`/`inf`/`-inf`/`snan`/`1e999` as a parse failure (NaN reading, `raw_mm_s=None`), every numeric conversion inside the guarded region; `RegexParser._optional_float` drops a non-finite temperature/pressure; module docstring says so. Plus: move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
+| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**, exiting **1** via `SystemExit` so `ros2 launch`/systemd see a failure, with the `except` scoped to construction only, not `spin()` **[PR-R2-MF1, PR-R2-S1]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s; **[SW2]** `main()` catches `ExternalShutdownException` and shuts down via `rclpy.try_shutdown()` |
+| `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap; **[SW1]** `test_aml_non_finite_sentence_is_a_parse_failure` (parametrized over `nan`/`NaN`/`inf`/`-inf`/`Infinity`/`snan`/`1e999`/`-1e999`) and `test_aml_keeps_framing_after_a_non_finite_sentence` |
+| `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case; **[SW1]** `test_regex_non_finite_capture_is_a_parse_failure`, `test_regex_non_finite_scale_product_is_a_parse_failure`, `test_regex_non_finite_optional_fields_are_not_reported`, `test_regex_keeps_framing_after_a_non_finite_sentence` |
+| `sound_speed_bridge/test/test_node.py` | Parameter validation (`test_parser_max_buffer_bytes_reaches_the_parser`, `test_parser_max_buffer_bytes_below_floor_is_rejected`, `test_parser_max_buffer_bytes_is_read_only` **[PR-R1-S3]**, `test_main_reports_a_rejected_parameter_and_shuts_down` **[PR-R1-S7, PR-R2-MF1]**); counters in `/diagnostics` (`test_buffer_counters_surface_in_diagnostics`, `test_trim_counters_are_snapshotted_once_per_tick` **[PR-R1-S5]**); WARN once then backed off (`test_buffer_trim_warns_once_then_backs_off`, `test_buffer_trim_warn_backoff_resets_after_a_quiet_period` **[PR-R1-S4]**); **[SW1]** `test_serial_thread_survives_a_non_finite_sentence` (drives the real `_serial_loop`); **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) and `test_main_returns_cleanly_on_an_external_shutdown`; **[PR-R3-S2]** `test_a_valueerror_from_spin_is_not_reported_as_a_start_failure` pins the narrowed `except` scope |
 | `sound_speed_bridge/package.xml` | `<depend>rcl_interfaces</depend>` for `ParameterDescriptor` **[PR-R2-S3]** |
+| `zda_serial_bridge/zda_serial_bridge/node.py` | **[SW2]** same `main()` fix |
+| `zda_serial_bridge/test/test_node.py` | **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) |
+| `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | **[SW2]** same `main()` fix (its `if rclpy.ok(): rclpy.shutdown()` becomes `try_shutdown()`) |
+| `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test) |
+| `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix |
+| `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test |
 
 ## Principles Self-Check
 
@@ -363,6 +450,9 @@ Rationale and the conflict surface:
 | `feed()` from generator to eager list | Node loop and tests (both already consume as an iterable) | Yes — step 2; no caller change needed |
 | `_publish_diagnostics` `KeyValue` list | PR #89, which edits the same list and `test_node.py` | Yes — Branch sequencing; textual, resolved by whoever merges second |
 | `parsers.py` docstrings | Cap/resync behaviour documented beside the framing quirks | Yes — step 9 |
+| **[SW1]** parser rejects non-finite values | `parsers.py` module docstring; the Valeport/template UDP formatters were checked (they `round()` on the serial thread, which is why `RegexParser` converts `inf` to NaN rather than passing it on) and the diagnostics comparisons (a NaN last reading is already a WARN state) | Yes — Scope widening |
+| **[SW2]** `main()` shutdown contract | All four nodes in the repo share the pattern, so all four are fixed in one commit; no launch file, parameter or topic changes | Yes — Scope widening |
+| **[SW1]**/**[SW2]** fixed here rather than filed | The operator's publish-gate decision, quoted in Scope widening; no follow-up issues filed for these two | Yes |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
 | A new node parameter | `launch/aml_svs.launch.py` | Yes — the example launch surfaces the operator-tunable parameters, so `parser_max_buffer_bytes` is added as a launch argument at its 4096 default **[PR-R1-S8]** |
 
@@ -388,10 +478,18 @@ Rationale and the conflict surface:
   two extra validation/test cases recorded in step 10 (non-integer cap
   rejection, exactly-at-the-cap boundary) and the launch-file row in
   Consequences.
-- Verification: `./sensors_ws/build.sh sound_speed_bridge` then
-  `./sensors_ws/test.sh sound_speed_bridge` —
-  `Summary: 76 tests, 0 errors, 0 failures, 0 skipped` (49 before this
-  branch). flake8 and pep257 are part of that suite and are clean.
+- The scope widening above ([SW1], [SW2]) landed as two further commits;
+  [SW2] is why three packages beyond `sound_speed_bridge` appear in Files
+  to Change.
+- Verification: all four touched packages are built and tested
+  (`./sensors_ws/build.sh` / `./sensors_ws/test.sh` with the four package
+  names). flake8 and pep257 are part of each suite and are clean. The
+  per-package summary lines are recorded in the `## Implementation`
+  progress entry for this pass.
+- [SW2] is additionally verified by *execution*, not only by test: the
+  console entry points are run with mocked I/O and sent a real SIGINT.
+  `sound_speed_bridge`, `zda_serial_bridge` and `kongsberg_em_bridge` exit
+  **0** with zero traceback lines (all three exited 1 before the fix).
 
 ## Estimated Scope
 
