@@ -260,8 +260,14 @@ Per parser (both files):
   single chunk *larger than the cap* frame fully with
   `buffer_trim_count == 0` — the regression test for the trim-on-append
   defect (F2).
-- **invalid cap rejected**: 0, negative, and 255 (below the floor) each
-  raise `ValueError` at construction.
+- **invalid cap rejected**: 0, negative, 1 and 255 (below the floor) each
+  raise `ValueError` at construction, as does a non-integer cap (`4096.0`,
+  `'4096'`, `None`, `True`) — a float or a string would otherwise compare
+  or slice in ways that silently mis-size the buffer, and `True` is an
+  `int` in Python, so the type check excludes `bool` explicitly.
+- **exactly at the cap is not a trim**: a residue of precisely
+  `max_buffer_bytes` leaves `buffer_trim_count == 0`, pinning the boundary
+  of the comparison.
 
 Node (`test_node.py`):
 
@@ -341,6 +347,7 @@ Rationale and the conflict surface:
 | `_publish_diagnostics` `KeyValue` list | PR #89, which edits the same list and `test_node.py` | Yes — Branch sequencing; textual, resolved by whoever merges second |
 | `parsers.py` docstrings | Cap/resync behaviour documented beside the framing quirks | Yes — step 9 |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
+| A new node parameter | `launch/aml_svs.launch.py` | No change needed — the example launch sets only `device`/`baud`/`parser`/`frame_id` and leaves everything else at the node defaults, which now include the 4096-byte cap |
 
 ## Documentation & Instruction Impact
 
@@ -357,6 +364,17 @@ Rationale and the conflict surface:
 - None. All 5 must-fix and 7 should-fix findings of the Plan Review are
   resolved above; the operator's checkpoint decision was "revise plan,
   then implement" with no further plan-review round.
+
+## Implementation notes (kept in sync with the branch)
+
+- Implemented as planned. The only additions beyond the text above are the
+  two extra validation/test cases recorded in step 10 (non-integer cap
+  rejection, exactly-at-the-cap boundary) and the launch-file row in
+  Consequences.
+- Verification: `./sensors_ws/build.sh sound_speed_bridge` then
+  `./sensors_ws/test.sh sound_speed_bridge` —
+  `Summary: 76 tests, 0 errors, 0 failures, 0 skipped` (49 before this
+  branch). flake8 and pep257 are part of that suite and are clean.
 
 ## Estimated Scope
 
