@@ -348,3 +348,91 @@ on this branch instead of being filed as follow-ups.
 - Tests added: parser-level non-finite cases on both parsers (parametrized over `nan`/`NaN`/`inf`/`-inf`/`Infinity`/`snan`/`1e999`/`-1e999`, plus a scale-product overflow and the optional fields), a node-level test that drives the **real** `_serial_loop` over `nan`/`inf`/`1e999` sentences and asserts the thread is alive and the next good sentence publishes, a real-SIGINT subprocess test for `sound_speed_bridge` and `zda_serial_bridge`, an in-process `ExternalShutdownException` test for `sound_speed_bridge`, `kongsberg_em_bridge` and `garmin_sidescan` (the latter two as new `test/test_main_shutdown.py` files, node mocked so only `main()` is under test), and the except-scope test above.
 - `garmin_sidescan` needs `marine_radar_control_msgs` built first; `colcon build --packages-up-to` covers it in this worktree.
 - Nothing pushed; no PR opened; no issues filed (per host instruction).
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 11:49 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Branch**: feature/issue-78 at `6e797d4`
+**Addressed**: the third defect the previous pass surfaced and left out of
+scope — `garmin_sidescan` still exiting 1 on a deliberate SIGINT — now in
+scope under the operator's standing publish-gate decision, verbatim:
+*"Fix those before publishing to reduce issue churn and get fixes done
+quicker."*
+**Commits**: `ac7803a`, `6e797d4`
+**Tests**: `garmin_sidescan` — `Summary: 86 tests, 0 errors, 0 failures, 0 skipped`
+(was 82; `colcon test-result --test-result-base build/garmin_sidescan`. The
+layer-wide line `./sensors_ws/test.sh` prints, `Summary: 289 tests, 0 errors,
+0 failures, 0 skipped`, covers every package already built in the worktree.)
+ament flake8 + pep257 are inside that count and clean.
+
+### Actions
+- [x] (defect 3 — SW3) A callback can no longer fail the process at shutdown.
+  rclpy's signal handler shuts the context down while the executor is still
+  inside `spin()`, so `_reconcile_transmit_param` reached `set_parameters()`
+  — and the parameter-event publish inside it — on a dead context:
+  `RCLError: Failed to publish: publisher's context is invalid` propagated
+  out of `spin()`, so a clean operator stop was exit 1 with a traceback,
+  which is exactly the signal #78's exit-code contract is trying to keep
+  meaningful under `Restart=on-failure`. A `quiet_on_shutdown` decorator now
+  guards the **call** — a bare `if rclpy.ok()` before it would be
+  check-then-act and the shutdown can land in the gap — catching
+  `RCLError`/`InvalidHandle` and consulting `rclpy.ok(context=self.context)`
+  only afterwards: a shutdown in flight returns quietly, a failure on a live
+  context is re-raised unchanged. Applied to the three timer callbacks, the
+  `~/change_state` subscription callback, `_publish_tx_state` /
+  `_publish_control_set` (which the startup daemon thread and the
+  `~/set_transmit` service reach) and the `_rx_loop` / `_aux_loop` thread
+  entries, where a stray `RCLError` at shutdown would otherwise kill a daemon
+  thread with a traceback on stderr. Normal behaviour is untouched —
+  `garmin_sidescan/garmin_sidescan/node.py` — `ac7803a`
+- [x] Four tests drive the callbacks against a **real** shut-down `rclpy`
+  `Context` (not a mock of `rclpy.ok`), raising the exact `RCLError` the field
+  shows: quiet on a dead context for the reconcile callback and for a sibling
+  publishing timer; still raised on a **live** context; and a non-RCL bug in a
+  callback body still surfaces — `garmin_sidescan/test/test_main_shutdown.py`
+  — `ac7803a`
+- [x] Plan: [SW3] moved out of Out of scope into Scope widening with the
+  operator quote, plus revision note, Files to Change and Consequences rows —
+  `.agent/work-plans/issue-78/plan.md` — `6e797d4`
+
+### Verification
+- **Deterministic, by execution, on the console entry point** (I/O mocked,
+  nothing about the failing call mocked): with the context shutdown forced to
+  land *inside* the reconcile callback, the pre-fix code exits **1** with
+  `rclpy._rclpy_pybind11.RCLError: Failed to publish: publisher's context is
+  invalid, at ./src/rcl/publisher.c:423`; the fixed code exits **0** with **0**
+  traceback lines. This is the discriminating check — see the caveat below.
+- **Real SIGINT to the console entry point** (I/O mocked, real signal):
+  `garmin_sidescan` exits **0**, **0** traceback lines, no `RCLError`.
+  **Caveat, stated because it bounds what that run proves**: on this bench the
+  *pre-fix* code also exits 0 under a plain real-SIGINT run. The failure is a
+  race — the callback has to be dispatched, or be mid-call, exactly across the
+  context teardown — and it did not land here in repeated attempts (5 runs of a
+  high-rate reconcile timer with a standing disagreement, 3 plain runs). The
+  previous pass observed it landing. So the real-SIGINT run confirms no
+  regression, and the forced-ordering run above is what proves the fix.
+- **Mutation checks** (out-of-tree copies only, run against the committed
+  tests): 4 mutations, all killed. (1) both decorators stripped — the exact
+  pre-fix code — killed by the two quiet-on-shutdown tests; (2) blanket swallow
+  (`return None` with no `rclpy.ok` re-raise) — killed by the live-context
+  test; (3) `except Exception` instead of `(RCLError, InvalidHandle)` — killed
+  by the non-RCL test; (4) check-then-act (`if not rclpy.ok(): return` before
+  the call, no try) — killed by two tests, which is the point: it changes
+  semantics as well as being racy.
+- `rclpy.exceptions` does not export `RCLError`; it is
+  `rclpy.impl.implementation_singleton.rclpy_implementation.RCLError`, a
+  `RuntimeError` subclass, imported the way rclpy's own code imports it.
+- No `.agents/README.md` exists in this repo, so there was no parameter/topic
+  table to update. No topic, service, parameter or launch change.
+
+### Notes
+- **Residual, surfaced not assumed away**: `sound_speed_bridge`,
+  `zda_serial_bridge` and `kongsberg_em_bridge` each run a publishing timer
+  (`_publish_diagnostics`, `_sonar_info_heartbeat`) and so share this race in
+  principle. It has never been observed on them and their real-SIGINT runs
+  exit 0. Extending the guard to them is a **fourth** scope widening the
+  operator has not been asked for, so it was not done — it is the operator's
+  one-line yes/no, recorded in the plan's Consequences table.
+- Nothing pushed; no PR opened; no issues filed (per host instruction).
