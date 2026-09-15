@@ -74,8 +74,11 @@ class SoundSpeedBridgeNode(Node):
         self.declare_parameter('regex_pattern', '')
         self.declare_parameter('regex_sound_speed_scale', 1.0)
         self.declare_parameter('regex_line_terminator', 'cr')
-        # Cap on each parser's unframed accumulation buffer. Read once
-        # here and handed to the parser factory below, so it is declared
+        # Cap on each parser's unframed accumulation buffer. An
+        # out-of-range value is fail-loud: the node refuses to start
+        # rather than silently clamping, and main() turns that refusal
+        # into one FATAL line naming this parameter. Read once here and
+        # handed to the parser factory below, so it is declared
         # read-only: a field `ros2 param set` is then rejected outright
         # rather than reporting success and changing nothing. Changing the
         # cap means restarting the node.
@@ -434,15 +437,28 @@ class SoundSpeedBridgeNode(Node):
 
 
 def main(args=None) -> None:
-    """Entry point: spin the bridge node until interrupted."""
+    """
+    Entry point: spin the bridge node until interrupted.
+
+    Construction happens inside the try so a parameter the node refuses
+    (see :meth:`SoundSpeedBridgeNode._validated_max_buffer_bytes`) is
+    reported as one FATAL line naming the parameter and still shuts rclpy
+    down, instead of exiting on a raw traceback with the context left
+    initialized. The node still refuses to start -- that is deliberate.
+    """
     rclpy.init(args=args)
-    node = SoundSpeedBridgeNode()
+    node = None
     try:
+        node = SoundSpeedBridgeNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except ValueError as exc:
+        rclpy.logging.get_logger('sound_speed_bridge').fatal(
+            f'sound_speed_bridge failed to start: {exc}')
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         rclpy.shutdown()
 
 

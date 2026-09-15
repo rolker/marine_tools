@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import rclpy
 from rclpy.parameter import Parameter
-from sound_speed_bridge.node import SoundSpeedBridgeNode
+from sound_speed_bridge.node import main, SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import SoundSpeedReading
 from std_msgs.msg import UInt8MultiArray
 
@@ -201,6 +201,28 @@ def test_parser_max_buffer_bytes_is_read_only(mock_serial_cls):
         assert node._parser._max_buffer_bytes != 1024
     finally:
         node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_main_reports_a_rejected_parameter_and_shuts_down(mock_serial_cls):
+    """
+    A refused parameter exits through one FATAL line, not a raw traceback.
+
+    The node constructing outside main()'s try/finally meant a parameter
+    ValueError skipped rclpy.shutdown() entirely and printed a stack trace
+    an operator has to read backwards to find the parameter name in.
+    """
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    rclpy.shutdown()  # main() does its own init
+    logger = MagicMock()
+    with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+               return_value=logger):
+        main(args=['--ros-args', '-p', 'parser_max_buffer_bytes:=128'])
+    assert not rclpy.ok()
+    assert 'parser_max_buffer_bytes' in logger.fatal.call_args.args[0]
+    rclpy.init()  # restore the context the autouse fixture shuts down
 
 
 @patch('sound_speed_bridge.node.serial.Serial')
