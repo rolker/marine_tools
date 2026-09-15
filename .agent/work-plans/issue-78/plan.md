@@ -20,6 +20,12 @@ https://github.com/rolker/marine_tools/issues/78
 > reviews surfaced are now fixed on this branch, marked **[SW1]** and
 > **[SW2]**.
 >
+> Revision 6 (2026-09-15) widens the scope a fourth time, on the same
+> standing operator decision and a Copilot cross-confirmation: the
+> callback-versus-shutdown guard [SW3] gave `garmin_sidescan` is extended
+> to the publishing timers of the other three nodes, marked **[SW4]** —
+> the residual Revision 5 recorded rather than assumed away.
+>
 > Revision 5 (2026-09-15) widens the scope once more, on the same
 > operator decision: the third defect, found while verifying [SW2] and
 > until now listed as out of scope — `garmin_sidescan`'s timer callback
@@ -75,7 +81,7 @@ read chunk and the sentence length, not by the stall duration — a stall of
 than anything legitimate and (b) small enough that the retained glued line
 is a diagnostic sample rather than a memory hazard.
 
-## Scope widening: three pre-existing defects, by operator decision
+## Scope widening: four pre-existing defects, by operator decision
 
 At the publish gate the operator was asked whether the pre-existing
 defects the #78 reviews found should be filed as follow-ups or fixed here.
@@ -84,13 +90,17 @@ The decision, verbatim:
 > "Fix those before publishing to reduce issue churn and get fixes done
 > quicker."
 
-All three are therefore in scope for this branch — [SW1] and [SW2] from
-the reviews, and [SW3], which surfaced while verifying [SW2]. The
-operator's quoted decision was given for [SW1]/[SW2]; the host
-orchestrator applied that standing decision to [SW3] on its own
-judgement, and the operator confirmed it after the PR was opened
-(2026-09-15: "garmin fix is ok"). None was introduced by #78; all sit on its
-contract, which is why the reviews raised them.
+All four are therefore in scope for this branch — [SW1] and [SW2] from
+the reviews, [SW3], which surfaced while verifying [SW2], and [SW4], the
+residual [SW3] recorded. The operator's quoted decision was given for
+[SW1]/[SW2]; the host orchestrator applied that standing decision to
+[SW3] on its own judgement, and the operator confirmed it after the PR
+was opened (2026-09-15: "garmin fix is ok"). [SW4] is the same class of
+fix as the [SW3] the operator confirmed, and Copilot's PR review raised it
+independently (round 3, twice), cross-confirming the round-4 local review's
+own residual — so the host applied the standing decision to it as well.
+None was introduced by #78; all sit on its contract, which is why the
+reviews raised them.
 
 ### [SW1] A non-finite sentence kills the serial reader thread
 
@@ -171,6 +181,39 @@ raises exactly as before. Applied to the three timer callbacks, the
 thread and the `~/set_transmit` service reach) and the two receive-loop
 thread entries (`_rx_loop`, `_aux_loop`) — where a stray `RCLError` at
 shutdown would otherwise kill a daemon thread with a traceback on stderr.
+
+### [SW4] The same race on the other three nodes' publishing timers
+
+[SW3] fixed `garmin_sidescan`, where the race was actually observed, and
+recorded the residual: `sound_speed_bridge` and `zda_serial_bridge` each
+run a 1 Hz `_publish_diagnostics` timer and `kongsberg_em_bridge` a
+SonarInfo heartbeat timer, so all three share the hazard in principle —
+the signal handler tears the context down while the executor is still
+inside `spin()`, and a timer that reaches `publish()` after that raises
+`RCLError: Failed to publish: publisher's context is invalid` straight out
+of `spin()`. It has never been observed on these three (their real-SIGINT
+runs exit 0); it is a race, and [SW3]'s own real-SIGINT runs did not
+reproduce it either on the node where it *was* seen.
+
+Fix: the same guard, applied inline at the single publish call site in
+each node rather than as a copy of `garmin_sidescan`'s decorator — that
+node has ten guarded call sites and no shared Python package exists
+between these four (`marine_tools` itself is `ament_cmake`/C++), so a
+shared helper would mean a new cross-package runtime dependency for five
+lines. The semantics are identical and deliberate: the **call** is
+guarded, not preceded by an `if rclpy.ok()` check-then-act; `RCLError` and
+`InvalidHandle` are caught; `rclpy.ok(context=self.context)` is consulted
+only afterwards to decide what the failure meant; a shutdown in flight
+returns quietly and a failure on a **live** context is re-raised, so a
+genuine broken publisher is still loud.
+
+`kongsberg_em_bridge`'s heartbeat already had a blanket
+`except Exception` that warned and continued. That is narrowed, not
+removed: the RCL class is now triaged against the context (quiet on a dead
+one, re-raised on a live one — a publisher that has stopped working
+mid-survey is not something a heartbeat should paper over), and any other
+exception keeps the previous throttled-warning behaviour, so a non-RCL bug
+still cannot kill the node.
 
 ## Approach
 
@@ -444,15 +487,17 @@ Rationale and the conflict surface:
 |------|--------|
 | `sound_speed_bridge/launch/aml_svs.launch.py` | Add the `parser_max_buffer_bytes` launch argument at its default **[PR-R1-S8]** |
 | `sound_speed_bridge/sound_speed_bridge/parsers.py` | **[SW1]** Non-finite guard: both `_parse`s treat `nan`/`inf`/`-inf`/`snan`/`1e999` as a parse failure (NaN reading, `raw_mm_s=None`), every numeric conversion inside the guarded region; `RegexParser._optional_float` drops a non-finite temperature/pressure; module docstring says so. Plus: move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
-| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**, exiting **1** via `SystemExit` so `ros2 launch`/systemd see a failure, with the `except` scoped to construction only, not `spin()` **[PR-R2-MF1, PR-R2-S1]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s; **[SW2]** `main()` catches `ExternalShutdownException` and shuts down via `rclpy.try_shutdown()` |
+| `sound_speed_bridge/test/test_shutdown_guard.py` | **[SW4]** new: `test_diagnostics_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard`, each against a real shut-down `Context` |
+| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**, exiting **1** via `SystemExit` so `ros2 launch`/systemd see a failure, with the `except` scoped to construction only, not `spin()` **[PR-R2-MF1, PR-R2-S1]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s; **[SW2]** `main()` catches `ExternalShutdownException` and shuts down via `rclpy.try_shutdown()`; **[SW4]** shutdown guard around the `_publish_diagnostics` publish |
 | `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap; **[SW1]** `test_aml_non_finite_sentence_is_a_parse_failure` (parametrized over `nan`/`NaN`/`inf`/`-inf`/`Infinity`/`snan`/`1e999`/`-1e999`) and `test_aml_keeps_framing_after_a_non_finite_sentence` |
 | `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case; **[SW1]** `test_regex_non_finite_capture_is_a_parse_failure`, `test_regex_non_finite_scale_product_is_a_parse_failure`, `test_regex_non_finite_optional_fields_are_not_reported`, `test_regex_keeps_framing_after_a_non_finite_sentence` |
 | `sound_speed_bridge/test/test_node.py` | Parameter validation (`test_parser_max_buffer_bytes_reaches_the_parser`, `test_parser_max_buffer_bytes_below_floor_is_rejected`, `test_parser_max_buffer_bytes_is_read_only` **[PR-R1-S3]**, `test_main_reports_a_rejected_parameter_and_shuts_down` **[PR-R1-S7, PR-R2-MF1]**); counters in `/diagnostics` (`test_buffer_counters_surface_in_diagnostics`, `test_trim_counters_are_snapshotted_once_per_tick` **[PR-R1-S5]**); WARN once then backed off (`test_buffer_trim_warns_once_then_backs_off`, `test_buffer_trim_warn_backoff_resets_after_a_quiet_period` **[PR-R1-S4]**); **[SW1]** `test_serial_thread_survives_a_non_finite_sentence` (drives the real `_serial_loop`); **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) and `test_main_returns_cleanly_on_an_external_shutdown`; **[PR-R3-S2]** `test_a_valueerror_from_spin_is_not_reported_as_a_start_failure` pins the narrowed `except` scope |
 | `sound_speed_bridge/package.xml` | `<depend>rcl_interfaces</depend>` for `ParameterDescriptor` **[PR-R2-S3]** |
-| `zda_serial_bridge/zda_serial_bridge/node.py` | **[SW2]** same `main()` fix |
+| `zda_serial_bridge/zda_serial_bridge/node.py` | **[SW2]** same `main()` fix; **[SW4]** shutdown guard around the `_publish_diagnostics` publish |
 | `zda_serial_bridge/test/test_node.py` | **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) |
-| `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | **[SW2]** same `main()` fix (its `if rclpy.ok(): rclpy.shutdown()` becomes `try_shutdown()`) |
-| `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test) |
+| `zda_serial_bridge/test/test_shutdown_guard.py` | **[SW4]** new: `test_diagnostics_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard`, each against a real shut-down `Context` |
+| `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | **[SW2]** same `main()` fix (its `if rclpy.ok(): rclpy.shutdown()` becomes `try_shutdown()`); **[SW4]** shutdown guard in `_sonar_info_heartbeat`, narrowing its blanket `except Exception` |
+| `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test); **[SW4]** `test_heartbeat_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_still_warned_and_not_propagated` |
 | `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix; **[SW3]** new `quiet_on_shutdown` decorator, applied to the three timer callbacks, the `~/change_state` subscription callback, `_publish_tx_state` / `_publish_control_set` and the `_rx_loop` / `_aux_loop` thread entries |
 | `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test; **[SW3]** four callback-level tests on a real shut-down `Context` — `test_reconcile_is_quiet_once_the_context_is_shut_down`, `test_a_publish_timer_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard` |
 
@@ -484,8 +529,9 @@ Rationale and the conflict surface:
 | `parsers.py` docstrings | Cap/resync behaviour documented beside the framing quirks | Yes — step 9 |
 | **[SW1]** parser rejects non-finite values | `parsers.py` module docstring; the Valeport/template UDP formatters were checked (they `round()` on the serial thread, which is why `RegexParser` converts `inf` to NaN rather than passing it on) and the diagnostics comparisons (a NaN last reading is already a WARN state) | Yes — Scope widening |
 | **[SW2]** `main()` shutdown contract | All four nodes in the repo share the pattern, so all four are fixed in one commit; no launch file, parameter or topic changes | Yes — Scope widening |
-| **[SW3]** callback-versus-shutdown guard | `garmin_sidescan` only. No launch file, parameter, topic or service changes, and with a live context every guarded callback behaves exactly as before. **Residual, stated rather than assumed**: the other three nodes each run a publishing timer (`_publish_diagnostics`, `_sonar_info_heartbeat`) and so share the same race in principle; it was never observed on them (their real-SIGINT runs exit 0), and extending the guard there is a fourth widening the operator has not been asked for — surfaced, not assumed away | Yes — Scope widening |
-| **[SW1]**/**[SW2]**/**[SW3]** fixed here rather than filed | The operator's publish-gate decision, quoted in Scope widening; no follow-up issues filed for these three | Yes |
+| **[SW3]** callback-versus-shutdown guard | `garmin_sidescan` only. No launch file, parameter, topic or service changes, and with a live context every guarded callback behaves exactly as before. The residual this row recorded — the other three nodes' publishing timers sharing the race in principle — is **no longer residual**: it is fixed as [SW4] below | Yes — Scope widening |
+| **[SW4]** the same guard on the other three nodes | One publish call site per node (`sound_speed_bridge`/`zda_serial_bridge` `_publish_diagnostics`, `kongsberg_em_bridge` `_sonar_info_heartbeat`). No launch file, parameter, topic or service changes; with a live context every callback behaves exactly as before. One behaviour change, deliberate: `kongsberg_em_bridge`'s heartbeat used to swallow-and-warn **every** exception, and an RCL failure on a live context is now re-raised instead — a publisher that has stopped working mid-survey must not be papered over. No shared helper: the four packages share no Python package (`marine_tools` is `ament_cmake`/C++), so a helper would add a cross-package runtime dependency for five lines | Yes — Scope widening |
+| **[SW1]**/**[SW2]**/**[SW3]**/**[SW4]** fixed here rather than filed | The operator's publish-gate decision, quoted in Scope widening; no follow-up issues filed for these four | Yes |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
 | A new node parameter | `launch/aml_svs.launch.py` | Yes — the example launch surfaces the operator-tunable parameters, so `parser_max_buffer_bytes` is added as a launch argument at its 4096 default **[PR-R1-S8]** |
 
@@ -513,7 +559,8 @@ Rationale and the conflict surface:
   Consequences.
 - The scope widening above ([SW1], [SW2]) landed as two further commits;
   [SW2] is why three packages beyond `sound_speed_bridge` appear in Files
-  to Change. [SW3] landed as one more, in `garmin_sidescan` alone.
+  to Change. [SW3] landed as one more, in `garmin_sidescan` alone, and
+  [SW4] as one more again, in the other three nodes.
 - Verification: all four touched packages are built and tested
   (`./sensors_ws/build.sh` / `./sensors_ws/test.sh` with the four package
   names). flake8 and pep257 are part of each suite and are clean. The
