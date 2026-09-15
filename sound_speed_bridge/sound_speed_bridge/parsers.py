@@ -116,11 +116,16 @@ class SoundSpeedParser(ABC):
     MIN_MAX_BUFFER_BYTES = 256
     """Floor for ``max_buffer_bytes``.
 
-    256 bytes is both the node's serial read size (node.py: ``ser.read(256)``)
-    and the longest legitimate sentence any configured parser frames. Below
-    this floor a healthy read chunk would overflow the cap, and a long but
-    legitimate sentence could never frame at all -- so a smaller value is
-    rejected rather than silently shredding good data.
+    256 bytes is the node's serial read size (node.py: ``ser.read(256)``):
+    below it a single healthy read chunk would overflow the cap, so a smaller
+    value is rejected outright. The floor is a sanity bound, **not** a
+    guarantee that every configuration's sentences fit: ``regex_pattern``
+    puts no upper bound on line length, so the cap must be sized above the
+    longest legitimate sentence of the configured protocol -- a line longer
+    than the cap can never frame and is discarded by ``_resync``. The AML
+    sentence is ~11 bytes and the BizzyBoat ``$AML,SVM`` sentence ~32, so the
+    4096 default leaves >100x margin; an operator configuring a long-line
+    protocol must raise ``parser_max_buffer_bytes`` accordingly.
     """
 
     _terminator = b'\r'
@@ -386,14 +391,16 @@ class RegexParser(SoundSpeedParser):
             value = float(match.group('sound_speed')) * self._scale
         except (TypeError, ValueError):
             value = float('nan')
-        if not math.isfinite(value):
+        if not math.isfinite(value) or not math.isfinite(value * 1000.0):
             # float() accepts 'nan'/'inf'/'-inf' and overflows a huge
             # exponent ('1e999') to inf, and a pattern as loose as
             # (?P<sound_speed>\S+) will hand them straight through. An
             # infinite sound_speed is not merely wrong downstream, it is
-            # fatal: format_valeport/format_template round() it on the
-            # serial thread, raising OverflowError past _serial_loop's
-            # (SerialException, OSError) catch and killing the reader.
+            # fatal: format_valeport/format_template round() the mm/s
+            # product on the serial thread, raising OverflowError past
+            # _serial_loop's (SerialException, OSError) catch and killing
+            # the reader. The check is on the *mm/s product*, not the
+            # value alone: a finite 1e306 m/s is still 1e309 mm/s == inf.
             # Non-finite is a parse failure, same as no match at all.
             value = float('nan')
         temperature = self._optional_float(match, 'temperature')

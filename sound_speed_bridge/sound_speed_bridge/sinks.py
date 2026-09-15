@@ -40,9 +40,12 @@ def format_valeport(
     """
     del template, ctx  # unused
     if reading.raw_mm_s is None:
-        if math.isnan(reading.sound_speed_m_s):
+        product = reading.sound_speed_m_s * 1000
+        if not math.isfinite(product):
+            # NaN (parse failure) or an overflow to inf: round() would raise
+            # OverflowError on the serial thread. Both mean "nothing to send".
             return None
-        mm_s = round(reading.sound_speed_m_s * 1000)
+        mm_s = round(product)
     else:
         mm_s = reading.raw_mm_s
     if mm_s < 0 or mm_s > 9999999:
@@ -90,10 +93,15 @@ def format_template(
     """
     if not template:
         return None
-    if math.isnan(reading.sound_speed_m_s):
-        return None
-    int_mm_s = (reading.raw_mm_s if reading.raw_mm_s is not None
-                else round(reading.sound_speed_m_s * 1000))
+    if reading.raw_mm_s is not None:
+        int_mm_s = reading.raw_mm_s
+    else:
+        product = reading.sound_speed_m_s * 1000
+        if not math.isfinite(product):
+            # NaN (parse failure) or an overflow to inf: round() would
+            # raise OverflowError on the serial thread.
+            return None
+        int_mm_s = round(product)
     frame_id = ''
     if isinstance(ctx, dict):
         frame_id = str(ctx.get('frame_id', ''))

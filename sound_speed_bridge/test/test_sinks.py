@@ -52,6 +52,26 @@ def test_valeport_skips_nan():
     assert out is None
 
 
+def test_valeport_skips_a_float_whose_mm_s_overflows():
+    """
+    A finite m/s value whose mm/s product is inf must be skipped, not raised.
+
+    RegexParser leaves raw_mm_s None, so the formatter rounds the float on
+    the serial thread; round(inf) is OverflowError, which _serial_loop does
+    not catch. 1e306 m/s is finite but 1e309 mm/s is not.
+    """
+    for value in (1e306, 1e308, -1e307, float('inf'), float('-inf')):
+        assert format_valeport(_reading(value=value, raw_mm_s=None)) is None
+
+
+def test_template_skips_a_float_whose_mm_s_overflows():
+    """Same guard on the template formatter's fallback rounding."""
+    for value in (1e306, 1e308, -1e307, float('inf'), float('-inf')):
+        assert format_template(
+            _reading(value=value, raw_mm_s=None), '{sound_speed_mm_s}', {}
+        ) is None
+
+
 def test_valeport_skips_negative_or_too_large():
     """Out-of-band integer mm/s must be skipped, not emitted as a malformed packet."""
     assert format_valeport(_reading(value=-1.0, raw_mm_s=-1000)) is None

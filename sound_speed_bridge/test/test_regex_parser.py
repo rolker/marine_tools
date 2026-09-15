@@ -197,7 +197,9 @@ def test_regex_rejects_non_integer_max_buffer_bytes(bad):
 
 # --- Non-finite captures must not kill the serial thread --------------------
 
-NON_FINITE = ['nan', 'inf', '-inf', 'Infinity', 'snan', '1e999', '-1e999']
+NON_FINITE = ['nan', 'inf', '-inf', 'Infinity', 'snan', '1e999', '-1e999',
+              # finite as m/s, infinite as mm/s -- the formatters' round()
+              '1e306', '1e308', '-1e307']
 
 
 @pytest.mark.parametrize('text', NON_FINITE)
