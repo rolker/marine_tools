@@ -134,11 +134,22 @@ class SoundSpeedParser(ABC):
     value is rejected outright. The floor is a sanity bound, **not** a
     guarantee that every configuration's sentences fit: ``regex_pattern``
     puts no upper bound on line length, so the cap must be sized above the
-    longest legitimate sentence of the configured protocol -- a line longer
-    than the cap can never frame and is discarded by ``_resync``. The AML
-    sentence is ~11 bytes and the BizzyBoat ``$AML,SVM`` sentence ~32, so the
-    4096 default leaves >100x margin; an operator configuring a long-line
-    protocol must raise ``parser_max_buffer_bytes`` accordingly.
+    longest legitimate sentence of the configured protocol.
+
+    What an undersized cap costs is *timing-dependent*, which is why it is
+    worth sizing for rather than relying on: the cap bounds **unframed
+    residue**, and trimming happens only after framing. A line longer than
+    the cap still frames whenever it and its terminator arrive inside one
+    ``feed()`` -- the 256-byte read is large enough that short sentences
+    usually do. It is only residue that reaches the cap *before* a
+    terminator is seen -- a long sentence split across reads, or a stream
+    that has stopped terminating at all -- that is trimmed and then
+    discarded through the next terminator by ``_resync``. So an undersized
+    cap does not fail cleanly; it drops the sentences that happen to
+    straddle a read boundary. The AML sentence is ~11 bytes and the
+    BizzyBoat ``$AML,SVM`` sentence ~32, so the 4096 default leaves >100x
+    margin; an operator configuring a long-line protocol must raise
+    ``parser_max_buffer_bytes`` accordingly.
     """
 
     _terminator = b'\r'

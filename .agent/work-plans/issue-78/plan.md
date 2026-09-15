@@ -415,8 +415,16 @@ miss — costing one extra discarded sentence per trim.
   not a line-length guarantee: `regex_pattern` bounds nothing, so the cap
   must be sized above the longest legitimate sentence of the configured
   protocol (AML ~11 B, BizzyBoat `$AML,SVM` ~32 B; the 4096 default leaves
-  >100x margin) — a longer line can never frame and is discarded. Sized
-  that way, trimming can only ever be triggered by unframed residue, i.e.
+  >100x margin). What an undersized cap costs is timing-dependent, which
+  is why it is worth sizing for: the cap bounds residue *after* framing,
+  so a line longer than the cap still frames whenever it and its
+  terminator arrive within one `feed()`, and only residue that reaches
+  the cap *before* a terminator is seen — a long sentence split across
+  reads, or a stream that has stopped terminating — is trimmed and then
+  discarded through the next terminator by `_resync`. An undersized cap
+  therefore loses whichever sentences happen to straddle a read boundary,
+  rather than failing cleanly. Sized above the longest sentence,
+  trimming can only ever be triggered by unframed residue, i.e.
   by a genuine framing stall. Validated identically in the ABC and at
   the node parameter declaration.
 

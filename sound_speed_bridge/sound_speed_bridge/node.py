@@ -102,10 +102,15 @@ class SoundSpeedBridgeNode(Node):
                     f'{SoundSpeedParser.MIN_MAX_BUFFER_BYTES} (the serial '
                     'read size; a floor, not a line-length guarantee). '
                     'Size it well above the longest legitimate sentence of '
-                    'the configured protocol: a line longer than the cap '
-                    'can never frame and is discarded. An out-of-range '
-                    'value fails node startup rather than being silently '
-                    'clamped. Static: takes effect at construction only.')))
+                    'the configured protocol: the cap bounds residue after '
+                    'framing, so a long line still frames when it and its '
+                    'terminator arrive in one read, but residue that '
+                    'reaches the cap before a terminator is seen is '
+                    'trimmed and discarded -- an undersized cap therefore '
+                    'loses whichever sentences straddle a read boundary. '
+                    'An out-of-range value fails node startup rather than '
+                    'being silently clamped. Static: takes effect at '
+                    'construction only.')))
 
         # The pre-framing wire tap is a diagnostic probe, not a
         # normal-operations topic, so it is OFF by default (operator decision,
