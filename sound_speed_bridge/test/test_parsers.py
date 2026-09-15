@@ -298,6 +298,12 @@ def test_a_trim_rebinds_the_counter_pair_in_a_single_assignment():
         assert isinstance(state, tuple) and len(state) == 2
         dropped, count = state
         assert count == 0 or dropped > 0
+    # Every rebind after the initial (0, 0) moves the dropped-byte half
+    # forward. This is what pins *one* assignment per event: splitting a
+    # trim into two writes -- in either order -- leaves one of them with
+    # the byte count unchanged, which this rejects.
+    assert all(later[0] > earlier[0]
+               for earlier, later in zip(writes, writes[1:]))
     assert p.trim_stats == writes[-1]
 
 
