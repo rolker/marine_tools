@@ -301,7 +301,7 @@ stop, bounded `join`, then `super().destroy_node()`):
   carry imagery and the device status flag, and `destroy_node` consults
   neither. The existing three-attempt OFF retry and its ERROR are
   unchanged.
-- **Bounded joins**: `SHUTDOWN_JOIN_TIMEOUT_S = 3.0`, a budget for the
+- **Bounded joins**: `SHUTDOWN_JOIN_TIMEOUT_S = 5.0`, a budget for the
   **whole set** (each join gets what is left of it), so several wedged
   sockets cannot multiply it. 3.0 s is the longest blocking call any
   worker can be inside — `_send`'s 2.0 s TCP socket timeout on the
@@ -689,6 +689,10 @@ Rationale and the conflict surface:
 > nothing remains in this list.
 
 - `quiet_on_shutdown`'s docstring says a genuine fault stays loud; a real `RCLError` that coincides with a shutdown is swallowed — caveat owed in the docstring.
+
+## Residual after pre-push round 6 (recorded, not done — a sixth widening for the operator's call)
+
+- `garmin_sidescan`'s `main()` constructs the node outside its `try`, so a construction failure is a raw traceback (not the one FATAL line `sound_speed_bridge` now gives) and `_join_workers()` could dereference thread attributes that were never created if construction failed part-way. Unreachable today via `destroy_node()` because construction failure never reaches it; fixing it means restructuring garmin's `main()` as was done for `sound_speed_bridge`.
 
 ## Open Questions
 
