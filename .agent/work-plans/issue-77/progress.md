@@ -437,3 +437,21 @@ Lifecycle: **Local Review** (approved) → push / open PR → **triage-reviews**
 
 ### False positives
 - none — every Copilot finding verified against the local file at head `edf2876`.
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 12:04 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #89 at `e53e475` (host-inline fix pass for the Integrated Review at `edf2876`; all seven findings trivial)
+
+### Findings
+- [x] (cross-confirmed) rejected-disable test now asserts the parameter store still reads `True` — `94088c2`
+- [x] (must-fix) `<depend>rcl_interfaces</depend>` added to `package.xml` — `94088c2`
+- [x] (low) plan Design Decision 2 now states publish-after-feed — `e53e475`
+- [x] (low) plan self-check names the three additive diagnostics keys — `e53e475`
+- [x] (low) plan helper snippet uses the `_tap_lock` snapshot / None gate — `e53e475`
+- [x] (low) plan README follow-up references #88 — `e53e475`
+- [x] (low) progress bullet sentence completed — `e53e475`
+
+Tests: `Summary: 62 tests, 0 errors, 0 failures, 0 skipped`. Pushed; Copilot re-review pending.
