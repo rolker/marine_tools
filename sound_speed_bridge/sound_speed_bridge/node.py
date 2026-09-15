@@ -227,20 +227,27 @@ class SoundSpeedBridgeNode(Node):
         be able to kill the sensor, so the ``except`` is deliberately broad.
         It is not silent: failures are counted (``tap_error_count``) and
         logged (throttled), both visible on ``/diagnostics``.
+
+        ``tap_byte_count`` counts bytes that arrived on the wire, not bytes
+        that were successfully published: it is incremented before the
+        publish is attempted, so a run of failing publishes shows as bytes
+        arriving *and* ``tap_error_count`` climbing, rather than as a silent
+        wire. "The probe is silent" is the question this counter answers, and
+        only a publish-independent count can answer it. Publish failures are
+        ``tap_error_count``'s to report (per chunk, not per byte).
         """
         # Shutdown guard, same rationale as _handle_reading's: destroy_node()'s
         # join is best-effort (2 s) and ser.read() can block up to 1 s past it,
         # after which the publishers may already be destroyed.
         if self._stop_event.is_set():
             return
+        self._tap_byte_count += len(data)
         try:
             self._tap_pub.publish(UInt8MultiArray(data=data))
         except Exception as exc:  # noqa: B902 - see docstring
             self._tap_error_count += 1
             self.get_logger().warning(
                 f'serial_tap publish failed: {exc}', throttle_duration_sec=10.0)
-            return
-        self._tap_byte_count += len(data)
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
         # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
@@ -361,8 +368,11 @@ class SoundSpeedBridgeNode(Node):
                      value=str(self._serial_reconnect_count)),
             # Aliveness of the pre-framing tap, so "the probe is silent" can be
             # told from "the node never ran / serial_tap was not recorded"
-            # without inspecting bag content. This requires /diagnostics to be
-            # in the deployment bag record list
+            # without inspecting bag content. tap_byte_count is bytes read off
+            # the wire, counted whether or not the publish succeeded, so the
+            # two keys separate "no bytes arrived" from "bytes arrived but the
+            # tap could not publish them". This requires /diagnostics to be in
+            # the deployment bag record list
             # (rolker/unh_echoboats_project11#396) alongside serial_tap.
             KeyValue(key='tap_byte_count', value=str(self._tap_byte_count)),
             KeyValue(key='tap_error_count', value=str(self._tap_error_count)),

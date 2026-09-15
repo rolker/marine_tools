@@ -354,8 +354,10 @@ def test_serial_tap_publish_failure_is_counted_not_fatal(mock_serial_cls):
         _drive_serial_loop(node, mock_serial_cls, chunks)
         assert node._tap_pub.publish.call_count == 2
         assert node._tap_error_count == 2
-        # Bytes are only counted when they were actually published.
-        assert node._tap_byte_count == 0
+        # tap_byte_count is wire traffic, not publish success: the bytes did
+        # arrive, so a failing tap must not look like a silent probe. The
+        # failures are tap_error_count's to report.
+        assert node._tap_byte_count == sum(len(c) for c in chunks)
         # The primary path kept running through both chunks.
         assert node._pub.publish.call_count == 2
     finally:

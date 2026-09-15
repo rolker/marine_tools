@@ -190,14 +190,13 @@ Flagged as a documentation candidate below, decision left to the operator.
    def _publish_serial_tap(self, data: bytes) -> None:
        if self._stop_event.is_set():
            return
+       self._tap_byte_count += len(data)
        try:
            self._tap_pub.publish(UInt8MultiArray(data=data))
        except Exception as exc:
            self._tap_error_count += 1
            self.get_logger().warning(
                f'serial_tap publish failed: {exc}', throttle_duration_sec=10.0)
-           return
-       self._tap_byte_count += len(data)
    ```
 
    **Both mitigations, and why** (review finding 1 asked for one; the file's
@@ -231,9 +230,12 @@ Flagged as a documentation candidate below, decision left to the operator.
    (same rationale as `_handle_reading`'s existing guard, `node.py:198-199`):
    `ser.read()` can block up to 1 s past `destroy_node()`'s 2 s best-effort
    join deadline, after which publishers may already be destroyed.
-3. **Add diagnostics counters**: `self._tap_byte_count` (total bytes
-   tapped since node start) and `self._tap_error_count` (tap publishes that
-   raised, per step 2), both monotonic and never reset — matching the
+3. **Add diagnostics counters**: `self._tap_byte_count` (total bytes read
+   off the wire since node start — counted before the publish is attempted,
+   so a failing tap reads as "bytes arrived, publishes failed" rather than
+   as a silent probe, which is the question this counter answers) and
+   `self._tap_error_count` (tap publishes that raised, per step 2, counted
+   per chunk), both monotonic and never reset — matching the
    existing style of `_parse_error_count`/`_serial_reconnect_count`.
    Surface both as new `KeyValue`s in `_publish_diagnostics`
    (`node.py:299-312`) — `tap_byte_count`, `tap_error_count` — so an
@@ -311,8 +313,9 @@ Flagged as a documentation candidate below, decision left to the operator.
      implementation, covering the second half of finding 1): make the tap
      publish raise and assert the loop still consumes every chunk, the
      primary `sound_speed` path still publishes every reading,
-     `tap_error_count` counts each failure, and `tap_byte_count` stays 0
-     because nothing reached the wire. Without the `try/except` this test
+     `tap_error_count` counts each failure, and `tap_byte_count` still
+     counts every byte, because the bytes did arrive on the wire — the
+     publish is what failed. Without the `try/except` this test
      fails, as does the shutdown-guard test without its guard — both were
      verified by removing the code under test.
    - `test_tap_counters_surface_in_diagnostics`: after driving the loop
