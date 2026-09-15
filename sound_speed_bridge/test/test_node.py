@@ -864,6 +864,11 @@ def test_tap_disable_publisher_failure_is_rejected_not_fatal(mock_serial_cls):
         assert 'rmw teardown failed' in results[0].reason
         assert node._tap_pub is None
         assert node._serial_tap_enabled is False
+        # The rejected set leaves the parameter store saying True while the
+        # publisher-derived state says off: the documented, deliberate
+        # divergence (node.py, the destroy-failure comment). Pin it so a
+        # change to either side fails here rather than silently.
+        assert node.get_parameter('serial_tap_enabled').value is True
         # The node survived: the reader still runs and the primary path still
         # publishes.
         node._raw_pub = MagicMock()
