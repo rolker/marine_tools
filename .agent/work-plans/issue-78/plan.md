@@ -226,9 +226,13 @@ discard-through-terminator resync, and the eager-`feed()` contract,
 alongside the existing framing-quirk documentation.
 
 **README**: `sound_speed_bridge` has no package README today. The
-parameter row for `parser_max_buffer_bytes` is **deferred to
-rolker/marine_tools#88**, which creates that README **[PR-F12c]**; #78
-does not create a README solely to hold one row.
+parameter row for `parser_max_buffer_bytes` and the two diagnostics
+`KeyValue`s (`buffer_dropped_bytes`, `buffer_trim_count`) are **deferred
+to rolker/marine_tools#88**, which creates that README **[PR-F12c]**; #78
+does not create a README solely to hold them. #88's ask list now names
+all three explicitly, so the deferral points at a list that actually
+carries them
+(https://github.com/rolker/marine_tools/issues/88#issuecomment-5682117811).
 
 ### 10. Tests
 
@@ -315,7 +319,7 @@ Rationale and the conflict surface:
 | File | Change |
 |------|--------|
 | `sound_speed_bridge/sound_speed_bridge/parsers.py` | Move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
-| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` + floor validation; `_last_buffer_trim_count`, `_last_buffer_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
+| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` + floor validation; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
 | `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap |
 | `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case |
 | `sound_speed_bridge/test/test_node.py` | Parameter validation; counters in `/diagnostics`; WARN once then backed off |
