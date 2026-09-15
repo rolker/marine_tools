@@ -701,3 +701,124 @@ Governance: no parameter, topic, service, message or launch change. `sound_speed
 - [ ] (carried, round 4, still open — suggestion) `garmin_sidescan.destroy_node()` does not join `_rx_thread` or the two `_aux_loop` threads, so a non-signal teardown can have a live thread publish into a torn-down publisher and re-raise. A fifth scope widening, so it is the operator's one-line yes/no — and it was **not** recorded in the plan's Consequences/Out-of-scope as round 4 asked, so pushing now loses it — `garmin_sidescan/garmin_sidescan/node.py:1085`
 - [ ] (carried, round 4, still open — suggestion) `quiet_on_shutdown`'s docstring still says "a failure on a live context is re-raised unchanged, so a genuine fault is still loud" without the caveat that a real `RCLError` coinciding with a shutdown is swallowed, since the decision is made from `rclpy.ok()` after the fact rather than from what raised — `garmin_sidescan/garmin_sidescan/node.py:79`
 - [ ] (carried, round 4, still open — suggestion) `kongsberg_em_bridge` and `garmin_sidescan` still have no committed real-SIGINT subprocess test (only in-process `ExternalShutdownException` and the new dead-`Context` guard tests). Both were verified by ad-hoc execution this round and last; ~10 lines each would pin the [SW2] exit-code contract against regression — `kongsberg_em_bridge/test/test_main_shutdown.py`, `garmin_sidescan/test/test_main_shutdown.py`
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 13:37 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**PR**: #91 at `89d64e3` (branch `feature/issue-78`; not pushed by this pass)
+**Addressed**: the first residual of the `## Local Review (Pre-Push)` round 5 entry
+of 2026-09-15 13:19 — `garmin_sidescan.destroy_node()` not joining its daemon
+threads — on the operator's explicit instruction (2026-09-15): *"fix the garmin's
+destroy_node issue"*. Recorded in the plan as **[SW5]**, the fifth scope widening.
+**Commits**: `382ddb1`, `ddf24fd`, `298b5d1`, `89d64e3`
+**Tests** — built and tested from the worktree's `sensors_ws` (never `colcon`
+inside the project repo): `./sensors_ws/build.sh garmin_sidescan` then
+`./sensors_ws/test.sh garmin_sidescan`.
+
+- garmin_sidescan: `Summary: 92 tests, 0 errors, 0 failures, 0 skipped` (was 86)
+
+ament flake8 + pep257 are inside that count and clean. The other three packages
+are untouched by this pass.
+
+### Actions
+- [x] **[SW5]** `destroy_node()` now stops, **joins** and only then tears down.
+  It used to set `self._running = False`, send transmit OFF and call
+  `super().destroy_node()` without waiting for any of the node's **four** daemon
+  threads — `gcv_rx`, the two `_aux_loop` listeners `gcv_status` / `gcv_config`,
+  and `gcv_startup` — two of which were anonymous and so could not have been
+  joined at all. Every one of them publishes (imagery, nadir range and water
+  temperature from `_rx_loop`; the raw status/config captures from the aux loops;
+  transmit state from the startup thread), so a thread outliving the publishers
+  kept working against a torn-down node — and [SW3]'s `quiet_on_shutdown` made
+  that *quiet*, which is right for a signal teardown and wrong as a way to leave
+  a thread running — `garmin_sidescan/garmin_sidescan/node.py` — `382ddb1`
+- [x] One stop signal. `self._running` (a bool polled only at the top of each
+  loop) becomes `self._stop_event`, a `threading.Event` — the same name and shape
+  as `sound_speed_bridge`'s serial thread, and the thing a back-off can *wait on*
+  rather than merely poll. All four threads are kept as attributes
+  (`_rx_thread`, `_aux_threads`, `_startup_thread`). Nothing outside `node.py`
+  referenced `_running` — `382ddb1`
+- [x] **Ordering, decided and documented: joins first, transmit OFF after them,
+  `super()` last.** The OFF is sent after the joins so it is the last command on
+  the wire: the startup thread issues commands of its own, so a
+  `transmit_on_startup` ON behind an earlier OFF would leave the sonar pinging
+  unattended — the one failure this shutdown path exists to prevent. Nothing is
+  lost by waiting first: an OFF is confirmed by `_send`'s own TCP `sendall` (a
+  per-command socket with a 2 s timeout), **not** by anything the receive loops
+  decode — they carry imagery and the device status flag, and `destroy_node`
+  consults neither. The existing three-attempt OFF retry and its ERROR are
+  unchanged — `382ddb1`
+- [x] **Bounded joins.** `SHUTDOWN_JOIN_TIMEOUT_S = 3.0`, a budget for the
+  **whole set** — each join gets what is left of it — so several wedged sockets
+  cannot multiply it. 3.0 s is the longest blocking call any worker can be inside
+  (`_send`'s 2.0 s TCP socket timeout, on the startup thread) plus a second of
+  scheduling slack; the two receive loops block at most on `_open_mcast`'s 1.0 s
+  `settimeout`. A thread that misses the budget is named in a WARN and, being a
+  daemon, dies with the process: a wedged read delays shutdown by a bounded
+  interval and never hangs it — `382ddb1`
+- [x] **Unblocking: shorten the blocking interval, do not close the socket from
+  another thread.** The receive loops' blocking read is already capped at the
+  1.0 s socket timeout, so it needs nothing. What actually stalled them was the
+  *back-off* — a plain `time.sleep(2.0)` on the multicast-rejoin path in both
+  loops, and `time.sleep(0.3)` between the startup OFF repeats. Those become
+  `self._stop_event.wait(...)`, which returns the moment the stop is signalled.
+  Closing the sockets from `destroy_node()` was considered and rejected: they are
+  locals owned by the loops, which close and reopen them on every `OSError`, so a
+  cross-thread close would race the reopen and hand a live loop a closed fd — for
+  no gain, since the 1.0 s timeout already bounds the read — `382ddb1`
+- [x] The startup thread returns early once the stop is signalled, before its
+  range command and before a `transmit_on_startup` ON, so a shutdown landing
+  mid-startup cannot put a command on the wire behind the shutdown OFF —
+  `382ddb1`
+- [x] Six tests in a new `garmin_sidescan/test/test_shutdown_joins.py`, five of
+  them against a **real** node with its multicast sockets and TCP command sends
+  faked out: every thread that was alive is joined and gone once `destroy_node()`
+  returns; a read that never returns costs the budget and not the process (and
+  the stuck thread is named in the WARN); a thread parked in its rejoin back-off
+  — an unreachable GCV, the ordinary case when the boat is being packed up — is
+  joined at once; the transmit OFF is sent only once every thread is dead; the
+  pre-existing OFF retry and ERROR still hold; and the startup thread issues no
+  further command once stopping — `ddf24fd`
+- [x] Plan kept in sync: **[SW5]** recorded as a fifth scope widening (revision 7
+  note, its own Scope-widening section quoting the operator's instruction
+  verbatim, a Files-to-Change row for `node.py` and one for the new test file, a
+  Consequences row naming both deliberate behaviour changes), and the residual
+  removed from the round-5 list now that it is done — `298b5d1`
+
+### Verification
+- **Mutation checks** (out-of-tree copy under the session scratchpad; the
+  worktree was never mutated; run against the committed tests): 8 mutations, all
+  killed. (1) `destroy_node` joins nothing — killed by 3 tests; (2) only
+  `_rx_thread` joined — killed by the back-off test, on `gcv_startup` surviving;
+  (3) unbounded `thread.join()` — killed by the wedged test (it ran 31 s instead
+  of 4 s); (4) the transmit OFF moved back ahead of the joins — killed by the
+  ordering test; (5) the startup thread's early return removed; (6) its repeat
+  pause reverted to `time.sleep(0.3)` — each killed by the startup test; (7) both
+  rejoin back-offs reverted to `time.sleep(2.0)` — killed by the back-off test;
+  (8) the missed-budget WARN dropped — killed by the wedged test.
+- **Real SIGINT of the `garmin_sidescan` console entry point** (I/O mocked,
+  SIGINT delivered 2 s in, subprocess): **exit 0, zero traceback lines**, and no
+  join WARN on the way out — every thread was joined inside the budget. This is
+  the [SW2]/[SW3] contract re-checked on top of the new teardown, and it is the
+  package the round-5 residual list notes has no *committed* SIGINT test (still
+  true; that residual is untouched).
+- No parameter, topic, service, message or launch change. The only new
+  operator-visible output is the WARN naming a thread that missed the join
+  budget, so no parameter or topic table changes. The package README's **Transmit
+  safety** section did need updating and got it (`89d64e3`): it said only that
+  transmit-off is sent on shutdown, and the two facts an operator now depends on
+  — that the OFF is sent *after* the joins, so a `transmit_on_startup` ON cannot
+  land behind it, and that the joins are bounded so a wedged read delays the OFF
+  without blocking it — are exactly about the behaviour that section exists to
+  describe. This repo has no `.agents/README.md`.
+
+### Notes
+- Every build and test run was made from the worktree's `sensors_ws`, so no
+  `log/` tree was generated in the project repo.
+- Nothing pushed; the PR was not touched; no issues filed (per host instruction).
+- The other round-5 findings (the plan §6 counters paragraph, the missing
+  `sinks.py` rows, the SIGINT-notes bullet, the two `test_sinks.py` template
+  keys, the `quiet_on_shutdown` docstring caveat, the missing committed
+  real-SIGINT tests) were **not** in this pass's instruction and are untouched.
