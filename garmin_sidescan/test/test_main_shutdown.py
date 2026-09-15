@@ -33,6 +33,7 @@ from garmin_sidescan.node import GarminSidescanNode, main
 import pytest
 import rclpy
 from rclpy.context import Context
+from rclpy.exceptions import InvalidHandle
 from rclpy.executors import ExternalShutdownException
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 
@@ -233,3 +234,21 @@ def test_sigint_exits_zero_without_a_traceback(tmp_path):
     assert proc.returncode == 0, f'exit {proc.returncode}\n{combined}'
     assert 'Traceback' not in combined, combined
     assert 'rcl_shutdown already called' not in combined, combined
+
+
+def test_invalid_handle_after_our_own_stop_is_quiet_even_on_a_live_context():
+    """
+    A worker that outlives the join publishes into a destroyed handle.
+
+    super().destroy_node() has taken the publishers but rclpy is not down
+    yet, so the context is live; the node's own stop event is what marks
+    this as teardown rather than a fault.
+    """
+    ctx = _context(live=True)
+    node = _status_node(ctx, InvalidHandle('publisher handle destroyed'))
+    node._stop_event = threading.Event()
+    node._stop_event.set()
+    try:
+        assert GarminSidescanNode._publish_status(node) is None
+    finally:
+        ctx.try_shutdown()

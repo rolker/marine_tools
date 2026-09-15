@@ -125,9 +125,17 @@ def quiet_on_shutdown(method):
     def wrapper(self, *args, **kwargs):
         try:
             return method(self, *args, **kwargs)
-        except (_rclpy.RCLError, InvalidHandle):
+        except (_rclpy.RCLError, InvalidHandle) as exc:
             # InvalidHandle is the same condition one step later: the node has
-            # been destroyed and the publisher handle is gone.
+            # been destroyed and the publisher handle is gone. That can happen
+            # with the context still live -- a worker that outlived the
+            # bounded join publishes after super().destroy_node() and before
+            # rclpy shuts down -- so our own stop event is a teardown
+            # condition too, not only the context state.
+            stopping = getattr(self, '_stop_event', None) is not None \
+                and self._stop_event.is_set()
+            if isinstance(exc, InvalidHandle) and stopping:
+                return None
             if rclpy.ok(context=self.context):
                 raise
             return None
@@ -558,7 +566,10 @@ class GarminSidescanNode(Node):
                 self.get_logger().info(f'startup: range set to {range_m} m')
             else:
                 self.get_logger().error(f'startup: range command ({range_m} m) failed to send')
-        if want_on:
+        if want_on and not self._stop_event.is_set():
+            # Re-checked here, not only before the range command: a shutdown
+            # signalled while that _send() was in flight must not let a
+            # startup ON follow destroy_node()'s final OFF onto the wire.
             self._set_transmit(True, 'startup (transmit_on_startup)')
 
     # ----- TCP command send --------------------------------------------------

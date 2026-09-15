@@ -212,3 +212,35 @@ def test_startup_thread_issues_no_command_once_the_stop_is_signalled():
     # One OFF attempt, then the interruptible wait returns at once and the
     # thread returns: no range command, no startup ON.
     assert sent == [TRANSMIT_OFF]
+
+
+def test_startup_on_is_suppressed_when_the_stop_lands_mid_sequence():
+    """
+    A stop that lands during the range command must still suppress the ON.
+
+    The pre-range check alone lets a shutdown that arrives while that
+    ``_send()`` is in flight fall through to ``transmit_on_startup``, which
+    would follow ``destroy_node``'s final OFF onto the wire.
+    """
+    sent = []
+    node = types.SimpleNamespace(
+        _tx_lock=threading.Lock(),
+        _stop_event=threading.Event(),
+        _transmitting=False,
+        _controls={},
+        _publish_tx_state=lambda: None,
+        _set_transmit=lambda on, reason: sent.append(('set_transmit', on)),
+        get_logger=lambda: types.SimpleNamespace(
+            info=lambda *a, **k: None, error=lambda *a, **k: None),
+    )
+
+    def send(data):
+        sent.append(data)
+        if data != TRANSMIT_OFF:
+            node._stop_event.set()   # the stop lands during the range send
+        return True
+    node._send = send
+
+    GarminSidescanNode._startup_transmit_state(node, True, 1, 25.0)
+
+    assert ('set_transmit', True) not in sent

@@ -108,8 +108,10 @@ dynamically: the node publishes a `RadarControlSet` on `state` and accepts
   explicit command (pairs with the chartplotter defaulting to not pinging on
   power-up).
 - Transmit-off is also sent on node shutdown — **after** the driver's worker
-  threads have been stopped and joined, so it is the last command on the wire
-  and the startup thread cannot put a `transmit_on_startup` ON behind it. The
+  threads have been signalled to stop and a bounded join has been attempted,
+  so it is normally the last command on the wire; the stop event itself is
+  what prevents the startup thread from issuing a `transmit_on_startup` ON
+  after it, even if that thread outlived the join budget. The
   joins are bounded (5 s for the whole set, the startup thread first because
   it holds the command lock the OFF needs), so a wedged socket read delays
   that OFF but can never block it; the OFF can additionally wait out one
