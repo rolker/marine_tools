@@ -387,3 +387,60 @@ def test_tap_counters_surface_in_diagnostics(mock_serial_cls):
         assert values['tap_error_count'] == '0'
     finally:
         node.destroy_node()
+
+
+class _OrderRecordingParser:
+    """
+    Delegating parser that records when each chunk reaches the framing code.
+
+    ``feed`` is a generator in every real parser, so its body runs when
+    ``_serial_loop`` starts *consuming* it — which is exactly the moment the
+    ordering invariant is about. Recording the marker inside the generator
+    therefore timestamps the feed the way the loop experiences it, not the
+    call that merely built it.
+    """
+
+    def __init__(self, inner, log):
+        self._inner = inner
+        self._log = log
+
+    def feed(self, data, receive_time_ns):
+        self._log.append(('feed', bytes(data)))
+        for reading in self._inner.feed(data, receive_time_ns):
+            yield reading
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_publishes_after_parser_feed(mock_serial_cls):
+    """
+    The tap publish happens after the chunk's parser feed and primary publishes.
+
+    The tap is diagnostic-only, so it must never delay or preempt the
+    SoundSpeed path — the same rule ``_handle_reading`` states for ``raw``.
+    That ordering was documented as load-bearing but unguarded: moving
+    ``_publish_serial_tap(data)`` above the feed loop left every other test
+    green. This test asserts the relative order directly, per chunk, so the
+    mutation fails here.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        log = []
+        node._parser = _OrderRecordingParser(node._parser, log)
+        node._pub = MagicMock()
+        node._pub.publish.side_effect = (
+            lambda msg: log.append(('sound_speed', round(msg.sound_speed, 3))))
+        node._tap_pub = MagicMock()
+        node._tap_pub.publish.side_effect = (
+            lambda msg: log.append(('tap', bytes(msg.data))))
+        chunks = [b'1500.123\r\r\n', b'1499.900\r\r\n']
+        _drive_serial_loop(node, mock_serial_cls, chunks)
+        assert log == [
+            ('feed', chunks[0]),
+            ('sound_speed', 1500.123),
+            ('tap', chunks[0]),
+            ('feed', chunks[1]),
+            ('sound_speed', 1499.900),
+            ('tap', chunks[1]),
+        ]
+    finally:
+        node.destroy_node()
