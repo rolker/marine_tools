@@ -366,3 +366,52 @@ RELIABLE QoS choice; the deliberately broad `except`; `parsers.py`'s unbounded a
 
 ### Next step
 Lifecycle: **Implementation** → **review-code** (re-review the fixes). Nothing was pushed and no PR exists; the host drives the next phase.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 10:07 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: approved
+
+**Branch**: feature/issue-77 at `47fcf09`
+**Mode**: pre-push
+**Depth**: bounded re-check (scoped by the host to the round-3 must-fix closures, the failed-destroy state decision, what the four fix commits introduced, and plan drift — not a fresh full-diff read)
+**Must-fix**: 0 | **Suggestions**: 3
+**Round**: 4 | **Ship**: recommended — both round-3 must-fixes independently re-verified closed by mutation, the one design decision in the fix pass is sound and self-healing, and nothing new was introduced; the three remaining items are all non-blocking polish.
+
+**Specialists**: lead-reviewer mutation + empirical verification against installed rclpy; one fresh-context Claude adversarial pass (sonnet, proportionate fan-out per the host's instruction). Static analysis ran inside the package suite (`ament_flake8` / `ament_pep257`, clean). Copilot and local cross-model reads off (not opted in).
+
+### Findings
+- [ ] (suggestion) `__init__`'s `_set_tap_publishing` call is unguarded, so a `create_publisher` failure at launch aborts node construction — the asymmetry the callback's new guard created. Failing loud at startup is defensible, but the adjacent comment's "enabled at startup and enabled later reach the identical state rather than being two code paths" is now true for success and not for failure; half a sentence would close it — `sound_speed_bridge/sound_speed_bridge/node.py:185-186`
+- [ ] (suggestion) `test_tap_disable_publisher_failure_is_rejected_not_fatal` does not assert `get_parameter('serial_tap_enabled').value is True` after the rejected disable, so the one deliberate inconsistency in this design — store says true, derived diagnostic says false — is documented in three places and asserted nowhere; its sibling enable test does pin its store value — `sound_speed_bridge/test/test_node.py:846-874`
+- [ ] (suggestion) The launch test duplicates `_make_node`'s thread-stop/clear dance inline because `_make_node` cannot take launch-time parameter overrides. Maintainability nit, no correctness impact — `sound_speed_bridge/test/test_node.py:762-786`
+
+### (a) Round-3 must-fix closures — both genuinely closed
+Both mutations the implementer reported were re-run independently by the lead reviewer against an out-of-tree copy (`cp` into the scratchpad; the worktree was verified clean before and after and no `git checkout --` / `git restore` was used), with the 22-test baseline re-verified green after each:
+- `__init__`'s `self._set_tap_publishing(bool(self.get_parameter('serial_tap_enabled').value))` → `pass`: **1 failed, 21 passed** — exactly `test_serial_tap_enabled_at_launch_needs_no_runtime_set`. This is the mutation that killed nothing at round 3.
+- The callback's `try/except` removed (bare `self._set_tap_publishing(requested)`): **2 failed, 20 passed** — exactly `test_tap_enable_publisher_failure_is_rejected_not_fatal` and `test_tap_disable_publisher_failure_is_rejected_not_fatal`. The adversarial pass reproduced this independently and confirmed by traceback that the `RuntimeError` propagates straight out of `set_parameters()` through rclpy's `_set_parameters_atomically_common` when the guard is removed — so the guard is load-bearing, not vacuous.
+
+The new launch test was additionally checked for the one thing that could make it a false pass — the `rclpy.shutdown()` / `rclpy.init(args=['--ros-args', '-p', 'serial_tap_enabled:=true'])` dance inside the test body, against the autouse `_ros_context` fixture. It is order-independent: passes alone, passes when run first ahead of other tap tests, passes in the full file. The adversarial pass traced `shutdown()` setting `g_default_context = None` in `rclpy/utilities.py` (so the next `init()` allocates a fresh `Context`) and ran the test 10x under `pytest-repeat`. No global-state leak between tests.
+
+### (b) The failed-destroy state decision — sound, and documented
+The load-bearing premise was verified directly in the installed rclpy (`/opt/ros/jazzy/.../rclpy/node.py`): `destroy_publisher` does `self._publishers.remove(publisher)` **before** `publisher.destroy()` and swallows only `InvalidHandle`, so "rclpy has already removed the publisher from the node's registry by then" holds for every exception that can reach this code — restoring `_tap_pub` really would hand the serial thread a publisher nothing owns. The mirror case also checks out (adversarial, read in rclpy): `create_publisher` appends to `_publishers` only after full success and tears the handle down on any exception, so a failed create leaves `_tap_pub` None with no partial registration. The residual rcl-handle leak after a failed destroy is inherent to rclpy's remove-then-destroy ordering, not created by this choice.
+
+The documented divergence was additionally probed on a live node to confirm it is not a trap — it is self-healing in both directions:
+- failed disable → `successful=False`, store `True`, derived `False` (exactly as documented)
+- retry the disable → `successful=True`, store `False`, derived `False` (converges)
+- enable from the diverged state → `successful=True`, store `True`, derived `True` (converges)
+Favouring "the diagnostic reports reality" over "the parameter store reports reality" is the right call given the constraint, and it is stated plainly in the code comment, the docstring and the plan rather than glossed over.
+
+### (c)/(d) Newly introduced, and plan drift
+Nothing broken by the four commits. `0d2cdf6` is comment-only and accurately describes the code (`_set_tap_publishing`'s only callers are `__init__` and the set-parameters callback, both on the single `rclpy.spin()` thread). `# noqa: B902` at `node.py:466` matches the pre-existing idiom at `node.py:407`. `create_publisher` is called with no `qos_overriding_options`, so a failed create declares no stray parameter that could break a later retry (adversarial, checked in `qos_overriding_options.py`). Plan drift: **none** — `a2a55d6` adds the callback failure-handling paragraph, the single-executor-thread invariant paragraph and the three new tests with their mutation results, all matching the diff; the README deferral is still carried in the plan's consequences map as a deliberate "no".
+
+### Verification performed by the lead reviewer
+- Full suite from the worktree (`source setup.bash && ./sensors_ws/build.sh sound_speed_bridge && ./sensors_ws/test.sh sound_speed_bridge`): `Summary: 62 tests, 0 errors, 0 failures, 0 skipped`. `ament_flake8` / `ament_pep257` run inside it and are clean.
+- Out-of-tree baseline 22 node tests green; both round-3 mutations re-run and restored; order-independence runs; the live divergence/recovery probe above. Worktree left clean (`git status --porcelain` empty).
+- `marine_tools` has no `.agents/` directory at all, so there is no verified-parameter table to update for `serial_tap_enabled` — a pre-existing repo-level gap, out of scope for this bounded round and unchanged by this diff.
+
+### Not re-litigated (adjudicated or deferred in rounds 1-3, with recorded reasons)
+The deliberately broad `except` in `_publish_serial_tap`; the RELIABLE QoS choice; `parsers.py`'s unbounded accumulation buffer (marine_tools#78); `_handle_reading`'s lack of exception isolation; pre-set vs post-set parameter-callback placement; the `sound_speed_bridge` README (operator's yes/no is what is owed, not the README); the knowledge-doc candidate for `.agent/knowledge/ros2_development_patterns.md` (operator's call, proposal only); the cross-repo `unh_echoboats_project11` bag record-list follow-up (host-handled at the publish checkpoint).
+
+### Next step
+Lifecycle: **Local Review** (approved) → push / open PR → **triage-reviews**. Nothing was pushed and no PR exists; the host drives the next phase. The three suggestions are non-blocking and can be applied before the push or carried into the PR.
