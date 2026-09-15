@@ -535,3 +535,125 @@ Governance: no parameter, topic, service, message or launch change in these thre
 
 ### False positives
 - none.
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 13:09 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**PR**: #91 at `db96536` (branch `feature/issue-78`; not pushed by this pass)
+**Addressed**: `## Integrated Review` of 2026-09-15 12:52 (Copilot R3 @ `5e1e580`
++ Local Review round-4 residuals) — all four open findings, each on the host's
+explicit decision to fix rather than defer.
+**Commits**: `90822a8`, `e2b6d5b`, `36989be`, `6efd0be`, `db96536`
+**Tests** — `./sensors_ws/build.sh` clean (`Summary: 4 packages finished`), then
+`./sensors_ws/test.sh sound_speed_bridge zda_serial_bridge kongsberg_em_bridge
+garmin_sidescan`; per-package counts from
+`colcon test-result --test-result-base sensors_ws/build/<pkg>`. ament flake8 +
+pep257 are inside each count and clean.
+
+- layer-wide: `Summary: 329 tests, 0 errors, 0 failures, 0 skipped`
+- sound_speed_bridge: `Summary: 137 tests, 0 errors, 0 failures, 0 skipped` (was 103)
+- zda_serial_bridge: `Summary: 47 tests, 0 errors, 0 failures, 0 skipped` (was 44)
+- kongsberg_em_bridge: `Summary: 59 tests, 0 errors, 0 failures, 0 skipped` (was 56)
+- garmin_sidescan: `Summary: 86 tests, 0 errors, 0 failures, 0 skipped` (unchanged)
+
+### Actions
+- [x] (must-fix, Copilot ×2 inline) The finite-in-m/s, infinite-in-mm/s hole is
+  closed at both ends. `AMLParser._parse` now tests `math.isfinite(parsed * 1000.0)`
+  as well as the value, matching `RegexParser`: `1e306` m/s is a perfectly finite
+  float, so the old value-only test passed it through *with* an exact
+  Decimal-derived `raw_mm_s`. Both formatters now compute and validate the mm/s
+  product **unconditionally, before** choosing the raw-integer path — the ordering
+  is the fix, since `format_template` previously bypassed the guard entirely
+  whenever `raw_mm_s` was populated and would have interpolated `inf` into
+  `{value_mm_s}`, and `format_valeport` would have emitted from an unvalidated
+  integer. Both happen on the serial thread, where `round(inf)`'s `OverflowError`
+  escapes `_serial_loop`'s `(SerialException, OSError)` catch. Tests: an AML
+  `1e306`/`-1e306`/`1e308` sentence parses to NaN with `raw_mm_s` None; the
+  node-level real-`_serial_loop` test now replays a `1e306` sentence too and still
+  asserts the thread is alive and the next good sentence publishes; and one sinks
+  test drives both formatters with a huge/NaN value **and** a populated `raw_mm_s`
+  — `sound_speed_bridge/sound_speed_bridge/parsers.py`, `sinks.py` — `90822a8`
+- [x] (cross-confirmed: Copilot suppressed ×2 + Local Review round 4 residual)
+  **[SW4]** The [SW3] callback-versus-shutdown guard is extended to the publishing
+  timers of the other three nodes: `_publish_diagnostics` in `sound_speed_bridge`
+  and `zda_serial_bridge`, `_sonar_info_heartbeat` in `kongsberg_em_bridge`. Each
+  publish **call** is guarded (not preceded by an `if rclpy.ok()` check-then-act,
+  which the shutdown can land inside), catching `RCLError`/`InvalidHandle` and
+  consulting `rclpy.ok(context=self.context)` only afterwards: quiet on a dead
+  context, re-raised unchanged on a live one. No copy of `garmin_sidescan`'s
+  decorator machinery — that node has ten guarded call sites, these have one each,
+  and the four packages share no Python package (`marine_tools` itself is
+  `ament_cmake`/C++), so a shared helper would mean a new cross-package runtime
+  dependency for five lines. `kongsberg_em_bridge`'s blanket `except Exception` is
+  **narrowed, not removed**: the RCL class is now triaged against the context (a
+  publisher that has stopped working mid-survey is not something a heartbeat should
+  paper over), every other exception keeps its throttled warning. Three tests per
+  node against a **real** shut-down `rclpy.Context` — not a mock of `rclpy.ok` —
+  with the publish raising the exact rcl error the field shows: quiet on a dead
+  context, still raised on a live one, and a non-RCL bug not swallowed (for
+  kongsberg, still warned and not propagated) —
+  `sound_speed_bridge/test/test_shutdown_guard.py`,
+  `zda_serial_bridge/test/test_shutdown_guard.py`,
+  `kongsberg_em_bridge/test/test_main_shutdown.py` — `e2b6d5b`
+- [x] (should-fix, Copilot suppressed) The trim counters are one atomic pair.
+  `buffer_dropped_bytes`/`buffer_trim_count` were two attributes written on the
+  serial thread and read on the diagnostics timer, so a snapshot taken between the
+  two writes of one trim reported a count without its bytes — and the node prints
+  those two numbers into a WARN line and a `/diagnostics` KeyValue an operator is
+  meant to correlate. They are now one tuple rebound in a single (GIL-atomic)
+  assignment, exposed as a `trim_stats` snapshot the node reads once per tick; the
+  two public names survive as read-only views. Tests: every rebind is a whole pair
+  whose dropped-byte half moves forward (which rejects a two-step write in either
+  order), the views agree with the snapshot and no longer accept assignment, and
+  the existing once-per-tick test's parser stand-in now *raises* if either
+  individual counter is touched — `parsers.py`, `node.py` — `36989be`, `db96536`
+- [x] (low, Copilot suppressed ×3) The three operator-facing strings no longer
+  claim 256 B is "the longest legitimate sentence": the node's startup FATAL text,
+  the parser's `ValueError`, and the `DEFAULT_MAX_BUFFER_BYTES` docstring. Nothing
+  bounds a `regex_pattern` line, so the claim was false in the one place an
+  operator reads it while sizing the cap. Each now says what is true — 256 B is
+  the serial read size, a sanity floor below which one healthy read chunk
+  overflows the cap, and the cap itself must exceed the longest sentence of the
+  configured protocol (AML ~11 B, BizzyBoat `$AML,SVM` ~32 B). The plan's matching
+  rationale bullet is corrected too. No test asserted the old text —
+  `node.py:~262`, `parsers.py:~113`, `~143` — `6efd0be`
+- [x] Plan kept in sync: **[SW4]** recorded as a fourth scope widening (revision 6
+  note, its own Scope-widening section, Files-to-Change rows, Consequences row),
+  with the operator's standing quote and the Copilot cross-confirmation named as
+  the basis, and the [SW3] row's "residual" language replaced since the residual is
+  now fixed — `.agent/work-plans/issue-78/plan.md` — `e2b6d5b`, `6efd0be`
+
+### Verification
+- **Mutation checks** (out-of-tree copies under `.../scratchpad/mut`, never the
+  worktree; run against the committed tests): 12 mutations, all killed.
+  (1) AML finiteness back to the value alone — killed by 4 tests including the
+  node-level thread-survival one; (2) `format_valeport` takes the raw path before
+  validating; (3) same for `format_template` — each killed by the new populated-
+  `raw_mm_s` test; (4) the trim rebind split into two writes, bytes first — killed
+  by the atomicity test (and it *survived* the weaker first version of that
+  assertion, which is why `db96536` strengthened it); (5) the node reading the two
+  counters separately — killed by the once-per-tick test's raising stand-in;
+  (6) the `sound_speed_bridge` guard removed entirely; (7) its live-context
+  re-raise dropped (blanket swallow); (8) `except Exception` in place of the RCL
+  class; (9) and (10) the same removal and blanket swallow in `zda_serial_bridge`;
+  (11) `kongsberg_em_bridge` reverted to its blanket `except Exception` — killed by
+  *two* tests, which is the point: it was both noisy on shutdown and silent on a
+  live fault; (12) its RCL branch swallowing without consulting the context.
+- The guard's semantics were checked against Jazzy rather than assumed: `RCLError`
+  is not exported from `rclpy.exceptions` (the
+  `rclpy.impl.implementation_singleton` route the code uses is the right one) and
+  both it and `InvalidHandle` are `RuntimeError` subclasses, so the two-branch
+  `except` ordering in `kongsberg_em_bridge` (RCL class first, `Exception` second)
+  is what makes the narrowing effective.
+- No parameter, topic, service, message or launch change in any of these commits;
+  the only operator-visible text changes are the three floor strings, which are
+  corrections. `sound_speed_bridge` still has no README (deferred to
+  rolker/marine_tools#88) and this repo has no `.agents/README.md`, so there is no
+  parameter/topic table to update.
+
+### Notes
+- Every build and test run was made from the worktree's `sensors_ws`, never with
+  `colcon` inside the project repo, so no `log/` tree was generated in it.
+- Nothing pushed; the PR was not touched; no issues filed (per host instruction).
