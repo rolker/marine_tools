@@ -602,7 +602,10 @@ Rationale and the conflict surface:
   subsequent sentence parses NaN). Filed separately; **not fixed here**
   **[PR-F4]**.
 - **rolker/marine_tools#88** — package README, which will carry the
-  `parser_max_buffer_bytes` parameter row **[PR-F12c]**.
+  `parser_max_buffer_bytes` parameter row **and** the two diagnostics
+  `KeyValue`s this change adds, `buffer_dropped_bytes` and
+  `buffer_trim_count` **[PR-F12c]**. #88's ask list names all three
+  explicitly, so the deferral points at a list that actually carries them.
 - **rolker/marine_tools#77 / PR #89** — byte-exact wire tap, the recovery
   path for bytes this cap drops.
 
@@ -637,7 +640,7 @@ Rationale and the conflict surface:
 | A change includes its consequences | `/diagnostics` KeyValues and parser docstrings land in the same PR; the README row is explicitly routed to #88 rather than left implicit; #90 is filed rather than silently absorbed. |
 | Human control and transparency | The parameter is declared, defaulted, floor-validated and justified; trims are visible as both bytes and events, and as a WARN that is loud once and then quiet. The plan states what the cap *loses*, not only what it bounds. |
 | Only what's needed | Shared logic in the ABC, two ints of counter state, no new topic, no new timer, no per-parser trim strategy. |
-| Improve incrementally | Two source files, three test files, no unrelated refactors; #90 and #88 stay separate. |
+| Improve incrementally | No unrelated refactors; #90 and #88 stay separate. The original #78 change was two source files and three test files, all in `sound_speed_bridge`; the operator's scope widening carried it to **four packages** — `sound_speed_bridge`, `zda_serial_bridge`, `kongsberg_em_bridge` and `garmin_sidescan` — each of which gains only the shutdown-contract fix and its tests (see Files to Change). |
 
 ## ADR Compliance
 
