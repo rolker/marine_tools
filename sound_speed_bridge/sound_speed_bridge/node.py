@@ -98,10 +98,12 @@ class SoundSpeedBridgeNode(Node):
                     'Maximum unframed residue the parser buffers, in bytes. '
                     'Must be >= '
                     f'{SoundSpeedParser.MIN_MAX_BUFFER_BYTES} (the serial '
-                    'read size and the longest legitimate sentence); an '
-                    'out-of-range value fails node startup rather than '
-                    'being silently clamped. Static: takes effect at '
-                    'construction only.')))
+                    'read size; a floor, not a line-length guarantee). '
+                    'Size it well above the longest legitimate sentence of '
+                    'the configured protocol: a line longer than the cap '
+                    'can never frame and is discarded. An out-of-range '
+                    'value fails node startup rather than being silently '
+                    'clamped. Static: takes effect at construction only.')))
 
         # The pre-framing wire tap is a diagnostic probe, not a
         # normal-operations topic, so it is OFF by default (operator decision,

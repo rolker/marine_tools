@@ -93,6 +93,10 @@ def format_template(
     """
     if not template:
         return None
+    if math.isnan(reading.sound_speed_m_s):
+        # Documented contract: a NaN reading is never rendered, whether or
+        # not an integer mm/s value happens to accompany it.
+        return None
     if reading.raw_mm_s is not None:
         int_mm_s = reading.raw_mm_s
     else:
