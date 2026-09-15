@@ -154,13 +154,103 @@ parameters/behavior) is a reasonable follow-up but is a separable,
 higher-scope task better done once, not fragmented across this issue and #78.
 Flagged as a documentation candidate below, decision left to the operator.
 
+### 5. The tap is OFF by default and enabled on the fly (operator decision)
+
+At the publish checkpoint the operator decided the tap must not run all the
+time:
+
+> "I'm not sure I want this enabled all the time, so let's default to not
+> enabled, make sure it can get enable on the fly, and not worry about
+> writing to a bag yet."
+
+and, on reviewing the first implementation of that (which kept the publisher
+advertised while disabled so a recorder could attach early):
+
+> "Why is the topic published when it's not enabled? I'd rather it only
+> publish if we enable it."
+
+**What this means concretely**:
+
+- A boolean parameter `serial_tap_enabled`, **default `false`**, declared
+  with a `ParameterDescriptor` whose `read_only=False` is stated explicitly
+  (rclpy's only descriptor-level marker for "settable at runtime") and whose
+  `description` names the exact `ros2 param set` command.
+- An `add_on_set_parameters_callback` applies a set to the **running** node,
+  so the tap turns on and off mid-deployment with no restart and no lost
+  serial connection — restarting the node to enable a diagnostic would drop
+  the very stream being diagnosed and reset the counters that frame the
+  question.
+- While disabled there is **no publisher and no topic**: `_set_tap_publishing`
+  creates the publisher when the parameter goes true and `destroy_publisher`s
+  it when it goes false, so `ros2 topic list` shows `serial_tap` exactly when
+  the tap is running. The enabled state is *derived* from the publisher
+  reference (a `_serial_tap_enabled` property), not tracked in a parallel
+  bool that could disagree with it.
+- `tap_byte_count` keeps counting **wire** bytes while disabled. It is the
+  cheap, always-on answer to "is the probe silent?", it costs one integer
+  add per chunk, and it is the counter that makes the tap worth enabling (or
+  proves there is nothing to enable it for). `serial_tap_enabled` is
+  surfaced as a `/diagnostics` KeyValue for the same reason: now that the
+  default is off, an absence of tap messages in a bag would otherwise be
+  ambiguous between "the probe was silent" and "nobody switched the tap on".
+
+**Rationale for the default** (operator's, recorded as stated): the tap is a
+diagnostic probe, not normal-operations telemetry. Off by default costs
+nothing in the normal case — no bag volume, no endpoint, no topic in the
+list — and the failure it diagnoses is investigated deliberately, not
+continuously.
+
+**Consequence accepted, and the cost of the correction**: a subscriber cannot
+attach before the tap is enabled, so the first chunk or two after enabling
+may be lost to discovery (a subscriber has to match the newly created
+publisher). That is the operator's explicit trade: a topic that exists only
+when the tap is on is worth more than the first ~1 s of bytes after
+enabling. The bytes that were missed are still counted in `tap_byte_count`.
+
+**Thread-safety of the toggle**: the publisher reference is swapped under a
+dedicated `_tap_lock`, and the serial thread copies the reference under that
+lock and publishes outside it. The lock is deliberately *not* `self._lock` —
+that one is held on the primary reading path (`_handle_reading`) and by the
+diagnostics timer, so reusing it would let a diagnostic contend with the
+`SoundSpeed` path, the exact coupling Approach step 2's ordering rule exists
+to prevent. The one remaining race — publishing on a reference taken just
+before a disable — is already covered by the tap's broad `except` and
+`tap_error_count`: `Publisher.publish` enters the handle's use-count, which
+defers destruction while a publish is in flight and otherwise raises
+`InvalidHandle` (a plain `Exception` subclass), so at worst a disable costs
+one counted, logged tap error.
+
+**Deliberately not done** (operator: "not worry about writing to a bag yet"):
+the `unh_echoboats_project11` follow-up to add `serial_tap` to the deployment
+bag record list — the round-1 review's must-fix 2 — is **not filed**, at the
+operator's request. The cited sites stay recorded here for whenever it is
+wanted: `bizzyboat_project11/config/bizzyboat.yaml:813-818` (the
+`logger`/`sonar_logger` record lists), `:709` and `:919` (prose still
+describing marine_tools#77 as future work). With the tap off by default the
+record-list gap is no longer the thing that makes the tap inert — the
+parameter is — so the follow-up genuinely can wait.
+
+**Not done, and why**: the callback applies only `serial_tap_enabled`. It
+does not start *rejecting* runtime sets of the node's other (startup-only)
+parameters, the way `garmin_sidescan`'s node does. That would be a behaviour
+change well beyond this issue; accepting them is exactly what rclpy did
+before any callback existed, so nothing regresses. Broadening that
+discipline to this node is a reasonable separate change — recorded here, not
+filed (see above).
+
 ## Approach
 
-1. **Add the `serial_tap` publisher** in `SoundSpeedBridgeNode.__init__`,
-   alongside the existing `raw` publisher (`node.py:110`), same `UInt8MultiArray`
-   type and `RELIABLE` QoS (`topic_qos`), bare relative name `serial_tap`. Doc
-   comment modeled on the `raw` publisher's, explaining this one taps
-   pre-framing and is byte-exact including unframeable garbage.
+1. **Add the `serial_tap` publisher**, same `UInt8MultiArray` type and
+   `RELIABLE` QoS (`topic_qos`, now retained as `self._topic_qos`) as the
+   existing `raw` publisher, bare relative name `serial_tap`. Doc comment
+   modeled on the `raw` publisher's, explaining this one taps pre-framing and
+   is byte-exact including unframeable garbage.
+
+   **Created on demand, not in `__init__`** (Design Decision 5): `__init__`
+   leaves `self._tap_pub = None` and calls `_set_tap_publishing()` with the
+   parameter's value, so a launch-time `serial_tap_enabled: true` and a
+   runtime set reach the identical state through one code path rather than
+   two.
 
    **Time base, recorded as a decision** (review suggestion 8):
    `UInt8MultiArray` has no header, so the bag's receive time is the only
@@ -226,6 +316,11 @@ Flagged as a documentation candidate below, decision left to the operator.
      `serial_tap` alone is unchanged; only cross-topic interleaving in the
      bag shifts, by well under one `read()` interval.
 
+   **Gate** (Design Decision 5): the publisher reference *is* the gate. It is
+   read per chunk — copied under `_tap_lock`, published outside it — rather
+   than latched at startup, so an enable lands on the very next chunk. A
+   `None` reference returns early, after the byte count.
+
    The `_stop_event` check is a shutdown guard specific to this call site
    (same rationale as `_handle_reading`'s existing guard, `node.py:198-199`):
    `ser.read()` can block up to 1 s past `destroy_node()`'s 2 s best-effort
@@ -238,9 +333,12 @@ Flagged as a documentation candidate below, decision left to the operator.
    per chunk), both monotonic and never reset — matching the
    existing style of `_parse_error_count`/`_serial_reconnect_count`.
    Surface both as new `KeyValue`s in `_publish_diagnostics`
-   (`node.py:299-312`) — `tap_byte_count`, `tap_error_count` — so an
-   operator can confirm the tap is alive, and see when it is not, without
-   inspecting bag content. Like the existing counters these are written
+   (`node.py:299-312`) — `tap_byte_count`, `tap_error_count` — plus
+   `serial_tap_enabled` (Design Decision 5), so an operator can confirm the
+   tap is alive, see when it is not, and tell both from "the tap was never
+   switched on", without inspecting bag content. `tap_byte_count` is
+   incremented before the enabled gate as well as before the publish, so it
+   reports wire traffic whether or not the tap is running. Like the existing counters these are written
    from the serial thread and read from the diagnostics timer without the
    lock; that is the established pattern in this file and int increments
    under CPython's GIL cannot tear a counter into an invalid value, so the
@@ -324,6 +422,35 @@ Flagged as a documentation candidate below, decision left to the operator.
      and tap publishers record theirs; assert the per-chunk sequence
      feed → `sound_speed` → `serial_tap`. Verified by mutation: hoisting the
      tap publish above the feed loop fails exactly this test.
+   - **Parameter-gate tests** (Design Decision 5), all driving the real
+     set-parameters callback via `node.set_parameters(...)` rather than
+     poking node internals — the enable path is part of what is under test:
+     `test_serial_tap_disabled_by_default_publishes_nothing` (no publisher
+     exists, nothing published, `tap_byte_count` still counts every byte, the
+     primary `sound_speed`/`raw` path unaffected);
+     `test_serial_tap_enabled_by_parameter_publishes` (a node constructed
+     with the default starts publishing once enabled);
+     `test_serial_tap_topic_advertised_only_when_enabled` (the ROS-graph
+     view — `get_publisher_names_and_types_by_node`, i.e. what `ros2 topic
+     list` shows — has no `serial_tap` while disabled, has it while enabled,
+     and loses it again on disable, with `/raw` as the control that proves
+     the query is answering);
+     `test_serial_tap_runtime_toggle_takes_effect_mid_stream` (off → on →
+     off between chunks of one loop run: exactly the enabled chunk is
+     published, the toggle is neither a chunk late nor sticky, and all three
+     sentences still reach the primary path);
+     `test_enabling_twice_keeps_the_same_publisher` (idempotent — a repeated
+     set must not tear down a live topic under a recorder);
+     `test_serial_tap_enabled_rejects_non_bool` (both layers: rclpy's own
+     declared-type check, which returns an unsuccessful result rather than
+     raising, and the callback's own validation called directly — no
+     coercion, since `bool('false')` is `True`);
+     `test_set_parameters_callback_leaves_other_parameters_alone` (the
+     deliberate non-rejection of startup parameters);
+     `test_serial_tap_enabled_surfaces_in_diagnostics` (the KeyValue reads
+     `false` then `true`). The existing tap tests enable the parameter in the
+     `_make_node` fixture (`tap_enabled=True`) rather than weakening their
+     assertions.
    - `test_tap_counters_surface_in_diagnostics`: after driving the loop
      with known chunks, assert `_tap_byte_count` equals the total input
      length and that `_publish_diagnostics` emits a `tap_byte_count`
@@ -374,10 +501,13 @@ Flagged as a documentation candidate below, decision left to the operator.
 | If we change... | Also update... | Included in plan? |
 |---|---|---|
 | Add `serial_tap` publisher/topic | Node's startup log line (`node.py:131-134`), which currently doesn't enumerate topics — no change needed, topics are self-describing via `ros2 topic list` | N/A — no action needed |
-| Add `serial_tap` publisher/topic | `sound_speed_bridge` README | Deliberate no (Design Decision 4) — flagged as a documentation candidate below |
+| Add `serial_tap` publisher/topic | `sound_speed_bridge` README | Deliberate no (Design Decision 4) — flagged as a documentation candidate below; the package still has no README, so the parameter is documented in the descriptor `description` (visible via `ros2 param describe`), the publisher doc comment, and the startup log line |
+| Add the `serial_tap_enabled` parameter | Node startup log line — it now reports `serial_tap_enabled=` so an operator reading the log knows whether the tap is live | Yes — Design Decision 5 |
+| Gate the tap behind a parameter | `/diagnostics` gains a `serial_tap_enabled` KeyValue, or absence of tap messages becomes ambiguous with "never enabled" | Yes — Design Decision 5 / Approach step 3 |
+| Destroy the publisher on disable | Serial-thread publish path must tolerate a `None` or just-destroyed publisher: reference copied under `_tap_lock`, published outside it, `InvalidHandle` caught by the existing broad `except` and counted | Yes — Design Decision 5 |
 | Add a diagnostics counter | `_publish_diagnostics`'s `KeyValue` list, existing pattern | Yes — included in Approach step 3 |
 | Field-diagnosis chain docs (#75, `echoboats#396`) referencing "the `raw` topic" | No update needed — `raw`'s meaning and topic name are unchanged; `serial_tap` is additive | Yes — decided in Design Decision 1, no follow-up needed |
-| Add `serial_tap` + `tap_byte_count` as the silent-vs-absent discriminator | `rolker/unh_echoboats_project11#396`'s deployment bag record list must carry **`/diagnostics`** (and `serial_tap`) — absence of tap messages only means "probe silent" if `tap_byte_count` is in the bag to prove the node was running | Recorded, cross-repo — no code change here; verify against the record list when this lands (Approach step 3) |
+| Add `serial_tap` + `tap_byte_count` as the silent-vs-absent discriminator | `rolker/unh_echoboats_project11#396`'s deployment bag record list must carry **`/diagnostics`** (and `serial_tap`) — absence of tap messages only means "probe silent" if `tap_byte_count` is in the bag to prove the node was running | Recorded, cross-repo. `/diagnostics` is already in both bizzyboat record lists; adding `serial_tap` is **deliberately not filed** at the operator's request ("not worry about writing to a bag yet") — Design Decision 5 |
 | In-code references describing the byte-stream tap as future work (`node.py:107`, `test/test_node.py:9`) | Repoint both at `serial_tap` | Yes — Documentation & Instruction Impact |
 | Tap publish can raise | `tap_error_count` counter + throttled WARN, so the broad `except` is never silent | Yes — Approach steps 2 and 3 |
 
@@ -419,6 +549,14 @@ Flagged as a documentation candidate below, decision left to the operator.
   (Design Decision 4, flagged as a future candidate, not a blocker).
 
 ## Revision History
+
+- **rev 3** (post-implementation, operator scope change at the publish
+  checkpoint): the tap is off by default and toggled at runtime via the
+  `serial_tap_enabled` parameter, and while off its topic is not advertised
+  at all — both operator decisions quoted verbatim in Design Decision 5,
+  with Approach steps 1/2/3/5 and the Consequences table updated to match.
+  Records that the `unh_echoboats_project11` bag-record-list follow-up is
+  deliberately **not** filed at the operator's request.
 
 - **rev 2** (this revision, pre-implementation): resolves all six
   `## Plan Review` findings — publish placement + exception isolation
