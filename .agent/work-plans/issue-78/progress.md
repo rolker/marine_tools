@@ -218,3 +218,48 @@ killed by the new tests. Plan drift: none; commit `a6d3803`'s plan sync is hones
   docstring; the `rcl_interfaces` import order (flake8 I100) is folded into
   `f2712d1`. Both linters are clean.
 - Nothing pushed; no PR opened; no issues filed (per host instruction).
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 11:12 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-78 at `e2da2c4`
+**Mode**: pre-push
+**Depth**: Deep (round-1 tier), scoped to a bounded re-check of the eight fix commits
+**Must-fix**: 1 | **Suggestions**: 3
+**Round**: 2 | **Ship**: recommended — must-fix down 2 -> 1 and not rising; the one left is a one-line exit-status fix, not a design question. Address it, then push.
+
+Specialists: Static Analysis (the package's own ament_flake8 + ament_pep257 tests, clean),
+one Claude Adversarial pass (sonnet). Copilot and local-model passes off (not opted in).
+Tests: `80 passed, 16 warnings in 1.55s` (pytest on an out-of-tree copy; was 76 at round 1).
+Mutation check: 7 targeted mutations on an out-of-tree copy (resync accounting removed;
+off-by-terminator in the resync count; `read_only=False`; reset re-anchored to the last WARN;
+`_last_trim_seen_ns` never updated; KeyValues un-snapshotted; node constructed outside
+main()'s try) — all 7 killed by the new tests.
+
+Round-1 must-fixes verified closed:
+- MF1 (`buffer_dropped_bytes` undercount): closed. The review's concrete case replays to
+  744 trimmed + 259 resync-discarded = 1003. A byte-conservation sweep over stall,
+  stall+recover, crlf-regex and healthy streams shows zero unaccounted payload bytes — the
+  only uncounted bytes are AML's 2 B/sentence CRCRLF padding, which appears identically on a
+  healthy stream, so it is framing artifact and not stream loss. `_resync` and `_trim_residue`
+  are the only buffer-shrinking sites and never overlap within one `feed()`, so no double count.
+- MF2 (README deferral): closed. rolker/marine_tools#88's comment names all three items
+  (`parser_max_buffer_bytes`, `buffer_dropped_bytes`, `buffer_trim_count`) — read directly.
+
+Other bounded checks, all clean: the `read_only=True` descriptor does not break the launch
+file's typed default (`aml_svs.launch.py` evaluates `parser_max_buffer_bytes = 4096 (int)`;
+a real node built with `-p parser_max_buffer_bytes:=8192` gets 8192 in both the parameter and
+the parser), and `test_parser_max_buffer_bytes_is_read_only` genuinely exercises a rejected
+set (with `read_only=False` the set succeeds and the assert fails). First-trim WARN latency and
+the doubling-to-300 s spam bound are unchanged by the re-anchoring. `rcl_interfaces` is a
+correct and required `<depend>`. Plan drift: the revision-3 sync is honest; only `package.xml`
+is missing from Files-to-Change.
+
+### Findings
+- [ ] (must-fix) A refused `parser_max_buffer_bytes` now exits **0** — verified by running `main()` with `-p parser_max_buffer_bytes:=128`: FATAL logged, exit status 0, where before `1e678bc` the uncaught ValueError exited 1. `ros2 launch` reports "process has finished cleanly" and systemd `Restart=on-failure` / `OnProcessExit` failure handlers never fire, so a node that refused to start is indistinguishable from a clean shutdown to everything but a human reading the log — contradicting the change's own "the node still refuses to start -- that is deliberate". One line: `raise SystemExit(1)` after the FATAL — `sound_speed_bridge/sound_speed_bridge/node.py:456`
+- [ ] (suggestion) `except ValueError` spans `rclpy.spin(node)`, not just construction: patching `spin` to raise ValueError produces `sound_speed_bridge started: ...` followed by `failed to start: ...`. Narrow the try to the constructor, or word the message off `node is None` — `sound_speed_bridge/sound_speed_bridge/node.py:456`
+- [ ] (suggestion) `test_main_reports_a_rejected_parameter_and_shuts_down` restores the rclpy context with an unguarded `rclpy.init()`; an assertion failure before that line adds a confusing teardown ERROR on top of the real failure (verified). Wrap in `try/finally` — `sound_speed_bridge/test/test_node.py:218`
+- [ ] (suggestion) Plan's Files-to-Change gained the launch-file row but not `sound_speed_bridge/package.xml` (the `rcl_interfaces` depend), and the `test_node.py` row does not name the three new tests — cosmetic — `.agent/work-plans/issue-78/plan.md`
