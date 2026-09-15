@@ -59,6 +59,15 @@ STATUS_GROUP, STATUS_PORT = '239.254.2.2', 50050    # 8e03 status (tx flag)
 CONFIG_GROUP, CONFIG_PORT = '239.254.2.11', 51000   # chartplotter CDP config (debug-capture only)
 GEN_VOTE_MIN = 5                # packets to vote before latching the generation
 
+# Total budget for joining the driver's daemon threads in destroy_node().
+# The longest blocking call any worker can be inside is _send's 2.0 s TCP
+# socket timeout (the startup thread); the two receive loops block at most on
+# _open_mcast's 1.0 s socket timeout, and every reconnect / repeat back-off is
+# an interruptible wait on _stop_event rather than time.sleep. 3.0 s is that
+# worst case plus a second of scheduling slack. It is a budget for the whole
+# set, not per thread, so several wedged sockets cannot multiply it.
+SHUTDOWN_JOIN_TIMEOUT_S = 3.0
+
 
 def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
     """
@@ -375,6 +384,12 @@ class GarminSidescanNode(Node):
         # state
         self._tx_lock = threading.Lock()      # guards transmit state changes
         self._send_lock = threading.Lock()    # serializes TCP command sends
+        # Single stop signal for every worker thread, set by destroy_node().
+        # An Event rather than a bool so the back-off sleeps inside the loops
+        # are interruptible: a thread whose only check is at the top of its
+        # loop cannot be joined inside a bounded budget if it is parked in a
+        # time.sleep. (Same shape as sound_speed_bridge's serial thread.)
+        self._stop_event = threading.Event()
         self._transmitting = False
         # True while _reconcile_transmit_param mirrors actual state into the
         # `transmit` param, so _on_param_set skips re-issuing a transmit command.
@@ -408,7 +423,6 @@ class GarminSidescanNode(Node):
         # applied in _make_sonar_msg -- the GCV-10 side-scan is 8-bit while its
         # water-column and all GCV-20 channels are 16-bit, so there is no single
         # device-wide dtype.
-        self._running = True
         # diagnostics state
         self._last_ping_t = None          # monotonic time of last emitted ping
         self._device_transmitting = None  # tx flag from the :50050 status frame
@@ -463,26 +477,33 @@ class GarminSidescanNode(Node):
         self._control_server.bind_parameter('transmit', group='sonar')
         self._control_server.bind_parameter('range_m', units='m', group='sonar')
 
+        # Every worker thread is kept as an attribute so destroy_node() can
+        # join it; an anonymous thread cannot be waited on, and these publish.
         self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
         self._rx_thread.start()
         # Auxiliary listeners: status feeds diagnostics (device tx flag) and is
         # captured under debug_raw; config is debug-capture only.
-        threading.Thread(
-            target=self._aux_loop, name='gcv_status', daemon=True,
-            args=(STATUS_GROUP, STATUS_PORT, self._pub_raw_status, self._on_status)).start()
-        threading.Thread(
-            target=self._aux_loop, name='gcv_config', daemon=True,
-            args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)).start()
+        self._aux_threads = [
+            threading.Thread(
+                target=self._aux_loop, name='gcv_status', daemon=True,
+                args=(STATUS_GROUP, STATUS_PORT, self._pub_raw_status, self._on_status)),
+            threading.Thread(
+                target=self._aux_loop, name='gcv_config', daemon=True,
+                args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)),
+        ]
+        for thread in self._aux_threads:
+            thread.start()
         self.create_timer(0.5, self._reconcile_transmit_param)
         self.create_timer(2.0, self._publish_status)
         self.create_timer(1.0, self._publish_diagnostics)
 
         self._publish_tx_state()
-        threading.Thread(
+        self._startup_thread = threading.Thread(
             target=self._startup_transmit_state,
             args=(bool(self._p('transmit_on_startup')), int(self._p('startup_off_repeats')),
                   float(self._p('range_m'))),
-            name='gcv_startup', daemon=True).start()
+            name='gcv_startup', daemon=True)
+        self._startup_thread.start()
 
     def _p(self, name):
         """Return a declared parameter's value."""
@@ -495,7 +516,10 @@ class GarminSidescanNode(Node):
             for _ in range(max(1, off_repeats)):
                 if self._send(TRANSMIT_OFF):
                     ok = True
-                time.sleep(0.3)
+                # Interruptible: destroy_node() joins this thread within a
+                # bounded budget, so the inter-repeat pause must not wait out.
+                if self._stop_event.wait(0.3):
+                    break
             # If every OFF send failed the GCV may be pinging; stay "on" so
             # status reflects reality rather than reporting a false OFF.
             self._transmitting = not ok
@@ -506,6 +530,12 @@ class GarminSidescanNode(Node):
             self.get_logger().error(
                 'startup: could not assert transmit OFF (GCV unreachable?); '
                 'assuming sonar may be pinging')
+        if self._stop_event.is_set():
+            # Shutting down. destroy_node() asserts transmit OFF itself, after
+            # joining this thread; issuing a range command -- or worse, the
+            # startup ON below -- now would put a command on the wire after
+            # that OFF and could leave the sonar pinging unattended.
+            return
         if range_m > 0:
             if self._send(build_range_cmd(range_m)):
                 self._controls['range'] = f'{range_m:.1f}'
@@ -691,12 +721,12 @@ class GarminSidescanNode(Node):
         captured for offline decode. Mirrors ``_rx_loop``'s reconnect handling.
         """
         sock = None
-        while self._running:
+        while not self._stop_event.is_set():
             if sock is None:
                 try:
                     sock = self._open_mcast(group, port)
                 except OSError:
-                    time.sleep(2.0)
+                    self._stop_event.wait(2.0)
                     continue
             try:
                 payload, _addr = sock.recvfrom(8192)
@@ -722,7 +752,7 @@ class GarminSidescanNode(Node):
     @quiet_on_shutdown
     def _rx_loop(self):
         sock = None
-        while self._running:
+        while not self._stop_event.is_set():
             if sock is None:
                 try:
                     sock = self._open_mcast(self._group, self._mport)
@@ -732,7 +762,7 @@ class GarminSidescanNode(Node):
                 except OSError as exc:
                     self.get_logger().error(f'multicast join failed: {exc}; retrying',
                                             throttle_duration_sec=5.0)
-                    time.sleep(2.0)
+                    self._stop_event.wait(2.0)
                     continue
             try:
                 payload, addr = sock.recvfrom(8192)
@@ -1082,9 +1112,56 @@ class GarminSidescanNode(Node):
                     if self._debug_raw else 'debug_raw off')
         return SetParametersResult(successful=True)
 
+    def _join_workers(self):
+        """
+        Join every worker thread inside one bounded budget.
+
+        The threads are daemons, so a wedged socket read must never hang the
+        process on shutdown -- but it must not be abandoned silently either:
+        a thread that outlives the join still holds a publisher this node is
+        about to destroy. Each join gets whatever is left of
+        :data:`SHUTDOWN_JOIN_TIMEOUT_S`, so the total wait is that budget no
+        matter how many threads are stuck, and a thread that misses it is
+        named in a WARN.
+        """
+        deadline = time.monotonic() + SHUTDOWN_JOIN_TIMEOUT_S
+        for thread in [self._rx_thread, *self._aux_threads, self._startup_thread]:
+            if thread is None or not thread.is_alive():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                self.get_logger().warn(
+                    f'shutdown: thread {thread.name} did not exit within '
+                    f'{SHUTDOWN_JOIN_TIMEOUT_S:.1f}s; it is a daemon and dies '
+                    'with the process')
+
     def destroy_node(self):
-        """Stop the receive loop and assert transmit off on shutdown."""
-        self._running = False
+        """
+        Stop and join the worker threads, assert transmit off, then tear down.
+
+        The order is load-bearing in both directions.
+
+        **Joins before ``super().destroy_node()``**: all four threads publish
+        (imagery, nadir range, water temperature, transmit state), so one
+        still running when the node's publishers are destroyed either raises
+        into a daemon thread or -- via ``quiet_on_shutdown`` -- is swallowed
+        while still doing work on a torn-down node.
+
+        **Transmit OFF after the joins**: the startup thread issues commands
+        of its own, including a ``transmit_on_startup`` ON, so an OFF sent
+        before it is joined can be overridden and leave the sonar pinging
+        unattended. Sending OFF last makes it the last command on the wire.
+        Nothing is lost by waiting for the joins first: an OFF is confirmed by
+        :meth:`_send`'s own TCP ``sendall``, not by anything the receive loops
+        decode -- they carry imagery and the device status flag, and
+        ``destroy_node`` consults neither.
+
+        The joins are bounded (:data:`SHUTDOWN_JOIN_TIMEOUT_S`), so a wedged
+        socket read delays the OFF by a bounded interval rather than blocking
+        it: the threads are daemons and the process can still exit.
+        """
+        self._stop_event.set()
+        self._join_workers()
         # Retry the OFF; a single dropped frame on shutdown must not leave the
         # sonar pinging unattended. _send already swallows OSError -> bool.
         off_ok = False
