@@ -204,12 +204,15 @@ class SoundSpeedBridgeNode(Node):
         self._last_reading_time_ns: Optional[int] = None
         self._parse_error_count = 0
         self._udp_send_error_count = 0
-        # Buffer-trim reporting. The parser owns the counters (plain ints,
-        # bumped on the serial thread, read here on the timer thread).
-        # Each individual read is atomic under the GIL, but the two are a
-        # correlated pair: read separately, the WARN text and the published
-        # KeyValues can describe different instants. _publish_diagnostics
-        # therefore snapshots both once and uses that snapshot throughout.
+        # Buffer-trim reporting. The parser owns the counters, and owns
+        # them as ONE tuple (`trim_stats`, rebound in a single assignment
+        # on the serial thread), not as two ints: they are a correlated
+        # pair, and two separate reads on this timer thread can straddle a
+        # trim and report a trim count without the bytes that go with it.
+        # `buffer_dropped_bytes` / `buffer_trim_count` remain as read-only
+        # views for a caller that wants one number; _publish_diagnostics
+        # needs both, so it takes the tuple once and uses that snapshot
+        # throughout.
         # The node owns the WARN back-off state so a multi-hour framing
         # stall cannot flood the log at the diagnostics rate.
         self._last_buffer_trim_count = 0
