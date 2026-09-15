@@ -23,12 +23,14 @@ directly with a genuinely shut-down context, since the race itself is not
 reproducible on demand.
 """
 
+import socket
 import subprocess
 import sys
 import threading
 import types
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import garmin_sidescan.node as node_mod
 from garmin_sidescan.node import GarminSidescanNode, main
 import pytest
 import rclpy
@@ -252,3 +254,108 @@ def test_invalid_handle_after_our_own_stop_is_quiet_even_on_a_live_context():
         assert GarminSidescanNode._publish_status(node) is None
     finally:
         ctx.try_shutdown()
+
+
+# ----- a refused start, and a constructor that fails part-way ---------------
+
+def _fake_socket_factory():
+    """Return a socket stand-in whose receives time out, so the loops run dry."""
+    def _recvfrom(*_args, **_kwargs):
+        raise socket.timeout()
+
+    def _factory(*_args, **_kwargs):
+        sock = MagicMock()
+        sock.recvfrom.side_effect = _recvfrom
+        sock.__enter__.return_value = sock
+        sock.__exit__.return_value = False
+        return sock
+
+    return _factory
+
+
+def _live_gcv_threads():
+    """Names of this node's worker threads that are still running."""
+    return sorted(t.name for t in threading.enumerate()
+                  if t.name.startswith('gcv_') and t.is_alive())
+
+
+def test_main_reports_a_wrong_typed_parameter_and_shuts_down():
+    """
+    An override of the wrong ROS type is a refused start, not a traceback.
+
+    rclpy raises InvalidParameterTypeException at declaration, before the
+    node builds anything; it must reach one FATAL line naming the cause and
+    exit 1, so ros2 launch and systemd Restart=on-failure see a failure
+    rather than a clean stop.
+    """
+    logger = MagicMock()
+    try:
+        with patch.object(node_mod.socket, 'socket', _fake_socket_factory()), \
+                patch('garmin_sidescan.node.rclpy.logging.get_logger',
+                      return_value=logger):
+            with pytest.raises(SystemExit) as excinfo:
+                main(args=['--ros-args', '-p', 'gcv_ip:=123'])
+        assert excinfo.value.code == 1
+        assert not rclpy.ok()
+        assert logger.fatal.call_count == 1
+        assert 'gcv_ip' in logger.fatal.call_args.args[0]
+        assert not _live_gcv_threads()
+    finally:
+        rclpy.try_shutdown()
+
+
+def test_a_constructor_failure_after_worker_start_leaves_no_live_threads():
+    """
+    A constructor that raises once workers are running must unwind them.
+
+    main() does not call destroy_node() on a node whose constructor raised,
+    so anything the constructor started is a daemon nobody will ever join --
+    still publishing, still able to put a transmit command on the wire, on a
+    node that does not exist. The failure is injected where the residual
+    window actually is: partway through the start block itself.
+    """
+    starts = []
+    real_start = threading.Thread.start
+
+    def _start(self):
+        starts.append(self.name)
+        if self.name == 'gcv_config':
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    rclpy.init()
+    try:
+        with patch.object(node_mod.socket, 'socket', _fake_socket_factory()), \
+                patch.object(threading.Thread, 'start', _start):
+            with pytest.raises(RuntimeError, match="can't start new thread"):
+                GarminSidescanNode()
+        # The two that did start were stopped and joined before the raise.
+        assert starts == ['gcv_rx', 'gcv_status', 'gcv_config']
+        assert not _live_gcv_threads()
+    finally:
+        rclpy.try_shutdown()
+
+
+def test_main_exits_one_with_one_fatal_on_a_constructor_value_error():
+    """
+    Our own validation failing takes the same path as rclpy's.
+
+    Pinned separately from the wrong-typed override because it is the branch
+    a future parameter check will land on, and because it is what proves the
+    construction sits inside main()'s try: built outside it, the ValueError
+    would escape as a traceback with rclpy never shut down.
+    """
+    logger = MagicMock()
+    try:
+        with patch('garmin_sidescan.node.GarminSidescanNode',
+                   side_effect=ValueError('range_max_m must exceed range_min_m')), \
+                patch('garmin_sidescan.node.rclpy.logging.get_logger',
+                      return_value=logger):
+            with pytest.raises(SystemExit) as excinfo:
+                main()
+        assert excinfo.value.code == 1
+        assert not rclpy.ok()
+        assert logger.fatal.call_count == 1
+        assert 'range_max_m must exceed range_min_m' in logger.fatal.call_args.args[0]
+    finally:
+        rclpy.try_shutdown()
