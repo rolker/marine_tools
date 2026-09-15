@@ -1,5 +1,5 @@
 """
-Shutdown-guard tests for the diagnostics timer (rolker/marine_tools#78).
+Shutdown-guard tests for this node's two guarded call sites (#78).
 
 ``main()``'s exit-code contract is not enough on its own: rclpy's signal
 handler tears the context down while the executor is still inside
@@ -8,13 +8,15 @@ publisher's context has gone invalid. rcl raises ``RCLError: Failed to
 publish: publisher's context is invalid``, ``spin()`` propagates it, and a
 deliberate operator stop exits 1 with a traceback -- indistinguishable
 from a crash under systemd ``Restart=on-failure``. ``garmin_sidescan``
-carries the same guard (see its ``test_main_shutdown.py``); this node's
-one publishing timer carries it inline.
+carries the same guard as a decorator (see its ``test_main_shutdown.py``);
+this node has two such call sites and carries the guard inline at each:
+the diagnostics timer, and the reading path on the serial thread, where
+an escaping RCLError ends the reader thread outright.
 
-The race is not reproducible on demand, so the callback is driven directly
-against a **real** ``rclpy.Context`` that has been shut down -- not a mock
-of ``rclpy.ok`` -- with the publish raising the exact rcl error the field
-shows.
+The race is not reproducible on demand, so each guarded call is driven
+directly against a **real** ``rclpy.Context`` that has been shut down --
+not a mock of ``rclpy.ok`` -- with the publish raising the exact rcl error
+the field shows.
 """
 
 from unittest.mock import MagicMock, patch
@@ -24,6 +26,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from sound_speed_bridge.node import SoundSpeedBridgeNode
+from sound_speed_bridge.parsers import SoundSpeedReading
 
 
 # The exact rcl message a publisher that outlived its context raises.
@@ -125,5 +128,141 @@ def test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard(mock_serial_cls)
         with pytest.raises(ValueError, match='a bug in the callback'):
             SoundSpeedBridgeNode._publish_diagnostics(proxy)
     finally:
+        ctx.try_shutdown()
+        node.destroy_node()
+
+
+# ----- the reading path: the same guard, on the serial thread ---------------
+
+class _ReadingProxy:
+    """
+    A real node with ``context`` and the ``sound_speed`` publisher overridden.
+
+    Same shape as :class:`_ContextProxy`, for the other guarded call site.
+    ``_handle_reading`` and ``_publish_reading`` are redefined to re-enter
+    the unbound methods *with the proxy as self*: plain attribute delegation
+    would hand back the underlying node's bound methods, and the guard would
+    then consult the node's live context and publish on the node's real
+    publisher instead of the raising stand-in.
+    """
+
+    def __init__(self, node, context, exc):
+        object.__setattr__(self, '_node', node)
+        object.__setattr__(self, 'context', context)
+        pub = MagicMock()
+        pub.publish.side_effect = exc
+        object.__setattr__(self, '_pub', pub)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_node'), name)
+
+    def _handle_reading(self, reading):
+        return SoundSpeedBridgeNode._handle_reading(self, reading)
+
+    def _publish_reading(self, reading):
+        return SoundSpeedBridgeNode._publish_reading(self, reading)
+
+
+def _reading():
+    """One valid reading, as the parser would yield it."""
+    return SoundSpeedReading(
+        sound_speed_m_s=1500.5,
+        receive_time_ns=1_000_000_000,
+        raw_bytes=b'1500.500\r',
+        raw_mm_s=1500500,
+    )
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_a_reading_publish_is_quiet_once_the_context_is_shut_down(mock_serial_cls):
+    """
+    The serial thread's sound_speed publish must not raise after teardown.
+
+    The thread's own ``_stop_event`` test is check-then-act: a SIGINT can
+    land between it and the publish, and the resulting RCLError has nothing
+    to catch it on that thread (``_serial_loop`` catches only
+    ``SerialException``/``OSError``), so it ends the reader as a thread
+    traceback on a deliberate Ctrl-C.
+    """
+    node = _node(mock_serial_cls)
+    ctx = _context(live=False)
+    proxy = _ReadingProxy(node, ctx, _rclpy.RCLError(_DEAD_CONTEXT))
+    try:
+        proxy._stop_event.clear()
+        assert SoundSpeedBridgeNode._handle_reading(proxy, _reading()) is None
+        # Guarded around the call, not before it.
+        assert proxy._pub.publish.call_count == 1
+    finally:
+        node._stop_event.set()
+        ctx.try_shutdown()
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_a_reading_publish_failure_on_a_live_context_is_still_raised(mock_serial_cls):
+    """A publisher that stops working mid-deployment is still loud."""
+    node = _node(mock_serial_cls)
+    ctx = _context(live=True)
+    proxy = _ReadingProxy(node, ctx, _rclpy.RCLError(_DEAD_CONTEXT))
+    try:
+        proxy._stop_event.clear()
+        with pytest.raises(_rclpy.RCLError):
+            SoundSpeedBridgeNode._handle_reading(proxy, _reading())
+    finally:
+        node._stop_event.set()
+        ctx.try_shutdown()
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_a_non_rcl_error_on_the_reading_path_is_not_swallowed(mock_serial_cls):
+    """A bug in the publish body still surfaces, shut-down context or not."""
+    node = _node(mock_serial_cls)
+    ctx = _context(live=False)
+    proxy = _ReadingProxy(node, ctx, ValueError('a bug on the reading path'))
+    try:
+        proxy._stop_event.clear()
+        with pytest.raises(ValueError, match='a bug on the reading path'):
+            SoundSpeedBridgeNode._handle_reading(proxy, _reading())
+    finally:
+        node._stop_event.set()
+        ctx.try_shutdown()
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_the_serial_loop_survives_a_shutdown_race_on_a_publish(mock_serial_cls):
+    """
+    Forced ordering: the reader thread outlives a teardown mid-publish.
+
+    The race is not reproducible on demand, so the ordering is forced --
+    the context is already down and the publisher raises the exact rcl
+    error -- and :meth:`_serial_loop` is run synchronously on the test
+    thread over several chunks. Every chunk must be consumed: a loop that
+    exits early is the field failure (silent sensor, ``serial_connected``
+    still true) this guard exists to prevent.
+    """
+    node = _node(mock_serial_cls)
+    ctx = _context(live=False)
+    proxy = _ReadingProxy(node, ctx, _rclpy.RCLError(_DEAD_CONTEXT))
+    chunks = [b'1500.100\r\r\n', b'1500.200\r\r\n', b'1500.300\r\r\n']
+    remaining = list(chunks)
+    port = MagicMock()
+
+    def _read(_size):
+        if not remaining:
+            proxy._stop_event.set()
+            return b''
+        return remaining.pop(0)
+
+    port.read.side_effect = _read
+    mock_serial_cls.return_value.__enter__.return_value = port
+    try:
+        proxy._stop_event.clear()
+        SoundSpeedBridgeNode._serial_loop(proxy)   # must not raise
+        assert not remaining, 'the reader loop died on the first publish'
+        assert proxy._pub.publish.call_count == len(chunks)
+    finally:
+        node._stop_event.set()
         ctx.try_shutdown()
         node.destroy_node()

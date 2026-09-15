@@ -451,7 +451,7 @@ class SoundSpeedBridgeNode(Node):
                         # Diagnostic-only, deliberately after the parser feed
                         # so the primary SoundSpeed path is never delayed or
                         # preempted by it (same rule as the raw publish in
-                        # _handle_reading). The helper carries its own
+                        # _publish_reading). The helper carries its own
                         # exception isolation — see _publish_serial_tap.
                         self._publish_serial_tap(data)
             except (serial.SerialException, OSError) as exc:
@@ -607,12 +607,51 @@ class SoundSpeedBridgeNode(Node):
         return SetParametersResult(successful=True)
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
+        """
+        Record and publish one reading. Runs on the serial thread.
+
+        The body lives in :meth:`_publish_reading` so the shutdown guard
+        below wraps a single call rather than fifty lines.
+        """
         # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
         # wedged in the UART layer can outlast it, after which the publishers
         # are destroyed while this daemon thread still runs. Once the stop
         # event is set, publishing is no longer safe.
         if self._stop_event.is_set():
             return
+        try:
+            self._publish_reading(reading)
+        except (_rclpy.RCLError, InvalidHandle):
+            # [SW4] call-level guard, the same one _publish_diagnostics
+            # carries, for the same reason one layer over. The stop-event
+            # test above is check-then-act: rclpy's signal handler can tear
+            # the context down in the gap between it and any publish below,
+            # and rcl then raises "Failed to publish: publisher's context is
+            # invalid". Nothing on this thread would catch it — _serial_loop
+            # catches only (SerialException, OSError) — so a deliberate
+            # Ctrl-C ends the serial reader with a thread traceback.
+            # InvalidHandle is the same condition one step later, once
+            # destroy_node() has taken the publisher handles.
+            #
+            # ok() is consulted only *after* the failure, never before it, so
+            # the decision is made on what actually happened: a shutdown in
+            # flight returns quietly; the same failure on a live context is
+            # re-raised unchanged, so a publisher that has stopped working
+            # mid-deployment is still loud. Non-RCL exceptions are
+            # deliberately not caught — a formatter or socket bug must still
+            # surface.
+            if not rclpy.ok(context=self.context):
+                return
+            raise
+
+    def _publish_reading(self, reading: SoundSpeedReading) -> None:
+        """
+        Publish one reading on every configured sink (serial thread).
+
+        Every RCL call on this path — ``sound_speed``, ``raw``, the optional
+        ``temperature``/``pressure``, and the logging inside the UDP
+        error path — is covered by :meth:`_handle_reading`'s guard.
+        """
         with self._lock:
             self._last_reading = reading
             self._last_reading_time_ns = self.get_clock().now().nanoseconds
