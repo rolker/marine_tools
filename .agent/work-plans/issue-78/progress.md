@@ -822,3 +822,25 @@ are untouched by this pass.
   `sinks.py` rows, the SIGINT-notes bullet, the two `test_sinks.py` template
   keys, the `quiet_on_shutdown` docstring caveat, the missing committed
   real-SIGINT tests) were **not** in this pass's instruction and are untouched.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-09-15 13:40 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #91 at `6d5d84b` (reviewed head; local head now 169d108 after [SW5])
+**Sources**: 3 (Copilot R4 @ `6d5d84b` — 1 inline + 11 suppressed; Local Review (Pre-Push) round 5 residuals; CI rollup)
+**Cross-source confirmations**: 2
+**CI**: all-pass
+
+### Findings
+- [ ] (cross-confirmed: Copilot + Local Review round 1 deferred suggestion) the serial thread's `_handle_reading()` publishes `sound_speed`/`raw` with no call-level shutdown guard; a SIGINT between the `_stop_event` check and a publish lets `RCLError` escape `_serial_loop` as a thread traceback — apply the [SW4] guard to those publishes with a forced-ordering regression test — `sound_speed_bridge/node.py:765` (and `_handle_reading`)
+- [ ] (cross-confirmed: Copilot ×2 + Local Review round 5 residual) `garmin_sidescan` and `kongsberg_em_bridge` have no committed real-SIGINT subprocess test; add the harness the other two packages have — `garmin_sidescan/node.py:1122`, `kongsberg_em_bridge/node.py:749`
+- [ ] (must-fix, Copilot inline + suppressed ×2) "a line longer than the cap can never frame" is too absolute: the cap applies after framing, so a long line frames when it and its terminator arrive in one `feed()`; only residue exceeding the cap before a terminator is discarded — reword in `parsers.py:138`, the node parameter description (`node.py:106`), and `plan.md:307`
+- [ ] (low, Copilot) stale comment: parser no longer owns two plain ints; it is one `_trim_stats` tuple with read-only views — `node.py:207`
+- [ ] (low, Copilot ×3) plan records: self-check "two source files, three test files" is stale (`plan.md:520`); verification record omits `garmin_sidescan` (`plan.md:586`); #88 out-of-scope line should list the two counters too (`plan.md:486`)
+- [x] (low, Copilot) PR description floor wording — updated host-side
+- [ ] (carried, Local Review round 5) `quiet_on_shutdown` docstring overstates "a genuine fault stays loud" — add the coinciding-shutdown caveat
+
+### False positives
+- (Copilot, `node.py:103`) "add the parameter/counter/topic README with this change" — deferred by explicit operator decision at the #77 publish gate (README filed as rolker/marine_tools#88, scope widened by comment to carry `parser_max_buffer_bytes`, `buffer_dropped_bytes`, `buffer_trim_count`); not a defect in this PR.
