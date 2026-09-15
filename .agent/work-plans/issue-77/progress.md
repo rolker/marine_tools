@@ -294,3 +294,49 @@ are still counted in `tap_byte_count`.
 
 ### Not pushed
 No `git push`, no PR, no issues filed — the host performs those.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 09:41 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-77 at `37ee5e9`
+**Mode**: pre-push
+**Depth**: Deep (reason: the operator's scope change added a dynamic-parameter callback that races the serial thread and creates/destroys a publisher at runtime — concurrency/lifecycle in a sensor driver; +272 lines in `node.py`. Promoted further by the handoff's flag that `node.py` was reconstructed from edit scripts after an accidental `git checkout --`, so nothing from rounds 1-2 could be assumed to have survived)
+**Must-fix**: 2 | **Suggestions**: 3
+**Round**: 3 | **Ship**: recommended — both must-fixes are mechanical with an obvious correction each (one missing test; one `try/except` plus its test), neither is a design question, and neither needs another independent read to settle. Round 2's zero must-fixes was a verdict on the *pre-scope-change* diff, so 0 → 2 is this code's first adversarial read, not a diverging loop. Address both, re-verify the suite, push.
+
+**Specialists**: Static Analysis (ament_flake8 + ament_pep257, run inside the package suite — clean), Governance, Plan Drift, Claude Adversarial Lens A (logic/correctness) and Lens B (systemic/concurrency/lifecycle), both fresh-context. Copilot and Local cross-model reads off (not opted in). The lead reviewer re-ran the full suite and re-ran five mutations independently against an out-of-tree copy.
+
+### Findings
+- [ ] (must-fix) The launch-time enable path is unguarded by any test: replacing `__init__`'s `self._set_tap_publishing(bool(self.get_parameter('serial_tap_enabled').value))` with `pass` leaves all 19 node tests green. Every test constructs the node with the default and enables afterwards through `set_parameters`, so the plan's and the code comment's central claim — "enabled at startup and enabled later are one code path" — is asserted by prose only. A regression would ship a boat where `serial_tap_enabled:=true` in the launch file silently advertises nothing. Add a test that constructs the node with the parameter already true (e.g. re-init the context inside the test with `rclpy.init(args=['--ros-args', '-p', 'serial_tap_enabled:=true'])`, since `SoundSpeedBridgeNode.__init__` forwards no `parameter_overrides`) and asserts `_tap_pub` exists and `/serial_tap` is advertised before any `set_parameters` call — `sound_speed_bridge/sound_speed_bridge/node.py:185-186`, `sound_speed_bridge/test/test_node.py`
+- [ ] (must-fix) A `create_publisher` / `destroy_publisher` failure inside the parameter callback kills the whole bridge, not just the tap: `rclpy`'s `_set_parameters_atomically_common` wraps the on-set callbacks in no `try`, `parameter_service.py` catches only `ParameterNotDeclaredException`, and `executors.py:917-918` re-raises a handler exception straight out of `rclpy.spin()`, which `main()` guards only for `KeyboardInterrupt`. So an RMW/resource failure during a live `ros2 param set serial_tap_enabled true` takes down the primary SoundSpeed/Temperature/FluidPressure publishing — the exact outcome `_publish_serial_tap`'s deliberately broad `except` exists to prevent on the serial-thread side ("a diagnostic must not be able to kill the sensor"). The guard is missing on the parameter-set side. Wrap the create/destroy in `try/except` and return `SetParametersResult(successful=False, reason=...)` so the failure degrades to a rejected `ros2 param set`; add a test that makes `create_publisher` raise and asserts the node survives with an unsuccessful result — `sound_speed_bridge/sound_speed_bridge/node.py:278-294`, `:426-427`
+- [ ] (suggestion) `_set_tap_publishing`'s enable branch reads `self._tap_pub` outside `_tap_lock` before acting on it. That check-then-act is safe **only** because `main()` uses a single-threaded `rclpy.spin()`, so the callback can never run on two threads at once; under a `MultiThreadedExecutor` two concurrent enables could each create a publisher and leak the loser, invisibly to a test suite that drives everything from one thread. The docstring explains the lock's scope but never states the single-executor-thread invariant the unlocked read depends on — one line would keep a future executor change from silently reintroducing the leak — `sound_speed_bridge/sound_speed_bridge/node.py:278-280`
+- [ ] (suggestion) The `sound_speed_bridge` README gap, deferred since PR#76, has widened: this change adds a second raw-adjacent topic **and** the node's first runtime-settable parameter, with operational semantics (off-by-default, the accepted subscriber-discovery lag after enabling, three tap diagnostics keys) that an operator now reconstructs from source, the startup log line and `ros2 param describe`. Operator's call whether to file it — the plan already names it as a candidate; what is owed is the yes/no, not the README — `.agent/work-plans/issue-77/plan.md` Design Decision 4
+- [ ] (suggestion) Knowledge-doc candidate, operator's call, proposal only and no auto-edit: the idiom now used twice in this node — a diagnostic publish placed after the primary data path, wrapped in its own broad `except`, with failures **counted** so a silent catch cannot hide a broken diagnostic — is reusable across this workspace's serial/UDP bridge nodes. Candidate home `.agent/knowledge/ros2_development_patterns.md`
+
+### Reconstruction check — did the round-1/round-2 properties survive?
+Yes. `node.py` was read end to end and is internally coherent; each previously-established property was re-verified by mutation against an out-of-tree copy (`cp` of the package tree, never `git checkout --`; the worktree stayed clean throughout), each failing exactly the test that guards it and nothing else:
+- publish-after-feed ordering (`node.py:308-315`) — hoisting `_publish_serial_tap(data)` above the feed loop fails only `test_serial_tap_publishes_after_parser_feed`
+- shutdown guard (`node.py:366-367`) — deleting it fails only `test_serial_tap_noop_after_stop`
+- exception isolation (`node.py:377-382`) — deleting the `try/except` fails only `test_serial_tap_publish_failure_is_counted_not_fatal`
+- byte-count semantics (`node.py:368`, incremented after the stop guard but before both the enabled gate and the publish) — verified by reading and by the disabled-path tests
+- publisher teardown on disable (`node.py:291-294`) — never destroying it fails only `test_serial_tap_topic_advertised_only_when_enabled`
+The fifth mutation is must-fix 1: deleting the launch-time enable call fails **nothing**.
+
+### Verification performed by the lead reviewer
+- Full suite from the worktree (`./sensors_ws/build.sh` then `./sensors_ws/test.sh sound_speed_bridge`): `Summary: 59 tests, 0 errors, 0 failures, 0 skipped`. `ament_flake8` / `ament_pep257` run inside it and are clean. Worktree left clean.
+- Out-of-tree baseline for the mutation work: 19 node tests, all passing, restored and re-verified green after every mutation.
+- The launch-time path itself **works** — probed by constructing the node under `rclpy.init(args=['--ros-args', '-p', 'serial_tap_enabled:=true'])`: the publisher exists as `/serial_tap` immediately after construction. Must-fix 1 is a coverage gap, not a defect.
+- Lens B's `InvalidHandle` claim re-checked against the installed rclpy rather than the code comment: `Publisher.publish` enters the use-counted handle and `InvalidHandle` is a `RuntimeError` subclass, so the publish-racing-a-disable path really is covered by the broad `except`. The comment is accurate.
+- Must-fix 2's propagation chain read directly in `/opt/ros/jazzy/lib/python3.12/site-packages/rclpy/` (`node.py` `_set_parameters_atomically_common`, `parameter_service.py`, `executors.py:917-918`) — not taken on the specialist's word.
+
+### Adjudicated this round — recorded so they are not re-raised
+- "Applying the side effect in a **pre**-set callback can diverge from the parameter store (Jazzy offers `add_post_set_parameters_callback`)": **not a defect here.** rclpy commits `self._parameters[...]` only after every on-set callback returns success, and `add_on_set_parameters_callback` **inserts at index 0**, so any callback registered later runs *before* this one — a rejection by another callback can therefore never land after this one has acted. This node registers exactly one callback. The one way the ordering does bite is an *exception*, which is must-fix 2.
+- Parameter set racing `destroy_node()`: unreachable — `main()` calls `destroy_node()` only after `rclpy.spin()` returns on the same thread.
+- `__init__` ordering (`_set_tap_publishing` and the callback registration before `_stop_event` and the thread start): no window — nothing can reach the callback until `__init__` returns and something spins.
+- Stale publisher at shutdown: none — `super().destroy_node()` destroys every registered publisher, `_tap_pub` included.
+
+### Adjudicated in earlier rounds — not re-raised
+RELIABLE QoS choice; the deliberately broad `except`; `parsers.py`'s unbounded accumulation buffer (marine_tools#78); `_handle_reading`'s lack of exception isolation (pre-existing follow-up candidate — note must-fix 2 is a *different* path and is in scope); the transport-drop caveat wording; the cross-repo `unh_echoboats_project11` bag record-list follow-up (deliberately not filed at the operator's "not worry about writing to a bag yet"). Governance found no must-fix and no ADR non-compliance; Plan Drift found none — the plan's test list, Design Decision 5 and every repointed stale comment match the diff.
