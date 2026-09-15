@@ -107,7 +107,11 @@ dynamically: the node publishes a `RadarControlSet` on `state` and accepts
 - **Transmit OFF at startup** — the node asserts off and never pings without an
   explicit command (pairs with the chartplotter defaulting to not pinging on
   power-up).
-- Transmit-off is also sent on node shutdown.
+- Transmit-off is also sent on node shutdown — **after** the driver's worker
+  threads have been stopped and joined, so it is the last command on the wire
+  and the startup thread cannot put a `transmit_on_startup` ON behind it. The
+  joins are bounded (3 s for the whole set), so a wedged socket read delays
+  that OFF but can never block it.
 - **No external sound-speed interlock.** The GCV stops pinging on its own when
   out of the water, so a dry transducer cannot overheat — the driver relies on
   that rather than a watchdog. This rests on a field observation (the unit stops
