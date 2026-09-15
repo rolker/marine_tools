@@ -142,3 +142,39 @@ separation) — belongs in `marine_tools`, not the workspace repo.
 - [ ] (should-fix) All four new tests must drive `_serial_loop`, but the shared `_make_node` helper deliberately kills the serial thread right after construction (`test_node.py:31-62`) and every existing test calls `_handle_reading` directly; name the harness work (second helper or direct `_serial_loop()` call with a `side_effect` that sets `_stop_event`) and preserve `_make_node`'s busy-spin rationale — `plan.md` Approach step 4
 - [ ] (suggestion) Context attributes non-framing to "the CRLF regex framer", but the default/field parser is `aml`, which frames on a single `\r` (`parsers.py:76`); conclusion holds for both, but the rationale record should name the right framer — `plan.md` Context
 - [ ] (suggestion) Record as a decision that `UInt8MultiArray` carries no header, so bag receive time is the tap's only time base — acceptable (`raw` is the same) but post-hoc temporal correlation is the tap's whole purpose — `plan.md` Approach step 1
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 09:04 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-77 at `8f1b254`
+**Mode**: pre-push
+**Depth**: Deep (reason: 898 changed lines, ≥200 threshold; concurrency/lifecycle change in a sensor driver)
+**Must-fix**: 2 | **Suggestions**: 5
+**Round**: 1 | **Ship**: continue — 2 must-fix at round 1, both mechanical and precisely located; next round should converge
+
+**Specialists**: Static Analysis (ament_flake8 + ament_pep257, clean), Governance, Plan Drift, Claude Adversarial Lens A + Lens B. Copilot and Local cross-model reads off (not opted in). Lead reviewer additionally mutation-tested the new tests and ran the suite (50/50 green).
+
+### Findings
+- [ ] (must-fix) Ordering invariant "tap publishes after the parser feed" is documented as load-bearing but no test guards it — moving the publish before `_parser.feed()` leaves all 50 tests green (verified empirically by mutation); assert relative call order between the primary publishes and the tap — `sound_speed_bridge/sound_speed_bridge/node.py:203-208`, `sound_speed_bridge/test/test_node.py`
+- [ ] (must-fix) Cross-repo consequence is recorded only as plan prose and will evaporate: `serial_tap` is absent from bizzyboat.yaml's `logger`/`sonar_logger` record lists, and bizzyboat.yaml still describes marine_tools#77 as future work — file the unh_echoboats_project11 follow-up and reference it in the PR body, or the tap is inert in the field — `bizzyboat_project11/config/bizzyboat.yaml:813-818,709,919` (cross-repo)
+- [ ] (suggestion) `_handle_reading`'s four publishes have no exception isolation at all while the new tap does — same thread, same shutdown path; pre-existing, but this PR draws the contrast, so file it as a follow-up — `sound_speed_bridge/sound_speed_bridge/node.py:269-292`
+- [ ] (suggestion) Byte-exactness caveat covers reconnects but not transport: RELIABLE + KEEP_LAST(10) can still drop samples if a subscriber falls more than 10 behind — one sentence in the publisher comment — `sound_speed_bridge/sound_speed_bridge/node.py:113-125`
+- [ ] (suggestion) `tap_byte_count` under-reports wire traffic when publishes fail (bytes counted only on success, errors counted per chunk not per byte); consider a bytes-read counter independent of publish success — `sound_speed_bridge/sound_speed_bridge/node.py:236-243`
+- [ ] (suggestion) File the deferred `sound_speed_bridge` README (covering `raw` + `serial_tap` + the parameter surface) as a real issue rather than leaving it as plan prose — `.agent/work-plans/issue-77/plan.md` Design Decision 4
+- [ ] (suggestion) Knowledge-doc candidate, operator's call: the "diagnostic publish placed after the primary path, wrapped in a counted + throttled-logged broad except" idiom is reusable across this workspace's serial/UDP bridge nodes — proposal only, no auto-edit
+
+### Adjudicated false positives (recorded so they are not re-raised)
+- Lens B "shutdown TOCTOU can surface as a native use-after-free/segfault the broad `except` cannot catch": **rejected**. `rclpy.publisher.Publisher.publish` enters `self.handle` (`Destroyable.__enter__`), which raises `InvalidHandle` — verified a Python `Exception` subclass — and holds a use-count that defers destruction while a publish is in flight. The guard-plus-broad-`except` design is correct and sufficient.
+- Lens B "the `except` block's `get_logger()` could itself raise and kill the thread": dropped, not substantiated — `get_logger()` returns a plain attribute and rclpy logging holds no rcl handle.
+- Lens B "tap publishes more often than `raw`, so its RELIABLE-QoS blocking risk is higher": **factually inverted** — the tap is ~1 Hz (one per `read()` return), `raw` is ~25 Hz (one per sentence) on the same profile in the same thread. The tap adds roughly 1/25 of the pre-existing exposure; RELIABLE retained as consistent with `raw`, repo convention, and ADR-0008.
+- Lens A "parsers.py unbounded accumulation buffer": already tracked as marine_tools#78 (OPEN, verified) — out of scope here.
+
+### Verification performed by the lead reviewer
+- Suite: 50/50 green. `ament_flake8` + `ament_pep257` clean on both changed files.
+- Mutation tests: deleting the `_stop_event` guard fails `test_serial_tap_noop_after_stop`; deleting the `try/except` fails `test_serial_tap_publish_failure_is_counted_not_fatal`; suppressing the tap when the parser yields nothing fails 4 tests. Moving the tap publish before the parser feed fails **nothing** — the basis of must-fix 1.
+- Field fidelity: the `_field_regex_parser` fixture matches the real BizzyBoat launch (`parser: regex`, `regex_line_terminator: crlf`, same `$AML,SVM` pattern) — confirmed against `sound_speed_launch.py`.
+- Downstream: the operator annunciator consumes `status.message`, not the KeyValue list, so the two new diagnostic keys break no consumer.
+- `/diagnostics` is already in both bizzyboat record lists, so that half of the plan's recorded consequence is satisfied; `serial_tap` is the half that is not.
