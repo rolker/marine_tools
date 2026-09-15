@@ -5,8 +5,10 @@ Reads serial data from a sound-speed sensor, publishes a ROS topic with the
 parsed reading, and optionally fans out UDP packets in configurable formats
 to downstream consumers. Two byte-level passthrough topics support post-hoc
 diagnosis from deployment bags: ``raw`` (per framed sentence) and
-``serial_tap`` (the pre-framing wire stream). Diagnostics carry the live
-value plus health counters so operator UIs see both health and value.
+``serial_tap`` (the pre-framing wire stream). ``serial_tap`` is off by
+default — the topic is not even advertised — and is turned on live, without
+a restart, via the ``serial_tap_enabled`` parameter. Diagnostics carry the
+live value plus health counters so operator UIs see both health and value.
 """
 
 import math
@@ -16,8 +18,11 @@ from typing import List, Optional
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_interfaces.msg import SoundSpeed
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.publisher import Publisher
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import FluidPressure, Temperature
 import serial
@@ -72,6 +77,27 @@ class SoundSpeedBridgeNode(Node):
         self.declare_parameter('regex_pattern', '')
         self.declare_parameter('regex_sound_speed_scale', 1.0)
         self.declare_parameter('regex_line_terminator', 'cr')
+        # The pre-framing wire tap is a diagnostic probe, not a
+        # normal-operations topic, so it is OFF by default (operator decision,
+        # recorded in .agent/work-plans/issue-77/plan.md): it is turned on only
+        # when a wrong-baud / corrupted-framing question is actually being
+        # asked, and while off the topic is not advertised at all. rclpy's
+        # only descriptor-level dynamism marker is read_only, so
+        # read_only=False (stated explicitly rather than left to the default)
+        # is what declares this parameter runtime-settable; the
+        # _on_set_parameters callback below is what makes a runtime set take
+        # effect on the running reader instead of being silently cached.
+        self.declare_parameter(
+            'serial_tap_enabled', False,
+            ParameterDescriptor(
+                description=(
+                    'Advertise and publish the pre-framing serial_tap byte '
+                    'stream. Off by default (diagnostic probe); while off the '
+                    'topic does not exist. Settable at runtime: ros2 param '
+                    'set /sound_speed_bridge serial_tap_enabled true creates '
+                    'the publisher and takes effect on the next serial '
+                    'chunk, no restart.'),
+                read_only=False))
 
         self._device = self.get_parameter('device').value
         self._baud = self.get_parameter('baud').value
@@ -94,7 +120,10 @@ class SoundSpeedBridgeNode(Node):
         if self._udp_targets:
             self._udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        topic_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        # Retained: the tap publisher is created on demand (see
+        # _set_tap_publishing), so its QoS has to outlive this block.
+        self._topic_qos = topic_qos = QoSProfile(
+            depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self._pub = self.create_publisher(SoundSpeed, 'sound_speed', topic_qos)
         self._temp_pub = self.create_publisher(Temperature, 'temperature', topic_qos)
         self._pressure_pub = self.create_publisher(
@@ -123,8 +152,15 @@ class SoundSpeedBridgeNode(Node):
         # only time base — within one read() interval of wire arrival, which
         # is the resolution the diagnostic question needs. Bare relative name,
         # matching `raw`. See rolker/marine_tools#77.
-        self._tap_pub = self.create_publisher(
-            UInt8MultiArray, 'serial_tap', topic_qos)
+        #
+        # Created on demand, not here: while `serial_tap_enabled` is false the
+        # topic is not advertised at all (operator decision, #77 — "I'd rather
+        # it only publish if we enable it"), so `ros2 topic list` shows
+        # serial_tap exactly when the tap is on and an idle deployment carries
+        # no dead endpoint. _set_tap_publishing() creates and destroys it; the
+        # serial thread reads the reference through _tap_lock.
+        self._tap_pub: Optional[Publisher] = None
+        self._tap_lock = threading.Lock()
         self._diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         self._lock = threading.Lock()
@@ -142,6 +178,18 @@ class SoundSpeedBridgeNode(Node):
 
         self._diag_timer = self.create_timer(1.0, self._publish_diagnostics)
 
+        # Honour a launch-time override (`serial_tap_enabled: true` in a launch
+        # file or on the command line): the parameter is read through the same
+        # helper the runtime toggle uses, so "enabled at startup" and "enabled
+        # later" reach the identical state rather than being two code paths.
+        self._set_tap_publishing(
+            bool(self.get_parameter('serial_tap_enabled').value))
+
+        # Registered before the serial thread starts, so there is no window in
+        # which a set is accepted by the parameter store but not applied to a
+        # reader that is already running.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         self._stop_event = threading.Event()
         self._serial_thread = threading.Thread(
             target=self._serial_loop, name='sound_speed_bridge.serial', daemon=True)
@@ -150,6 +198,7 @@ class SoundSpeedBridgeNode(Node):
         self.get_logger().info(
             f'sound_speed_bridge started: device={self._device} baud={self._baud} '
             f'parser={self._parser_name} '
+            f'serial_tap_enabled={self._serial_tap_enabled} '
             f'udp_targets={[(t.host, t.port, t.format_name) for t in self._udp_targets]}')
 
     def _build_udp_targets(self) -> List[_UdpTarget]:
@@ -186,6 +235,64 @@ class SoundSpeedBridgeNode(Node):
                 host, port, fmt, template, decoded_template, formatter))
         return targets
 
+    @property
+    def _serial_tap_enabled(self) -> bool:
+        """
+        Whether the tap is currently advertising and publishing.
+
+        Derived from the publisher rather than tracked in a parallel bool:
+        the publisher's existence *is* the enabled state (the topic is not
+        advertised while off), and a second flag could only ever disagree
+        with it.
+        """
+        return self._tap_pub is not None
+
+    def _set_tap_publishing(self, enabled: bool) -> None:
+        """
+        Create or destroy the ``serial_tap`` publisher to match ``enabled``.
+
+        Idempotent, so a repeated set (an operator confirming a state, or a
+        launch-time override that already matches) neither re-advertises nor
+        tears down a live topic.
+
+        Thread-safety: ``_tap_lock`` guards only the publisher *reference*,
+        which is the one piece of state shared between this (executor thread)
+        and ``_publish_serial_tap`` (serial thread). It is deliberately its
+        own lock and not ``self._lock``: that lock is held on the primary
+        reading path (``_handle_reading``) and by the diagnostics timer, so
+        reusing it would let a diagnostic contend with the ``SoundSpeed``
+        path — the coupling this file's ordering rule exists to prevent. The
+        reader copies the reference under the lock and publishes outside it,
+        so a publish never runs with a lock held.
+
+        That leaves one deliberate race, and it is already covered: the
+        serial thread can be publishing on a reference taken just before a
+        disable. ``Publisher.publish`` enters the handle's use-count
+        (``Destroyable.__enter__``), which defers the actual destruction
+        while a publish is in flight and raises ``InvalidHandle`` — a plain
+        ``Exception`` subclass — if the handle is already gone. Either way
+        ``_publish_serial_tap``'s broad ``except`` catches it and counts it
+        in ``tap_error_count``: at worst a disable costs one counted, logged
+        tap error, never a crashed reader thread.
+        """
+        if enabled:
+            if self._tap_pub is not None:
+                return
+            # Created outside the lock: create_publisher touches the node's
+            # own structures, not the tap reference, and the reader treats a
+            # None reference as "off" until the swap lands.
+            pub = self.create_publisher(
+                UInt8MultiArray, 'serial_tap', self._topic_qos)
+            with self._tap_lock:
+                self._tap_pub = pub
+        else:
+            with self._tap_lock:
+                pub, self._tap_pub = self._tap_pub, None
+            if pub is not None:
+                # Destroyed after the reference is cleared, so no reader can
+                # pick it up again while it is being torn down.
+                self.destroy_publisher(pub)
+
     def _serial_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -219,6 +326,23 @@ class SoundSpeedBridgeNode(Node):
         """
         Publish one pre-framing chunk of the serial stream on ``serial_tap``.
 
+        Publishing is gated on the ``serial_tap_enabled`` parameter, which
+        defaults to **off** — the tap is a diagnostic probe, turned on when a
+        framing question is being asked and left off the rest of the time.
+        While off there is no publisher and the topic is not advertised at
+        all. The gate is the publisher reference, read here per chunk rather
+        than latched at startup, so ``ros2 param set /sound_speed_bridge
+        serial_tap_enabled true`` takes effect on the very next chunk (see
+        ``_on_set_parameters`` / ``_set_tap_publishing``).
+
+        ``tap_byte_count`` is incremented *before* the gate as well as before
+        the publish, so it keeps counting wire traffic while the tap is
+        disabled and its topic does not exist. That is deliberate: it is the
+        cheap always-on answer to "is the probe silent?" — an operator who
+        sees the counter frozen knows there is nothing to enable the tap
+        *for*, without paying any bag volume to find out. Counting a byte
+        costs one integer add.
+
         Isolated from the reader loop on purpose: ``_serial_loop`` catches
         only ``(SerialException, OSError)``, so any other exception escaping
         this diagnostic publish would propagate out of the loop and end the
@@ -242,12 +366,75 @@ class SoundSpeedBridgeNode(Node):
         if self._stop_event.is_set():
             return
         self._tap_byte_count += len(data)
+        # Local copy under the lock, publish outside it: a concurrent disable
+        # can only mean this reference is torn down mid-publish, which the
+        # except below turns into a counted tap error (see
+        # _set_tap_publishing).
+        with self._tap_lock:
+            tap_pub = self._tap_pub
+        if tap_pub is None:
+            return
         try:
-            self._tap_pub.publish(UInt8MultiArray(data=data))
+            tap_pub.publish(UInt8MultiArray(data=data))
         except Exception as exc:  # noqa: B902 - see docstring
             self._tap_error_count += 1
             self.get_logger().warning(
                 f'serial_tap publish failed: {exc}', throttle_duration_sec=10.0)
+
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """
+        Apply a runtime ``serial_tap_enabled`` set to the running reader.
+
+        Applying it creates or destroys the ``serial_tap`` publisher
+        (``_set_tap_publishing``), so while the tap is off the topic is not
+        advertised — an operator's ``ros2 topic list`` shows ``serial_tap``
+        exactly when the tap is actually running.
+
+        Only ``serial_tap_enabled`` is applied here; it is the one parameter
+        this node declares as runtime-settable. Every other parameter is read
+        once in ``__init__``, and this callback deliberately does **not**
+        start rejecting runtime sets of them: that would be a behaviour change
+        beyond the scope of this issue (``garmin_sidescan``'s node does reject
+        them, and broadening the same discipline to this node is a reasonable
+        separate change). Accepting them here is exactly what rclpy already
+        did before a callback existed, so nothing regresses.
+
+        Type validation is defence in depth: rclpy rejects a type mismatch
+        against the declared BOOL type before this callback runs, but the
+        callback is the contract an operator (and a test) can rely on, so it
+        checks rather than assuming its caller already did. A non-bool is
+        rejected with a reason rather than coerced — ``bool('false')`` is
+        ``True``, so coercion would silently enable the tap for an operator
+        who typed the opposite of what they meant.
+
+        Thread-safety: the publisher swap is done under ``_tap_lock``; see
+        ``_set_tap_publishing`` for why that is its own lock and why a
+        publish racing a disable is already covered.
+        """
+        requested = None
+        for param in params:
+            if param.name != 'serial_tap_enabled':
+                continue
+            if param.type_ != Parameter.Type.BOOL:
+                reason = (
+                    f'serial_tap_enabled must be a bool, got '
+                    f'{param.type_.name.lower()}')
+                self.get_logger().warning(f'{reason}; rejected')
+                return SetParametersResult(successful=False, reason=reason)
+            requested = bool(param.value)
+
+        if requested is not None:
+            self._set_tap_publishing(requested)
+            # Logged on every accepted set, not only on a transition: the
+            # operator needs confirmation that the command landed, and a
+            # re-set to the current value is an operator asking exactly that.
+            self.get_logger().info(
+                'serial_tap ENABLED - advertising and publishing the '
+                'pre-framing wire stream'
+                if requested else
+                'serial_tap disabled - topic unadvertised, no messages will be '
+                'published (tap_byte_count keeps counting wire bytes)')
+        return SetParametersResult(successful=True)
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
         # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
@@ -376,6 +563,15 @@ class SoundSpeedBridgeNode(Node):
             # (rolker/unh_echoboats_project11#396) alongside serial_tap.
             KeyValue(key='tap_byte_count', value=str(self._tap_byte_count)),
             KeyValue(key='tap_error_count', value=str(self._tap_error_count)),
+            # Whether the tap is currently advertised and publishing.
+            # Without this key an absence of serial_tap messages in a bag is
+            # ambiguous between "the probe was silent" and "the tap was never
+            # switched on" — and since the tap now defaults to off, and its
+            # topic does not even exist while off, the second reading is the
+            # likely one. tap_byte_count separates silent from corrupt; this
+            # key separates both from not-enabled.
+            KeyValue(key='serial_tap_enabled',
+                     value=str(self._serial_tap_enabled).lower()),
             KeyValue(key='device', value=self._device),
             KeyValue(key='parser', value=self._parser_name),
         ]
