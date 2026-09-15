@@ -205,3 +205,35 @@ separation) — belongs in `marine_tools`, not the workspace repo.
 
 ### Not pushed
 No `git push`, no PR, no issues filed — the host performs those.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 09:13 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: approved
+
+**Branch**: feature/issue-77 at `6b656c6`
+**Mode**: pre-push
+**Depth**: Standard (reason: round-2 re-review of a ~100-line delta — two fix commits, `a6e4339` + `f737576` — on an already-Deep-reviewed branch; fan-out sized to the delta)
+**Must-fix**: 0 | **Suggestions**: 1
+**Round**: 2 | **Ship**: recommended — both round-1 must-fixes are closed (one fixed and mutation-verified twice independently, one deferred to the host by design), and the only remaining item is a one-line plan-list omission
+
+**Specialists**: Static Analysis (ament_flake8 + ament_pep257, run as part of the package suite — clean), Claude Adversarial Lens A (logic/test-robustness) and Lens B (systemic/consistency/lifecycle), both fresh-context on the round-2 delta. Governance and Plan Drift carried by the lead reviewer at this delta size. Copilot and Local cross-model reads off (not opted in).
+
+### Findings
+- [ ] (suggestion) The plan's test list (`plan.md` Approach step 5) records every other test, including the one added during implementation, but not `test_serial_tap_publishes_after_parser_feed` — the plan-first workflow expects the plan to stay in sync with the branch, and the ordering decision it documents (step 2, "Consequence of the ordering choice, recorded") is now guarded by a test the list does not mention; add the one bullet before push so PR review does not flag it as drift — `.agent/work-plans/issue-77/plan.md` Approach step 5
+
+### Round-1 must-fixes — status
+- **Must-fix 1 (ordering invariant untested): closed.** `test_serial_tap_publishes_after_parser_feed` (`test/test_node.py:399-448`) records a per-chunk marker sequence and asserts it exactly. It is robust, not incidental: the `feed` marker is appended *inside* `_OrderRecordingParser.feed`'s generator body, so it is timestamped when `_serial_loop` starts consuming the generator rather than when the generator object is built; and if the parser ever yielded nothing the assertion would still fail under the mutation, so the guard does not depend on a successful parse.
+- **Must-fix 2 (cross-repo bizzyboat.yaml record-list gap): still open by design** — deferred to the host at the publish checkpoint (file the `unh_echoboats_project11` follow-up and cite it in the PR body). Not actionable in this repo; not counted against this round.
+
+### Verification performed by the lead reviewer
+- Suite: 51/51 green before and after (`./sensors_ws/test.sh sound_speed_bridge`). `ament_flake8` / `ament_pep257` run inside the suite and are clean. Worktree left clean (`git status` empty).
+- **Mutation, run independently in an out-of-tree copy** (so the worktree was never modified): hoisting `self._publish_serial_tap(data)` above the `for reading in self._parser.feed(...)` loop fails exactly one test — `test_serial_tap_publishes_after_parser_feed`, at index 0 of the sequence — with all other node tests green. Lens A reproduced the same mutation independently in-tree and reverted it; both reads agree.
+- Parser trace (`AMLParser.feed`): `b'1500.123\r\r\n'` frames one reading and leaves an empty buffer (the trailing `\r` frames an empty sentence, which is skipped, and the `\n` is stripped as padding), so the test's "one feed + one sound_speed per chunk" expectation is a property of the framer, not a coincidence, and no buffer state crosses the chunk boundary.
+- `tap_byte_count` semantics: the increment sits *after* the `_stop_event` guard and *before* the publish, so a failing publish now reads as "bytes arrived, publishes failed" (the silent-probe question the counter exists to answer) while post-shutdown chunks are still uncounted — `test_serial_tap_noop_after_stop`'s `== 0` assertion is therefore still correct and needed no change. Every site describing the counters agrees: the `_publish_serial_tap` docstring (`node.py:231-237`), the `_publish_diagnostics` comment (`node.py:368-376`), `test_serial_tap_publish_failure_is_counted_not_fatal` (`test/test_node.py:355-360`), and `plan.md` steps 2/3 and the test description. The three success-path tap tests assert the same totals under both old and new semantics, so their silence is correct rather than stale.
+- Thread-safety unchanged: both counters remain single-writer (serial thread) plain ints read by the diagnostics timer — the same unlocked pattern as `_parse_error_count` / `_serial_reconnect_count`, whose rationale the plan already records. Reordering an increment past a `try` changes nothing there.
+- New test harness introduces no lifecycle hazard: it reuses `_make_node` / `_drive_serial_loop` (loop driven synchronously on the test thread, no live serial thread), swaps mocks only after `_make_node` has validated the real publishers' topic names/types, and destroys the node in a `finally`.
+
+### Adjudicated in round 1 — not re-raised
+RELIABLE QoS choice; the deliberately broad `except`; `parsers.py`'s unbounded accumulation buffer (tracked as marine_tools#78); `_handle_reading`'s lack of exception isolation (pre-existing, follow-up candidate); the transport-drop caveat wording; the `sound_speed_bridge` README; the knowledge-doc idiom candidate. All carry recorded reasons; no new evidence surfaced against any of them this round.
