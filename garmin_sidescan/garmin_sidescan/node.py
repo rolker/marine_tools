@@ -18,6 +18,7 @@ Safety: the node asserts transmit OFF at startup and never pings without an
 explicit command.  The GCV stops pinging on its own when out of the water, so
 no external sound-speed interlock is needed to protect the transducer.
 """
+import functools
 import math
 import socket
 import threading
@@ -29,7 +30,9 @@ from marine_control_py import ControlServer
 from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
 from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
 import rclpy
+from rclpy.exceptions import InvalidHandle
 from rclpy.executors import ExternalShutdownException
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -71,6 +74,39 @@ def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
     if ping_age > stale_after:
         return DiagnosticStatus.ERROR, f'transmitting but imagery stale ({ping_age:.1f}s)'
     return DiagnosticStatus.OK, f'receiving (last ping {ping_age:.1f}s ago)'
+
+
+def quiet_on_shutdown(method):
+    """
+    Wrap a node method so a context teardown under it cannot fail the process.
+
+    rclpy's SIGINT handler shuts the context down while the executor is still
+    inside ``spin()``, so a timer callback, a subscription callback or one of
+    the driver's own daemon threads can reach a publish (or the parameter-event
+    publish inside ``set_parameters()``) *after* every publisher's context has
+    gone invalid. rcl then raises ``RCLError: Failed to publish: publisher's
+    context is invalid`` -- which ``spin()`` propagates, so a deliberate stop
+    exits 1 with a traceback and is indistinguishable from a crash under
+    systemd ``Restart=on-failure``. That is the same operator-facing contract
+    ``main()`` restores below, one layer in.
+
+    Testing ``rclpy.ok()`` *before* the call would be check-then-act: the
+    shutdown can land in the gap. The call itself is therefore guarded, and
+    ``rclpy.ok()`` is consulted only afterwards, to decide what the failure
+    meant -- a shutdown in flight is returned from quietly, and a failure on a
+    live context is re-raised unchanged, so a genuine fault is still loud.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except (_rclpy.RCLError, InvalidHandle):
+            # InvalidHandle is the same condition one step later: the node has
+            # been destroyed and the publisher handle is gone.
+            if rclpy.ok(context=self.context):
+                raise
+            return None
+    return wrapper
 
 
 SIDES = ('port', 'stbd', 'down')
@@ -510,6 +546,7 @@ class GarminSidescanNode(Node):
                 f'transmit {"ON" if self._transmitting else "OFF"} ({reason})')
         self._publish_tx_state()
 
+    @quiet_on_shutdown
     def _publish_tx_state(self):
         self._pub_tx.publish(Bool(data=bool(self._transmitting)))
         # keep the operator-control mirror in sync with actual transmit state
@@ -539,6 +576,7 @@ class GarminSidescanNode(Node):
         return resp
 
     # ----- operator control set (radar-style) -------------------------------
+    @quiet_on_shutdown
     def _publish_control_set(self):
         rcs = RadarControlSet()
         status = RadarControlItem()
@@ -569,6 +607,7 @@ class GarminSidescanNode(Node):
                 rcs.items.append(item)
         self._pub_state.publish(rcs)
 
+    @quiet_on_shutdown
     def _on_control_value(self, msg):
         key, value = msg.key, msg.value
         if key == 'status':
@@ -604,6 +643,7 @@ class GarminSidescanNode(Node):
             return
         self._publish_control_set()
 
+    @quiet_on_shutdown
     def _reconcile_transmit_param(self):
         """
         Mirror actual transmit state into the `transmit` parameter.
@@ -641,6 +681,7 @@ class GarminSidescanNode(Node):
         sock.settimeout(1.0)
         return sock
 
+    @quiet_on_shutdown
     def _aux_loop(self, group, port, raw_pub, on_payload):
         """
         Listen to an auxiliary GCV multicast stream (status / config).
@@ -678,6 +719,7 @@ class GarminSidescanNode(Node):
             self._device_transmitting = tx
             self._last_status_t = time.monotonic()
 
+    @quiet_on_shutdown
     def _rx_loop(self):
         sock = None
         while self._running:
@@ -909,6 +951,7 @@ class GarminSidescanNode(Node):
         msg.image.data = bytes(samples)
         return msg
 
+    @quiet_on_shutdown
     def _publish_diagnostics(self):
         now = time.monotonic()
         ping_age = None if self._last_ping_t is None else now - self._last_ping_t
@@ -948,6 +991,7 @@ class GarminSidescanNode(Node):
         arr.status = [imagery, transmit]
         self._pub_diag.publish(arr)
 
+    @quiet_on_shutdown
     def _publish_status(self):
         self._pub_status.publish(String(data=(
             f'tx={"ON" if self._transmitting else "OFF"} '
