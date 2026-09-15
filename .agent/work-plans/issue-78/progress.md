@@ -1000,3 +1000,18 @@ the [SW4] extension and round-4 fixes (`9b4316e`, `2279c45`, `e5b618f`, `e841a54
   by #88. `garmin_sidescan/README.md`'s Transmit safety section was updated with the change
   (modulo the must-fix wording above). All 13 commits carry the agent identity; nothing
   pushed.
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 14:02 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #91 (host-inline fix for the round-6 must-fix)
+
+### Findings
+- [x] (must-fix, round 6) join budget worst case was 2× short and the startup thread was joined last while holding `_send_lock` — startup thread now joined first, budget 5.0 s (4 s connect+sendall worst case + slack), claims corrected in the constant comment, `destroy_node` docstring and README
+- [ ] (suggestion, round 6) lock-contention path untested — deferred
+- [ ] (suggestion, round 6) wedged-thread timing bracket is precautionary — deferred
+- [ ] (latent, round 6) garmin `main()` constructs outside its `try` — recorded in plan as a sixth-widening candidate for the operator
+
+garmin_sidescan: `Summary: 93 tests, 0 errors, 0 failures, 0 skipped`; layer: 341/341.
