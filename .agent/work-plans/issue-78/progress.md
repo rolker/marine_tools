@@ -750,11 +750,13 @@ are untouched by this pass.
   decode — they carry imagery and the device status flag, and `destroy_node`
   consults neither. The existing three-attempt OFF retry and its ERROR are
   unchanged — `382ddb1`
-- [x] **Bounded joins.** `SHUTDOWN_JOIN_TIMEOUT_S = 3.0`, a budget for the
+- [x] **Bounded joins.** `SHUTDOWN_JOIN_TIMEOUT_S = 5.0`, a budget for the
   **whole set** — each join gets what is left of it — so several wedged sockets
-  cannot multiply it. 3.0 s is the longest blocking call any worker can be inside
-  (`_send`'s 2.0 s TCP socket timeout, on the startup thread) plus a second of
-  scheduling slack; the two receive loops block at most on `_open_mcast`'s 1.0 s
+  cannot multiply it. 4.0 s is the longest blocking call any worker can be inside
+  (`_send`'s 2.0 s TCP socket timeout, charged once to the connect and again to
+  the `sendall`, on the startup thread) plus a second of scheduling slack;
+  *(corrected in #92: written against the earlier 3.0 s budget and a single
+  2.0 s timeout; 5.0 s is what shipped)* the two receive loops block at most on `_open_mcast`'s 1.0 s
   `settimeout`. A thread that misses the budget is named in a WARN and, being a
   daemon, dies with the process: a wedged read delays shutdown by a bounded
   interval and never hangs it — `382ddb1`
@@ -802,8 +804,10 @@ are untouched by this pass.
   SIGINT delivered 2 s in, subprocess): **exit 0, zero traceback lines**, and no
   join WARN on the way out — every thread was joined inside the budget. This is
   the [SW2]/[SW3] contract re-checked on top of the new teardown, and it is the
-  package the round-5 residual list notes has no *committed* SIGINT test (still
-  true; that residual is untouched).
+  package the round-5 residual list notes has no *committed* SIGINT test.
+  *(corrected in #92: that residual is closed — the real-SIGINT subprocess test
+  is committed for both `garmin_sidescan` and `kongsberg_em_bridge`, in each
+  package's `test/test_main_shutdown.py`.)*
 - No parameter, topic, service, message or launch change. The only new
   operator-visible output is the WARN naming a thread that missed the join
   budget, so no parameter or topic table changes. The package README's **Transmit

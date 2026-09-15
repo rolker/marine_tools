@@ -303,10 +303,13 @@ stop, bounded `join`, then `super().destroy_node()`):
   unchanged.
 - **Bounded joins**: `SHUTDOWN_JOIN_TIMEOUT_S = 5.0`, a budget for the
   **whole set** (each join gets what is left of it), so several wedged
-  sockets cannot multiply it. 3.0 s is the longest blocking call any
-  worker can be inside — `_send`'s 2.0 s TCP socket timeout on the
-  startup thread — plus a second of scheduling slack; the receive loops
-  block at most on `_open_mcast`'s 1.0 s `settimeout`. A thread that
+  sockets cannot multiply it. 4.0 s is the longest blocking call any
+  worker can be inside — `_send`'s 2.0 s TCP socket timeout applies to
+  the connect *and* again to the `sendall`, on the startup thread —
+  plus a second of scheduling slack; the receive loops block at most on
+  `_open_mcast`'s 1.0 s `settimeout`. *(corrected in #92: this arithmetic
+  was written against an earlier 3.0 s budget and counted one 2.0 s
+  timeout, not two; 5.0 s is what shipped.)* A thread that
   misses the budget is named in a WARN and, being a daemon, dies with the
   process: a wedged socket read delays shutdown by a bounded interval and
   never hangs it.
@@ -662,7 +665,7 @@ Rationale and the conflict surface:
 | **[SW2]** `main()` shutdown contract | All four nodes in the repo share the pattern, so all four are fixed in one commit; no launch file, parameter or topic changes | Yes — Scope widening |
 | **[SW3]** callback-versus-shutdown guard | `garmin_sidescan` only. No launch file, parameter, topic or service changes, and with a live context every guarded callback behaves exactly as before. The residual this row recorded — the other three nodes' publishing timers sharing the race in principle — is **no longer residual**: it is fixed as [SW4] below | Yes — Scope widening |
 | **[SW4]** the same guard on the other three nodes | One publish call site per node (`sound_speed_bridge`/`zda_serial_bridge` `_publish_diagnostics`, `kongsberg_em_bridge` `_sonar_info_heartbeat`), **plus the [SW4] extension**: `sound_speed_bridge`'s serial-thread reading path, whose body moves into `_publish_reading()` so one guard covers `sound_speed`, `raw`, `temperature`/`pressure` and the UDP error path's logging. No launch file, parameter, topic or service changes; with a live context every callback behaves exactly as before. One behaviour change, deliberate: `kongsberg_em_bridge`'s heartbeat used to swallow-and-warn **every** exception, and an RCL failure on a live context is now re-raised instead — a publisher that has stopped working mid-survey must not be papered over. No shared helper: the four packages share no Python package (`marine_tools` is `ament_cmake`/C++), so a helper would add a cross-package runtime dependency for five lines | Yes — Scope widening |
-| **[SW5]** `garmin_sidescan.destroy_node()` joins its threads | `garmin_sidescan` only. No launch file, parameter, topic, service or message change; the transmit-OFF retry and its ERROR are unchanged, and the only new operator-visible output is a WARN naming a thread that missed the join budget. Two deliberate behaviour changes: shutdown now takes up to `SHUTDOWN_JOIN_TIMEOUT_S` (3.0 s) longer when a socket read is wedged — bounded, and the threads are daemons so the process still exits — and the transmit OFF is now sent *after* the joins rather than first, which is what stops the startup thread overriding it. `self._running` is gone; nothing outside `node.py` referenced it | Yes — Scope widening |
+| **[SW5]** `garmin_sidescan.destroy_node()` joins its threads | `garmin_sidescan` only. No launch file, parameter, topic, service or message change; the transmit-OFF retry and its ERROR are unchanged, and the only new operator-visible output is a WARN naming a thread that missed the join budget. Two deliberate behaviour changes: shutdown now takes up to `SHUTDOWN_JOIN_TIMEOUT_S` (5.0 s — *corrected in #92*; 3.0 s was the value this row was written against) longer when a socket read is wedged — bounded, and the threads are daemons so the process still exits — and the transmit OFF is now sent *after* the joins rather than first, which is what stops the startup thread overriding it. `self._running` is gone; nothing outside `node.py` referenced it | Yes — Scope widening |
 | **[SW1]**/**[SW2]**/**[SW3]**/**[SW4]**/**[SW5]** fixed here rather than filed | The operator's publish-gate decision for the first four and a direct instruction for [SW5], both quoted in Scope widening; no follow-up issues filed for these five | Yes |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
 | A new node parameter | `launch/aml_svs.launch.py` | Yes — the example launch surfaces the operator-tunable parameters, so `parser_max_buffer_bytes` is added as a launch argument at its 4096 default **[PR-R1-S8]** |
