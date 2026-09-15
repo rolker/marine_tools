@@ -415,3 +415,25 @@ The deliberately broad `except` in `_publish_serial_tap`; the RELIABLE QoS choic
 
 ### Next step
 Lifecycle: **Local Review** (approved) → push / open PR → **triage-reviews**. Nothing was pushed and no PR exists; the host drives the next phase. The three suggestions are non-blocking and can be applied before the push or carried into the PR.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-09-15 12:03 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #89 at `edf2876`
+**Sources**: 3 (Copilot R1 @ `edf2876` — 2 inline + 5 suppressed, Local Review (Pre-Push) rounds 1–4 @ `8f1b254`…`47fcf09`, CI rollup)
+**Cross-source confirmations**: 1
+**CI**: all-pass (build-and-test, copilot-pull-request-reviewer)
+
+### Findings
+- [ ] (cross-confirmed: Copilot suppressed + Local Review round 4 suggestion 2) the rejected-disable test does not assert the parameter store still reads `True`, so the documented store/diagnostic divergence is pinned nowhere — `sound_speed_bridge/test/test_node.py` ~866
+- [ ] (must-fix, Copilot) `rcl_interfaces` imported at `node.py:21` but not declared in `sound_speed_bridge/package.xml`; rosdep can omit it — add `<depend>rcl_interfaces</depend>`
+- [ ] (low, Copilot) plan Design Decision 2 still says the tap publishes *before* `self._parser.feed()`; implementation and Approach say after — `plan.md:80-82`
+- [ ] (low, Copilot suppressed) plan self-check claims no diagnostics schema change; three KeyValues were added — `plan.md:534`
+- [ ] (low, Copilot suppressed) plan helper snippet publishes via `self._tap_pub` directly without the `_tap_lock` snapshot / None gate — `plan.md:318`
+- [ ] (low, Copilot suppressed) plan says the README is "worth its own issue if wanted"; it is filed as #88 — `plan.md:594`
+- [ ] (low, Copilot suppressed) progress bullet ends mid-sentence ("the parameter is") — `progress.md:273`
+
+### False positives
+- none — every Copilot finding verified against the local file at head `edf2876`.
