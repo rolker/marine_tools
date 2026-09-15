@@ -3,8 +3,10 @@ Sound speed bridge node.
 
 Reads serial data from a sound-speed sensor, publishes a ROS topic with the
 parsed reading, and optionally fans out UDP packets in configurable formats
-to downstream consumers. Diagnostics carry the live value plus health
-counters so operator UIs see both health and value.
+to downstream consumers. Two byte-level passthrough topics support post-hoc
+diagnosis from deployment bags: ``raw`` (per framed sentence) and
+``serial_tap`` (the pre-framing wire stream). Diagnostics carry the live
+value plus health counters so operator UIs see both health and value.
 """
 
 import math
@@ -104,10 +106,25 @@ class SoundSpeedBridgeNode(Node):
         # these messages does not byte-exactly reconstruct what arrived on
         # the UART, and a stream that never frames at all (e.g. wrong baud)
         # publishes nothing here. It does capture garbled-but-framed traffic
-        # in the bag for post-hoc diagnosis. See rolker/marine_tools#77 for a
-        # true byte-stream tap. Bare relative name so it sits beside
-        # sound_speed, not under the node name.
+        # in the bag for post-hoc diagnosis. The companion `serial_tap` topic
+        # below covers what this one cannot. Bare relative name so it sits
+        # beside sound_speed, not under the node name.
         self._raw_pub = self.create_publisher(UInt8MultiArray, 'raw', topic_qos)
+        # Pre-framing wire tap: every non-empty chunk ser.read() returns,
+        # published verbatim before any framing or parsing has been applied.
+        # Concatenating these messages in publish order reconstructs the UART
+        # stream byte-exactly *within one serial connection* — a reconnect
+        # (see _serial_loop) drops whatever was in flight and emits no in-band
+        # marker, so byte-exactness may only be claimed across a span in which
+        # the serial_reconnect_count diagnostic did not change. This is the
+        # topic that carries unframeable garbage (wrong baud, bus-voltage sag
+        # corrupting the line terminator), the case in which `raw` above is
+        # silent. UInt8MultiArray has no header, so bag receive time is the
+        # only time base — within one read() interval of wire arrival, which
+        # is the resolution the diagnostic question needs. Bare relative name,
+        # matching `raw`. See rolker/marine_tools#77.
+        self._tap_pub = self.create_publisher(
+            UInt8MultiArray, 'serial_tap', topic_qos)
         self._diag_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
         self._lock = threading.Lock()
@@ -116,6 +133,8 @@ class SoundSpeedBridgeNode(Node):
         self._parse_error_count = 0
         self._udp_send_error_count = 0
         self._serial_reconnect_count = 0
+        self._tap_byte_count = 0
+        self._tap_error_count = 0
         self._readings_in_window = 0
         self._window_start_ns = self.get_clock().now().nanoseconds
         self._rate_hz = 0.0
@@ -181,6 +200,12 @@ class SoundSpeedBridgeNode(Node):
                         now_ns = self.get_clock().now().nanoseconds
                         for reading in self._parser.feed(data, now_ns):
                             self._handle_reading(reading)
+                        # Diagnostic-only, deliberately after the parser feed
+                        # so the primary SoundSpeed path is never delayed or
+                        # preempted by it (same rule as the raw publish in
+                        # _handle_reading). The helper carries its own
+                        # exception isolation — see _publish_serial_tap.
+                        self._publish_serial_tap(data)
             except (serial.SerialException, OSError) as exc:
                 self._serial_connected = False
                 self._serial_reconnect_count += 1
@@ -189,6 +214,33 @@ class SoundSpeedBridgeNode(Node):
                     f'reconnect in {self._reconnect_delay:.1f}s')
                 self._stop_event.wait(self._reconnect_delay)
         self._serial_connected = False
+
+    def _publish_serial_tap(self, data: bytes) -> None:
+        """
+        Publish one pre-framing chunk of the serial stream on ``serial_tap``.
+
+        Isolated from the reader loop on purpose: ``_serial_loop`` catches
+        only ``(SerialException, OSError)``, so any other exception escaping
+        this diagnostic publish would propagate out of the loop and end the
+        serial thread permanently — no reconnect, no readings, in exactly the
+        degraded condition this tap exists to observe. A diagnostic must not
+        be able to kill the sensor, so the ``except`` is deliberately broad.
+        It is not silent: failures are counted (``tap_error_count``) and
+        logged (throttled), both visible on ``/diagnostics``.
+        """
+        # Shutdown guard, same rationale as _handle_reading's: destroy_node()'s
+        # join is best-effort (2 s) and ser.read() can block up to 1 s past it,
+        # after which the publishers may already be destroyed.
+        if self._stop_event.is_set():
+            return
+        try:
+            self._tap_pub.publish(UInt8MultiArray(data=data))
+        except Exception as exc:  # noqa: B902 - see docstring
+            self._tap_error_count += 1
+            self.get_logger().warning(
+                f'serial_tap publish failed: {exc}', throttle_duration_sec=10.0)
+            return
+        self._tap_byte_count += len(data)
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
         # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
@@ -307,6 +359,13 @@ class SoundSpeedBridgeNode(Node):
                      value=str(self._udp_send_error_count)),
             KeyValue(key='serial_reconnect_count',
                      value=str(self._serial_reconnect_count)),
+            # Aliveness of the pre-framing tap, so "the probe is silent" can be
+            # told from "the node never ran / serial_tap was not recorded"
+            # without inspecting bag content. This requires /diagnostics to be
+            # in the deployment bag record list
+            # (rolker/unh_echoboats_project11#396) alongside serial_tap.
+            KeyValue(key='tap_byte_count', value=str(self._tap_byte_count)),
+            KeyValue(key='tap_error_count', value=str(self._tap_error_count)),
             KeyValue(key='device', value=self._device),
             KeyValue(key='parser', value=self._parser_name),
         ]
