@@ -19,6 +19,11 @@ https://github.com/rolker/marine_tools/issues/78
 > operator's scope widening (below) — the two pre-existing defects the
 > reviews surfaced are now fixed on this branch, marked **[SW1]** and
 > **[SW2]**.
+>
+> Revision 5 (2026-09-15) widens the scope once more, on the same
+> operator decision: the third defect, found while verifying [SW2] and
+> until now listed as out of scope — `garmin_sidescan`'s timer callback
+> racing the context shutdown — is fixed here too, marked **[SW3]**.
 
 ## Context
 
@@ -70,17 +75,20 @@ read chunk and the sentence length, not by the stall duration — a stall of
 than anything legitimate and (b) small enough that the retained glued line
 is a diagnostic sample rather than a memory hazard.
 
-## Scope widening: two pre-existing defects, by operator decision
+## Scope widening: three pre-existing defects, by operator decision
 
-At the publish gate the operator was asked whether the two pre-existing
+At the publish gate the operator was asked whether the pre-existing
 defects the #78 reviews found should be filed as follow-ups or fixed here.
 The decision, verbatim:
 
 > "Fix those before publishing to reduce issue churn and get fixes done
 > quicker."
 
-Both are therefore in scope for this branch. Neither was introduced by
-#78; both sit on its contract, which is why the reviews raised them.
+All three are therefore in scope for this branch — [SW1] and [SW2] from
+the reviews, and [SW3], which surfaced while verifying [SW2] and was
+carried back to the operator, who applied the same standing decision to
+it. None was introduced by #78; all sit on its contract, which is why the
+reviews raised them.
 
 ### [SW1] A non-finite sentence kills the serial reader thread
 
@@ -132,6 +140,35 @@ execution to run correctly on an already-shut-down context.
 `kongsberg_em_bridge`'s `if rclpy.ok(): rclpy.shutdown()` becomes
 `try_shutdown()` as well: same intent, without the check-then-act race.
 Nothing else in those nodes changes.
+
+### [SW3] `garmin_sidescan` still exits 1 on SIGINT — one layer in
+
+Fixing `main()` was not enough for this node. Verifying [SW2] by
+execution showed `garmin_sidescan` still exiting **1** on a deliberate
+SIGINT, for a different reason: the shutdown lands while the executor is
+still inside `spin()`, so the `_reconcile_transmit_param` **timer
+callback** reaches `set_parameters()` — and the parameter-event publish
+inside it — on a context that is already down. rcl raises `RCLError:
+Failed to publish: publisher's context is invalid`, `spin()` propagates
+it, and the operator's clean stop is again a traceback and exit 1 under
+`Restart=on-failure`. The same hazard sits on every sibling callback that
+publishes (`_publish_status`, `_publish_diagnostics`, `_on_control_value`)
+and on the driver's own daemon threads, which publish imagery, nadir
+range, temperature and transmit state.
+
+Fix: a `quiet_on_shutdown` decorator on those methods. It wraps the
+**call** — a bare `if rclpy.ok()` before it would be check-then-act, and
+the shutdown can land in the gap — catching `RCLError`/`InvalidHandle`
+and consulting `rclpy.ok(context=self.context)` only afterwards, to
+decide what the failure meant: a shutdown in flight returns quietly, a
+failure on a live context is re-raised unchanged. The node's normal
+behaviour is untouched: with a live context every callback runs and
+raises exactly as before. Applied to the three timer callbacks, the
+`~/change_state` subscription callback, the two shared publish helpers
+(`_publish_tx_state`, `_publish_control_set`, which the startup daemon
+thread and the `~/set_transmit` service reach) and the two receive-loop
+thread entries (`_rx_loop`, `_aux_loop`) — where a stray `RCLError` at
+shutdown would otherwise kill a daemon thread with a traceback on stderr.
 
 ## Approach
 
@@ -395,16 +432,6 @@ Rationale and the conflict surface:
   `parser_max_buffer_bytes` parameter row **[PR-F12c]**.
 - **rolker/marine_tools#77 / PR #89** — byte-exact wire tap, the recovery
   path for bytes this cap drops.
-- **A third, distinct defect observed in `garmin_sidescan` while verifying
-  [SW2]** — with the sonar absent, a SIGINT still exits 1, but for an
-  unrelated reason: the `_reconcile_transmit_param` timer callback calls
-  `set_parameters()` after the signal handler has shut the context down,
-  and the resulting `RCLError: publisher's context is invalid` propagates
-  out of `spin()`. That is a callback-versus-shutdown race inside the
-  node, not the `main()` contract [SW2] fixes, and it predates this
-  branch. Reported to the operator rather than fixed here: the publish-gate
-  decision widened scope to the two defects the #78 reviews found, and
-  this is a third.
 
 ## Files to Change
 
@@ -421,8 +448,8 @@ Rationale and the conflict surface:
 | `zda_serial_bridge/test/test_node.py` | **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) |
 | `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | **[SW2]** same `main()` fix (its `if rclpy.ok(): rclpy.shutdown()` becomes `try_shutdown()`) |
 | `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test) |
-| `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix |
-| `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test |
+| `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix; **[SW3]** new `quiet_on_shutdown` decorator, applied to the three timer callbacks, the `~/change_state` subscription callback, `_publish_tx_state` / `_publish_control_set` and the `_rx_loop` / `_aux_loop` thread entries |
+| `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test; **[SW3]** four callback-level tests on a real shut-down `Context` — `test_reconcile_is_quiet_once_the_context_is_shut_down`, `test_a_publish_timer_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard` |
 
 ## Principles Self-Check
 
@@ -452,7 +479,8 @@ Rationale and the conflict surface:
 | `parsers.py` docstrings | Cap/resync behaviour documented beside the framing quirks | Yes — step 9 |
 | **[SW1]** parser rejects non-finite values | `parsers.py` module docstring; the Valeport/template UDP formatters were checked (they `round()` on the serial thread, which is why `RegexParser` converts `inf` to NaN rather than passing it on) and the diagnostics comparisons (a NaN last reading is already a WARN state) | Yes — Scope widening |
 | **[SW2]** `main()` shutdown contract | All four nodes in the repo share the pattern, so all four are fixed in one commit; no launch file, parameter or topic changes | Yes — Scope widening |
-| **[SW1]**/**[SW2]** fixed here rather than filed | The operator's publish-gate decision, quoted in Scope widening; no follow-up issues filed for these two | Yes |
+| **[SW3]** callback-versus-shutdown guard | `garmin_sidescan` only. No launch file, parameter, topic or service changes, and with a live context every guarded callback behaves exactly as before. **Residual, stated rather than assumed**: the other three nodes each run a publishing timer (`_publish_diagnostics`, `_sonar_info_heartbeat`) and so share the same race in principle; it was never observed on them (their real-SIGINT runs exit 0), and extending the guard there is a fourth widening the operator has not been asked for — surfaced, not assumed away | Yes — Scope widening |
+| **[SW1]**/**[SW2]**/**[SW3]** fixed here rather than filed | The operator's publish-gate decision, quoted in Scope widening; no follow-up issues filed for these three | Yes |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
 | A new node parameter | `launch/aml_svs.launch.py` | Yes — the example launch surfaces the operator-tunable parameters, so `parser_max_buffer_bytes` is added as a launch argument at its 4096 default **[PR-R1-S8]** |
 
@@ -480,7 +508,7 @@ Rationale and the conflict surface:
   Consequences.
 - The scope widening above ([SW1], [SW2]) landed as two further commits;
   [SW2] is why three packages beyond `sound_speed_bridge` appear in Files
-  to Change.
+  to Change. [SW3] landed as one more, in `garmin_sidescan` alone.
 - Verification: all four touched packages are built and tested
   (`./sensors_ws/build.sh` / `./sensors_ws/test.sh` with the four package
   names). flake8 and pep257 are part of each suite and are clean. The
