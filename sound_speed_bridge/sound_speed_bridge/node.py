@@ -15,6 +15,7 @@ from typing import List, Optional
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_interfaces.msg import SoundSpeed
 import rclpy
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import FluidPressure, Temperature
@@ -73,11 +74,24 @@ class SoundSpeedBridgeNode(Node):
         self.declare_parameter('regex_pattern', '')
         self.declare_parameter('regex_sound_speed_scale', 1.0)
         self.declare_parameter('regex_line_terminator', 'cr')
-        # Cap on each parser's unframed accumulation buffer. Static: read
-        # once here and passed to the parser factory below.
+        # Cap on each parser's unframed accumulation buffer. Read once
+        # here and handed to the parser factory below, so it is declared
+        # read-only: a field `ros2 param set` is then rejected outright
+        # rather than reporting success and changing nothing. Changing the
+        # cap means restarting the node.
         self.declare_parameter(
             'parser_max_buffer_bytes',
-            SoundSpeedParser.DEFAULT_MAX_BUFFER_BYTES)
+            SoundSpeedParser.DEFAULT_MAX_BUFFER_BYTES,
+            ParameterDescriptor(
+                read_only=True,
+                description=(
+                    'Maximum unframed residue the parser buffers, in bytes. '
+                    'Must be >= '
+                    f'{SoundSpeedParser.MIN_MAX_BUFFER_BYTES} (the serial '
+                    'read size and the longest legitimate sentence); an '
+                    'out-of-range value fails node startup rather than '
+                    'being silently clamped. Static: takes effect at '
+                    'construction only.')))
 
         self._device = self.get_parameter('device').value
         self._baud = self.get_parameter('baud').value

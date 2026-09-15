@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import rclpy
+from rclpy.parameter import Parameter
 from sound_speed_bridge.node import SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import SoundSpeedReading
 from std_msgs.msg import UInt8MultiArray
@@ -181,6 +182,25 @@ def test_parser_max_buffer_bytes_below_floor_is_rejected(mock_serial_cls):
     mock_serial_cls.return_value.__enter__.return_value = port
     with pytest.raises(ValueError, match='parser_max_buffer_bytes'):
         SoundSpeedBridgeNode()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_parser_max_buffer_bytes_is_read_only(mock_serial_cls):
+    """
+    The cap is declared read-only, so a field `ros2 param set` is rejected.
+
+    It is read once at construction and handed to the parser; a runtime set
+    that reported success and changed nothing would be worse than a refusal.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        assert node.describe_parameter('parser_max_buffer_bytes').read_only
+        result = node.set_parameters(
+            [Parameter('parser_max_buffer_bytes', Parameter.Type.INTEGER, 1024)])
+        assert not result[0].successful
+        assert node._parser._max_buffer_bytes != 1024
+    finally:
+        node.destroy_node()
 
 
 @patch('sound_speed_bridge.node.serial.Serial')
