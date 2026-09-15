@@ -137,7 +137,7 @@ def test_aml_resyncs_to_the_next_good_sentence():
 
 
 def test_aml_dropped_bytes_counts_the_resync_discard_too():
-    """
+    r"""
     Every byte that never becomes a reading is counted, not just the trim.
 
     ``buffer_dropped_bytes`` reports how much of the stream was lost, so it
