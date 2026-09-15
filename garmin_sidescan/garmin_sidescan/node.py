@@ -103,7 +103,17 @@ def quiet_on_shutdown(method):
     shutdown can land in the gap. The call itself is therefore guarded, and
     ``rclpy.ok()`` is consulted only afterwards, to decide what the failure
     meant -- a shutdown in flight is returned from quietly, and a failure on a
-    live context is re-raised unchanged, so a genuine fault is still loud.
+    live context is re-raised unchanged, so a genuine fault on a **running**
+    node is still loud.
+
+    The caveat that buys: a real RCL fault that happens to coincide with a
+    shutdown is swallowed, because after the fact the two are
+    indistinguishable -- all the guard can see is that the call failed and
+    the context is down. That is the deliberate trade. A genuine fault
+    during teardown has nowhere useful to go anyway (the node is going away
+    either way), whereas the alternative -- letting it out -- fails the
+    process on every deliberate stop, which is the condition this guard
+    exists to remove. So: loud while running, quiet while shutting down.
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
