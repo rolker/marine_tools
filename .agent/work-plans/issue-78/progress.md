@@ -114,3 +114,15 @@ with the defect.
 - [ ] Add the new diagnostics counter to `node.py`'s `_publish_diagnostics` `KeyValue` list; coordinate ordering with PR #89 (open, touches the same list) — decide stacking vs. independent-then-rebase.
 - [ ] Update `parsers.py` docstrings (module + affected classes) to describe the new cap/drop-oldest behavior alongside the existing framing-quirk documentation.
 - [ ] Pick and justify a concrete default for the new configurable max-buffer-size parameter.
+
+## Plan Authored
+**Status**: complete
+**When**: 2026-09-15 15:20 -04:00
+**By**: Claude Code Agent (Claude Sonnet)
+
+**Plan**: `.agent/work-plans/issue-78/plan.md` at `11242d6`
+**Branch**: feature/issue-78 at `11242d6`
+**Phases**: single
+
+### Open questions
+- [ ] No open questions — plan is review-plan-ready.
