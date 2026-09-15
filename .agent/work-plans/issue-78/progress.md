@@ -479,3 +479,21 @@ Governance: no parameter, topic, service, message or launch change in these thre
 - [ ] (suggestion) `quiet_on_shutdown` decides "shutdown in flight" vs "genuine fault" from `rclpy.ok()` *after* the fact, not from what raised, so an unrelated real `RCLError` that happens to coincide with a shutdown is swallowed. That is the right trade, but the docstring states it more strongly than it holds ("a failure on a live context is re-raised unchanged, so a genuine fault is still loud") — a one-line caveat would keep the doc honest — `garmin_sidescan/garmin_sidescan/node.py:79`
 - [ ] (suggestion) `sound_speed_bridge` and `zda_serial_bridge` each got a real-SIGINT subprocess guard, but `kongsberg_em_bridge` and `garmin_sidescan` have only the in-process `ExternalShutdownException` test — and `garmin_sidescan` is the node where the shutdown race was actually observed. The SIGINT run does not discriminate the SW3 fix (stated in the implementation entry, correctly), but it would pin the SW2 exit-code contract against future regression in those two packages for ~10 lines — `kongsberg_em_bridge/test/test_main_shutdown.py`, `garmin_sidescan/test/test_main_shutdown.py`
 - [ ] (suggestion) `e6e1888` bundles two logical changes: the four-package SW2 shutdown fix and the round-3 suggestion-2 regression test `test_a_valueerror_from_spin_is_not_reported_as_a_start_failure`, which pins the *round-2* except-scope fix and has nothing to do with the shutdown contract. Cosmetic against AGENTS.md's atomic-commit rule; not worth a rewrite this late — noted so it is not repeated
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-09-15 12:24 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #91 at `ff6b62f`
+**Sources**: 3 (Copilot R1 @ `ff6b62f` — 2 inline + 1 suppressed; Local Review (Pre-Push) rounds 1–4; CI rollup). Copilot's first attempt @ `bbaf25c` errored with no content.
+**Cross-source confirmations**: 0
+**CI**: all-pass (build-and-test, copilot-pull-request-reviewer)
+
+### Findings
+- [x] (must-fix, Copilot) finite-but-huge capture (`1e306`) passes the parser's finiteness check, then `round(value * 1000)` in the Valeport/template formatter overflows on the serial thread — reject a non-finite mm/s product at the parser and guard both formatters — `parsers.py:389`, `sinks.py` — fixed inline, tests on parser + both formatters
+- [x] (low, Copilot) PR body still asked for confirmation of the [SW3] garmin widening after the plan recorded the operator's "garmin fix is ok" — PR body updated to match
+- [x] (low, Copilot suppressed) floor docstring claimed 256 B is the longest legitimate sentence for any configured parser; `regex_pattern` bounds nothing — reworded: the floor is the read size, the cap must exceed the configured protocol's longest line — `parsers.py:118`
+
+### False positives
+- none.
