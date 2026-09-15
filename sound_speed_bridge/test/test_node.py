@@ -755,3 +755,50 @@ def test_enabling_twice_keeps_the_same_publisher(mock_serial_cls):
         assert node._tap_pub is None
     finally:
         node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_enabled_at_launch_needs_no_runtime_set(mock_serial_cls):
+    """
+    `serial_tap_enabled:=true` at launch advertises and publishes immediately.
+
+    Every other tap test constructs the node with the default and switches
+    the tap on afterwards through set_parameters, so without this one the
+    launch-time path — __init__ reading the parameter and calling
+    _set_tap_publishing — is asserted by prose only: deleting that call
+    leaves the rest of the suite green while shipping a boat whose
+    `serial_tap_enabled:=true` in a launch file silently advertises nothing.
+
+    SoundSpeedBridgeNode.__init__ forwards no parameter_overrides, so the
+    override is supplied the way a launch file supplies it — as a global ROS
+    argument on the context the node is constructed in, which means
+    re-initialising the autouse fixture's context here.
+    """
+    rclpy.shutdown()
+    rclpy.init(args=['--ros-args', '-p', 'serial_tap_enabled:=true'])
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    node = SoundSpeedBridgeNode()
+    try:
+        node._stop_event.set()
+        node._serial_thread.join(timeout=2.0)
+        assert not node._serial_thread.is_alive()
+        node._stop_event.clear()
+        # Enabled by construction alone: no set_parameters call has run.
+        assert node.get_parameter('serial_tap_enabled').value is True
+        assert node._serial_tap_enabled is True
+        assert node._tap_pub is not None
+        # Same external contract the runtime enable path is held to.
+        assert node._tap_pub.topic_name == '/serial_tap'
+        assert node._tap_pub.msg_type is UInt8MultiArray
+        # ...and it publishes the very first chunk off the wire, so an
+        # operator who launched with the tap on loses no bytes waiting for a
+        # parameter set that never comes.
+        node._tap_pub = MagicMock()
+        chunk = b'1500.123\r\r\n'
+        _drive_serial_loop(node, mock_serial_cls, [chunk])
+        assert node._tap_pub.publish.call_count == 1
+        assert bytes(node._tap_pub.publish.call_args.args[0].data) == chunk
+    finally:
+        node.destroy_node()
