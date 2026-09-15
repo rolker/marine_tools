@@ -278,13 +278,22 @@ class AMLParser(SoundSpeedParser):
         ending the sensor feed. A sentence that cannot yield a finite
         number is a parse failure like any other: NaN, raw bytes preserved,
         counted by the node's parse-error path.
+
+        The finiteness test is on the **mm/s product**, matching
+        :class:`RegexParser`: ``1e306`` m/s is a perfectly finite float, but
+        ``1e306 * 1000`` is ``inf``, and mm/s is what the downstream sinks
+        render -- ``format_template``'s ``{value_mm_s}`` would interpolate
+        ``inf`` and ``round()`` would raise ``OverflowError``, both on the
+        serial thread. Rejecting the product here also keeps ``raw_mm_s``
+        (an exact Decimal-derived integer that would *not* have raised)
+        from carrying a value the float path has already disowned.
         """
         value = float('nan')
         raw_mm_s: Optional[int] = None
         try:
             decimal_value = Decimal(stripped.decode('ascii'))
             parsed = float(decimal_value)
-            if math.isfinite(parsed):
+            if math.isfinite(parsed) and math.isfinite(parsed * 1000.0):
                 value = parsed
                 raw_mm_s = int(decimal_value * 1000)
         except (UnicodeDecodeError, InvalidOperation, ValueError, OverflowError):

@@ -235,6 +235,25 @@ def test_aml_non_finite_sentence_is_a_parse_failure(text):
     assert r.raw_bytes == text.encode('ascii') + b'\r'
 
 
+@pytest.mark.parametrize('text', ['1e306', '-1e306', '1e308'])
+def test_aml_finite_value_with_a_non_finite_mm_s_product_is_a_parse_failure(text):
+    """
+    A value finite in m/s but infinite in mm/s is a parse failure, like RegexParser.
+
+    1e306 m/s converts to a perfectly finite float, so a finiteness test on
+    the value alone passes it through -- and the exact Decimal-derived
+    raw_mm_s comes with it. Downstream, mm/s is what the sinks render:
+    format_template's {value_mm_s} would interpolate `inf` into the
+    datagram, and round() of the product raises OverflowError, both on the
+    serial thread where nothing catches it.
+    """
+    p = AMLParser()
+    readings = _readings(p, text.encode('ascii') + b'\r\r\n')
+    assert len(readings) == 1
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[0].raw_mm_s is None
+
+
 def test_aml_keeps_framing_after_a_non_finite_sentence():
     """The stream recovers: the next good sentence parses normally."""
     p = AMLParser()

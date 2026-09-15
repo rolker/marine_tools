@@ -39,15 +39,21 @@ def format_valeport(
     the float.
     """
     del template, ctx  # unused
-    if reading.raw_mm_s is None:
-        product = reading.sound_speed_m_s * 1000
-        if not math.isfinite(product):
-            # NaN (parse failure) or an overflow to inf: round() would raise
-            # OverflowError on the serial thread. Both mean "nothing to send".
-            return None
-        mm_s = round(product)
-    else:
+    # The mm/s product is validated *unconditionally*, before the raw-integer
+    # path is chosen: a reading can be finite as m/s and non-finite as mm/s
+    # (1e306 m/s is 1e309 mm/s == inf), and a parser bug or a future parser
+    # could pair such a value with a populated raw_mm_s -- which would then
+    # bypass the guard entirely. A non-finite product means "nothing to send"
+    # however the integer would have been obtained.
+    product = reading.sound_speed_m_s * 1000
+    if not math.isfinite(product):
+        # NaN (parse failure) or an overflow to inf: round() would raise
+        # OverflowError on the serial thread. Both mean "nothing to send".
+        return None
+    if reading.raw_mm_s is not None:
         mm_s = reading.raw_mm_s
+    else:
+        mm_s = round(product)
     if mm_s < 0 or mm_s > 9999999:
         return None
     return f' {mm_s:7d}\r\n'.encode('ascii')
@@ -89,22 +95,22 @@ def format_template(
     not naturally embed control chars; this formatter receives the already-
     decoded form and only does ``str.format`` substitution.
 
-    Skips NaN readings.
+    Skips readings whose mm/s product is not finite.
     """
     if not template:
         return None
-    if math.isnan(reading.sound_speed_m_s):
-        # Documented contract: a NaN reading is never rendered, whether or
-        # not an integer mm/s value happens to accompany it.
+    # Unconditional, and *before* the raw-integer path is chosen. Two cases
+    # it must catch whether or not raw_mm_s is populated: a NaN reading is
+    # never rendered (documented contract), and a finite-but-huge one
+    # (1e306 m/s) has a non-finite mm/s product -- which round() would raise
+    # OverflowError on, and which `{value_mm_s}` would happily interpolate
+    # into the datagram as `inf`. Both happen on the serial thread.
+    product = reading.sound_speed_m_s * 1000.0
+    if not math.isfinite(product):
         return None
     if reading.raw_mm_s is not None:
         int_mm_s = reading.raw_mm_s
     else:
-        product = reading.sound_speed_m_s * 1000
-        if not math.isfinite(product):
-            # NaN (parse failure) or an overflow to inf: round() would
-            # raise OverflowError on the serial thread.
-            return None
         int_mm_s = round(product)
     frame_id = ''
     if isinstance(ctx, dict):
@@ -112,7 +118,7 @@ def format_template(
     try:
         rendered = template.format(
             value=reading.sound_speed_m_s,
-            value_mm_s=reading.sound_speed_m_s * 1000.0,
+            value_mm_s=product,
             value_int_mm_s=int_mm_s,
             stamp=reading.receive_time_ns / 1e9,
             frame_id=frame_id,

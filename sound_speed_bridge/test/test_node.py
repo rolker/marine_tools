@@ -472,9 +472,15 @@ def test_serial_thread_survives_a_non_finite_sentence(mock_serial_cls):
     ValueError/OverflowError out of feed() ends the daemon thread with
     _serial_connected still True -- the node reports a live serial link
     and never publishes another reading, for the rest of the deployment.
+
+    ``1e306`` is the finite-in-m/s, infinite-in-mm/s case: it survives a
+    finiteness test on the value alone, and its exact Decimal ``raw_mm_s``
+    then rides downstream into ``round()``/``{value_mm_s}`` on this same
+    thread.
     """
     port = _serial_port_replaying(
-        [b'nan\r\r\n', b'inf\r\r\n', b'1e999\r\r\n', b'1500.500\r\r\n'])
+        [b'nan\r\r\n', b'inf\r\r\n', b'1e999\r\r\n', b'1e306\r\r\n',
+         b'1500.500\r\r\n'])
     mock_serial_cls.return_value.__enter__.return_value = port
     node = SoundSpeedBridgeNode()
     try:
@@ -491,7 +497,7 @@ def test_serial_thread_survives_a_non_finite_sentence(mock_serial_cls):
         assert last is not None, 'no reading published; the thread died'
         assert last.sound_speed_m_s == 1500.5
         assert last.raw_mm_s == 1500500
-        assert node._parse_error_count == 3
+        assert node._parse_error_count == 4
     finally:
         node.destroy_node()
 
