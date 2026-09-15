@@ -259,6 +259,32 @@ def test_parser_max_buffer_bytes_is_read_only(mock_serial_cls):
 
 
 @patch('sound_speed_bridge.node.serial.Serial')
+def test_main_reports_a_wrong_typed_parameter_and_shuts_down(mock_serial_cls):
+    """
+    An override of the wrong ROS type is the same refused start.
+
+    rclpy raises InvalidParameterTypeException at declaration, before our
+    own validation runs; it must reach the same one FATAL line and exit 1.
+    """
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    rclpy.shutdown()
+    logger = MagicMock()
+    try:
+        with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+                   return_value=logger):
+            with pytest.raises(SystemExit) as excinfo:
+                main(args=['--ros-args',
+                           '-p', 'parser_max_buffer_bytes:=4096.0'])
+        assert excinfo.value.code == 1
+        assert not rclpy.ok()
+        assert 'parser_max_buffer_bytes' in logger.fatal.call_args.args[0]
+    finally:
+        rclpy.init()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
 def test_main_reports_a_rejected_parameter_and_shuts_down(mock_serial_cls):
     """
     A refused parameter exits 1 through one FATAL line, not a traceback.

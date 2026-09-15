@@ -20,7 +20,7 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_interfaces.msg import SoundSpeed
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 import rclpy
-from rclpy.exceptions import InvalidHandle
+from rclpy.exceptions import InvalidHandle, InvalidParameterTypeException
 from rclpy.executors import ExternalShutdownException
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
@@ -648,7 +648,11 @@ class SoundSpeedBridgeNode(Node):
             # mid-deployment is still loud. Non-RCL exceptions are
             # deliberately not caught — a formatter or socket bug must still
             # surface.
-            if not rclpy.ok(context=self.context):
+            # The stop event counts as teardown too: destroy_node() sets it,
+            # joins the reader for 2 s best-effort, then destroys the
+            # publishers -- a read that outlives that join publishes into
+            # InvalidHandle with the context still live.
+            if not rclpy.ok(context=self.context) or self._stop_event.is_set():
                 return
             raise
 
@@ -870,7 +874,11 @@ def main(args=None) -> None:
     try:
         try:
             node = SoundSpeedBridgeNode()
-        except ValueError as exc:
+        except (ValueError, InvalidParameterTypeException) as exc:
+            # ValueError: our own validation (parser name, buffer cap).
+            # InvalidParameterTypeException: rclpy rejecting an override of
+            # the wrong ROS type (e.g. parser_max_buffer_bytes:=4096.0)
+            # before our validation ever runs -- the same refused start.
             rclpy.logging.get_logger('sound_speed_bridge').fatal(
                 f'sound_speed_bridge failed to start: {exc}')
             raise SystemExit(1) from exc

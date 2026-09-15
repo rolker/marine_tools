@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import rclpy
 from rclpy.context import Context
+from rclpy.exceptions import InvalidHandle
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from sound_speed_bridge.node import SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import SoundSpeedReading
@@ -262,6 +263,27 @@ def test_the_serial_loop_survives_a_shutdown_race_on_a_publish(mock_serial_cls):
         SoundSpeedBridgeNode._serial_loop(proxy)   # must not raise
         assert not remaining, 'the reader loop died on the first publish'
         assert proxy._pub.publish.call_count == len(chunks)
+    finally:
+        node._stop_event.set()
+        ctx.try_shutdown()
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_a_late_reading_after_our_own_stop_is_quiet_on_a_live_context(mock_serial_cls):
+    """
+    A late read after our own stop must not end the reader with a traceback.
+
+    A read that outlives destroy_node()'s 2 s join publishes into a
+    destroyed handle while the context is still live; the stop event marks
+    it as teardown rather than a fault.
+    """
+    node = _node(mock_serial_cls)
+    ctx = _context(live=True)
+    proxy = _ReadingProxy(node, ctx, InvalidHandle('publisher handle destroyed'))
+    try:
+        proxy._stop_event.set()
+        assert SoundSpeedBridgeNode._handle_reading(proxy, _reading()) is None
     finally:
         node._stop_event.set()
         ctx.try_shutdown()
