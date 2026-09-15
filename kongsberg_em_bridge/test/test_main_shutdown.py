@@ -28,6 +28,8 @@ has been shut down, with the publish raising the exact rcl error the field
 shows. ``garmin_sidescan`` carries the same guard as a decorator.
 """
 
+import subprocess
+import sys
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -135,3 +137,70 @@ def test_a_non_rcl_error_is_still_warned_and_not_propagated():
         assert node.get_logger.return_value.warning.call_count == 1
     finally:
         ctx.try_shutdown()
+
+
+# ----- a real SIGINT to the real entry point --------------------------------
+
+# Mirrors the harness `sound_speed_bridge` and `zda_serial_bridge` carry: the
+# console entry point is run for real in a subprocess with only its I/O mocked,
+# because the behaviour under test *is* signal delivery -- an in-process test
+# cannot reproduce rclpy's own signal handler tearing the context down while
+# the executor is still inside spin(). The UDP receive socket raises
+# socket.timeout (the real exception class, which _recv_loop treats as "no
+# datagram this 0.5 s"), so the receive thread runs its genuine loop and
+# nothing binds a real port -- a bind would make the test depend on 20002
+# being free on the runner.
+_SIGINT_HARNESS = """
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import kongsberg_em_bridge.node as node_mod
+
+
+def _recvfrom(*args, **kwargs):
+    time.sleep(0.05)
+    raise socket.timeout()
+
+
+def _fake_socket(*args, **kwargs):
+    sock = MagicMock()
+    sock.recvfrom.side_effect = _recvfrom
+    sock.__enter__.return_value = sock
+    sock.__exit__.return_value = False
+    return sock
+
+
+def _interrupt():
+    time.sleep(2.0)
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+threading.Thread(target=_interrupt, daemon=True).start()
+with patch.object(node_mod.socket, 'socket', _fake_socket):
+    sys.exit(node_mod.main())
+"""
+
+
+def test_sigint_exits_zero_without_a_traceback(tmp_path):
+    """
+    A real SIGINT to the console entry point exits 0 and prints no traceback.
+
+    The in-process tests above pin ``main()`` and the heartbeat guard
+    separately, each with the node or the context stood in for. This one
+    runs the whole thing: the real entry point, the real node, the real
+    receive thread, and a real signal.
+    """
+    script = tmp_path / 'sigint_main.py'
+    script.write_text(_SIGINT_HARNESS)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f'exit {proc.returncode}\n{combined}'
+    assert 'Traceback' not in combined, combined
+    assert 'rcl_shutdown already called' not in combined, combined

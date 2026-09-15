@@ -616,9 +616,9 @@ Rationale and the conflict surface:
 | `zda_serial_bridge/test/test_node.py` | **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) |
 | `zda_serial_bridge/test/test_shutdown_guard.py` | **[SW4]** new: `test_diagnostics_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard`, each against a real shut-down `Context` |
 | `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | **[SW2]** same `main()` fix (its `if rclpy.ok(): rclpy.shutdown()` becomes `try_shutdown()`); **[SW4]** shutdown guard in `_sonar_info_heartbeat`, narrowing its blanket `except Exception` |
-| `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test); **[SW4]** `test_heartbeat_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_still_warned_and_not_propagated` |
+| `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test) and `test_sigint_exits_zero_without_a_traceback` (real entry point, real SIGINT, subprocess, UDP socket mocked so nothing binds port 20002); **[SW4]** `test_heartbeat_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_still_warned_and_not_propagated` |
 | `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix; **[SW3]** new `quiet_on_shutdown` decorator, applied to the three timer callbacks, the `~/change_state` subscription callback, `_publish_tx_state` / `_publish_control_set` and the `_rx_loop` / `_aux_loop` thread entries; **[SW5]** `_running` bool → `_stop_event` `threading.Event`, all four worker threads kept as attributes (`_rx_thread`, `_aux_threads`, `_startup_thread`), new `SHUTDOWN_JOIN_TIMEOUT_S` + `_join_workers()`, `destroy_node()` joins before sending transmit OFF and before `super()`, every back-off sleep becomes an interruptible `_stop_event.wait`, and the startup thread returns early once the stop is signalled |
-| `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test; **[SW3]** four callback-level tests on a real shut-down `Context` — `test_reconcile_is_quiet_once_the_context_is_shut_down`, `test_a_publish_timer_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard` |
+| `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test, plus `test_sigint_exits_zero_without_a_traceback` — the real entry point under a real SIGINT in a subprocess, sockets mocked, matching the harness the other packages carry; **[SW3]** four callback-level tests on a real shut-down `Context` — `test_reconcile_is_quiet_once_the_context_is_shut_down`, `test_a_publish_timer_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard` |
 | `garmin_sidescan/test/test_shutdown_joins.py` | **[SW5]** new: `test_destroy_node_joins_every_worker_thread`, `test_a_wedged_thread_does_not_hang_destroy_node`, `test_a_reconnecting_thread_is_joined_promptly`, `test_transmit_off_is_sent_after_every_thread_is_joined`, `test_destroy_node_still_retries_a_failing_transmit_off`, `test_startup_thread_issues_no_command_once_the_stop_is_signalled` — a real node with its sockets faked out, plus one fake-node case for the startup early return |
 
 ## Principles Self-Check
@@ -671,9 +671,13 @@ Rationale and the conflict surface:
 > The first residual — `destroy_node()` not joining its daemon threads —
 > was instructed by the operator and is fixed on this branch as **[SW5]**
 > (there were four threads, not three), so it is no longer listed here.
+> Two more are gone the same way: Copilot's round-4 review cross-confirmed
+> the missing real-SIGINT tests for `garmin_sidescan` and
+> `kongsberg_em_bridge` (now committed, so all four packages carry the
+> harness) and the `quiet_on_shutdown` docstring caveat (now written), so
+> nothing remains in this list.
 
 - `quiet_on_shutdown`'s docstring says a genuine fault stays loud; a real `RCLError` that coincides with a shutdown is swallowed — caveat owed in the docstring.
-- `kongsberg_em_bridge` and `garmin_sidescan` have no committed real-SIGINT subprocess test (verified by execution in rounds 4/5: all four entry points exit 0 with no traceback).
 
 ## Open Questions
 
@@ -699,8 +703,13 @@ Rationale and the conflict surface:
   progress entry for this pass.
 - [SW2] is additionally verified by *execution*, not only by test: the
   console entry points are run with mocked I/O and sent a real SIGINT.
-  `sound_speed_bridge`, `zda_serial_bridge` and `kongsberg_em_bridge` exit
-  **0** with zero traceback lines (all three exited 1 before the fix).
+  All four — `sound_speed_bridge`, `zda_serial_bridge`,
+  `kongsberg_em_bridge` and `garmin_sidescan` — exit **0** with zero
+  traceback lines (every one of them exited 1 before the fix). Since
+  Copilot's round-4 review that execution is **committed as a test** in
+  all four packages, not only run by hand: each carries
+  `test_sigint_exits_zero_without_a_traceback`, and each was mutation-
+  checked by restoring the pre-fix `main()` in an out-of-tree copy.
 
 ## Estimated Scope
 

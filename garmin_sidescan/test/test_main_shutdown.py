@@ -23,6 +23,8 @@ directly with a genuinely shut-down context, since the race itself is not
 reproducible on demand.
 """
 
+import subprocess
+import sys
 import threading
 import types
 from unittest.mock import patch
@@ -160,3 +162,74 @@ def test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard():
             GarminSidescanNode._publish_status(node)
     finally:
         ctx.try_shutdown()
+
+
+# ----- a real SIGINT to the real entry point --------------------------------
+
+# Mirrors the harness `sound_speed_bridge` and `zda_serial_bridge` carry: the
+# console entry point is run for real in a subprocess with only its I/O mocked,
+# because the behaviour under test *is* signal delivery -- an in-process test
+# cannot reproduce rclpy's own signal handler tearing the context down while
+# the executor is still inside spin(). The multicast receive sockets raise
+# socket.timeout (the real exception class, which _rx_loop/_aux_loop treat as
+# "no datagram this second"), so the driver's four worker threads run their
+# genuine loops with no network. The TCP control socket is the same MagicMock,
+# so the startup command and the shutdown transmit-OFF "succeed" without a GCV
+# on the wire.
+_SIGINT_HARNESS = """
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import garmin_sidescan.node as node_mod
+
+
+def _recvfrom(*args, **kwargs):
+    time.sleep(0.05)
+    raise socket.timeout()
+
+
+def _fake_socket(*args, **kwargs):
+    sock = MagicMock()
+    sock.recvfrom.side_effect = _recvfrom
+    sock.__enter__.return_value = sock
+    sock.__exit__.return_value = False
+    return sock
+
+
+def _interrupt():
+    time.sleep(3.0)
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+threading.Thread(target=_interrupt, daemon=True).start()
+with patch.object(node_mod.socket, 'socket', _fake_socket):
+    sys.exit(node_mod.main())
+"""
+
+
+def test_sigint_exits_zero_without_a_traceback(tmp_path):
+    """
+    A real SIGINT to the console entry point exits 0 and prints no traceback.
+
+    This node is the one where the callback-versus-shutdown race was actually
+    observed, so the end-to-end contract -- Ctrl-C is exit 0, silently -- is
+    pinned by execution and not only by the per-callback guard tests above.
+    Both fixes are under test at once: ``main()``'s
+    ``ExternalShutdownException``/``try_shutdown()`` handling, and the
+    ``quiet_on_shutdown`` guard on the timer, subscription and thread entry
+    points that keep running while the context is being torn down.
+    """
+    script = tmp_path / 'sigint_main.py'
+    script.write_text(_SIGINT_HARNESS)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f'exit {proc.returncode}\n{combined}'
+    assert 'Traceback' not in combined, combined
+    assert 'rcl_shutdown already called' not in combined, combined
