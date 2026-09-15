@@ -30,6 +30,12 @@ https://github.com/rolker/marine_tools/issues/78
 > operator decision: the third defect, found while verifying [SW2] and
 > until now listed as out of scope — `garmin_sidescan`'s timer callback
 > racing the context shutdown — is fixed here too, marked **[SW3]**.
+>
+> Revision 7 (2026-09-15) widens the scope a fifth time, on a **fresh**
+> explicit operator instruction rather than the standing decision:
+> `garmin_sidescan`'s `destroy_node()` does not join its daemon threads.
+> Marked **[SW5]**; it was the first entry of the round-5 residual list,
+> which now no longer carries it.
 
 ## Context
 
@@ -81,7 +87,7 @@ read chunk and the sentence length, not by the stall duration — a stall of
 than anything legitimate and (b) small enough that the retained glued line
 is a diagnostic sample rather than a memory hazard.
 
-## Scope widening: four pre-existing defects, by operator decision
+## Scope widening: five pre-existing defects, by operator decision
 
 At the publish gate the operator was asked whether the pre-existing
 defects the #78 reviews found should be filed as follow-ups or fixed here.
@@ -90,17 +96,19 @@ The decision, verbatim:
 > "Fix those before publishing to reduce issue churn and get fixes done
 > quicker."
 
-All four are therefore in scope for this branch — [SW1] and [SW2] from
-the reviews, [SW3], which surfaced while verifying [SW2], and [SW4], the
-residual [SW3] recorded. The operator's quoted decision was given for
-[SW1]/[SW2]; the host orchestrator applied that standing decision to
-[SW3] on its own judgement, and the operator confirmed it after the PR
-was opened (2026-09-15: "garmin fix is ok"). [SW4] is the same class of
-fix as the [SW3] the operator confirmed, and Copilot's PR review raised it
+All five are therefore in scope for this branch — [SW1] and [SW2] from
+the reviews, [SW3], which surfaced while verifying [SW2], [SW4], the
+residual [SW3] recorded, and [SW5], the first residual of pre-push round
+5. The operator's quoted decision was given for [SW1]/[SW2]; the host
+orchestrator applied that standing decision to [SW3] on its own
+judgement, and the operator confirmed it after the PR was opened
+(2026-09-15: "garmin fix is ok"). [SW4] is the same class of fix as the
+[SW3] the operator confirmed, and Copilot's PR review raised it
 independently (round 3, twice), cross-confirming the round-4 local review's
 own residual — so the host applied the standing decision to it as well.
-None was introduced by #78; all sit on its contract, which is why the
-reviews raised them.
+[SW5] needed no standing decision: the operator instructed it directly
+(quoted in its own section below). None was introduced by #78; all sit on
+its contract, which is why the reviews raised them.
 
 ### [SW1] A non-finite sentence kills the serial reader thread
 
@@ -214,6 +222,74 @@ one, re-raised on a live one — a publisher that has stopped working
 mid-survey is not something a heartbeat should paper over), and any other
 exception keeps the previous throttled-warning behaviour, so a non-RCL bug
 still cannot kill the node.
+
+### [SW5] `garmin_sidescan.destroy_node()` does not join its daemon threads
+
+Raised as a suggestion by pre-push rounds 4 and 5 and then instructed
+directly by the operator (2026-09-15):
+
+> "fix the garmin's destroy_node issue"
+
+`destroy_node()` set `self._running = False`, sent transmit OFF and called
+`super().destroy_node()` without waiting for any of the node's **four**
+daemon threads: `_rx_thread` (`gcv_rx`), the two `_aux_loop` listeners
+(`gcv_status`, `gcv_config`) and the startup thread (`gcv_startup`). Two
+of them were anonymous — started and never referenced — so they could not
+have been joined even if the code had tried.
+
+Every one of them publishes: imagery, nadir range and water temperature
+from `_rx_loop`, the raw status/config captures from the aux loops,
+transmit state from the startup thread. A thread still running when the
+node's publishers are destroyed therefore keeps working against a
+torn-down node — and [SW3]'s `quiet_on_shutdown` makes that *quiet* on a
+dead context, which is right for a signal teardown and wrong as a way to
+leave a thread running. Worse, the startup thread issues **commands**: a
+`transmit_on_startup` ON sent after the shutdown OFF leaves the sonar
+pinging unattended, which is the one failure this node's shutdown path
+exists to prevent.
+
+Fix, following `sound_speed_bridge`'s pattern (`node.py:789-796`: signal
+stop, bounded `join`, then `super().destroy_node()`):
+
+- **One stop signal.** `self._running` (a bool checked only at the top of
+  each loop) becomes `self._stop_event`, a `threading.Event` — the same
+  name and shape as `sound_speed_bridge`'s serial thread. The bool could
+  not unblock anything; the event can, and there is no second flag to
+  fall out of step with it.
+- **Every thread is an attribute** (`_rx_thread`, `_aux_threads`,
+  `_startup_thread`), so it can be joined.
+- **Ordering: joins first, transmit OFF after them, `super()` last.** The
+  OFF is sent after the joins so it is the last command on the wire and
+  the startup thread cannot override it. Nothing is lost by waiting: an
+  OFF is confirmed by `_send`'s own TCP `sendall` (a 2 s-timeout socket
+  opened per command), not by anything the receive loops decode — they
+  carry imagery and the device status flag, and `destroy_node` consults
+  neither. The existing three-attempt OFF retry and its ERROR are
+  unchanged.
+- **Bounded joins**: `SHUTDOWN_JOIN_TIMEOUT_S = 3.0`, a budget for the
+  **whole set** (each join gets what is left of it), so several wedged
+  sockets cannot multiply it. 3.0 s is the longest blocking call any
+  worker can be inside — `_send`'s 2.0 s TCP socket timeout on the
+  startup thread — plus a second of scheduling slack; the receive loops
+  block at most on `_open_mcast`'s 1.0 s `settimeout`. A thread that
+  misses the budget is named in a WARN and, being a daemon, dies with the
+  process: a wedged socket read delays shutdown by a bounded interval and
+  never hangs it.
+- **Unblocking, by shortening the blocking interval rather than closing
+  the socket.** The receive loops already cap their blocking read at the
+  1.0 s socket timeout, so they need nothing; what stalled them was the
+  *back-off*, a plain `time.sleep(2.0)` on the multicast-rejoin path
+  (`_rx_loop`, `_aux_loop`) and `time.sleep(0.3)` between the startup
+  OFF repeats. Those become `self._stop_event.wait(...)`, which returns
+  the moment the stop is signalled. Closing the sockets from
+  `destroy_node()` was rejected: they are locals owned by the loops,
+  which close and reopen them on every `OSError`, so a cross-thread close
+  would race the reopen and hand the loop a closed fd — with no benefit,
+  since the 1.0 s timeout already bounds the read.
+- **The startup thread returns early** once the stop is signalled, before
+  its range command and before a `transmit_on_startup` ON, so a shutdown
+  landing mid-startup cannot put a command on the wire behind the
+  shutdown OFF.
 
 ## Approach
 
@@ -506,8 +582,9 @@ Rationale and the conflict surface:
 | `zda_serial_bridge/test/test_shutdown_guard.py` | **[SW4]** new: `test_diagnostics_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard`, each against a real shut-down `Context` |
 | `kongsberg_em_bridge/kongsberg_em_bridge/node.py` | **[SW2]** same `main()` fix (its `if rclpy.ok(): rclpy.shutdown()` becomes `try_shutdown()`); **[SW4]** shutdown guard in `_sonar_info_heartbeat`, narrowing its blanket `except Exception` |
 | `kongsberg_em_bridge/test/test_main_shutdown.py` | **[SW2]** new: `test_main_returns_cleanly_on_an_external_shutdown` (node mocked; only `main()` is under test); **[SW4]** `test_heartbeat_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_still_warned_and_not_propagated` |
-| `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix; **[SW3]** new `quiet_on_shutdown` decorator, applied to the three timer callbacks, the `~/change_state` subscription callback, `_publish_tx_state` / `_publish_control_set` and the `_rx_loop` / `_aux_loop` thread entries |
+| `garmin_sidescan/garmin_sidescan/node.py` | **[SW2]** same `main()` fix; **[SW3]** new `quiet_on_shutdown` decorator, applied to the three timer callbacks, the `~/change_state` subscription callback, `_publish_tx_state` / `_publish_control_set` and the `_rx_loop` / `_aux_loop` thread entries; **[SW5]** `_running` bool → `_stop_event` `threading.Event`, all four worker threads kept as attributes (`_rx_thread`, `_aux_threads`, `_startup_thread`), new `SHUTDOWN_JOIN_TIMEOUT_S` + `_join_workers()`, `destroy_node()` joins before sending transmit OFF and before `super()`, every back-off sleep becomes an interruptible `_stop_event.wait`, and the startup thread returns early once the stop is signalled |
 | `garmin_sidescan/test/test_main_shutdown.py` | **[SW2]** new: same minimal `main()`-level test; **[SW3]** four callback-level tests on a real shut-down `Context` — `test_reconcile_is_quiet_once_the_context_is_shut_down`, `test_a_publish_timer_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard` |
+| `garmin_sidescan/test/test_shutdown_joins.py` | **[SW5]** new: `test_destroy_node_joins_every_worker_thread`, `test_a_wedged_thread_does_not_hang_destroy_node`, `test_a_reconnecting_thread_is_joined_promptly`, `test_transmit_off_is_sent_after_every_thread_is_joined`, `test_destroy_node_still_retries_a_failing_transmit_off`, `test_startup_thread_issues_no_command_once_the_stop_is_signalled` — a real node with its sockets faked out, plus one fake-node case for the startup early return |
 
 ## Principles Self-Check
 
@@ -539,7 +616,8 @@ Rationale and the conflict surface:
 | **[SW2]** `main()` shutdown contract | All four nodes in the repo share the pattern, so all four are fixed in one commit; no launch file, parameter or topic changes | Yes — Scope widening |
 | **[SW3]** callback-versus-shutdown guard | `garmin_sidescan` only. No launch file, parameter, topic or service changes, and with a live context every guarded callback behaves exactly as before. The residual this row recorded — the other three nodes' publishing timers sharing the race in principle — is **no longer residual**: it is fixed as [SW4] below | Yes — Scope widening |
 | **[SW4]** the same guard on the other three nodes | One publish call site per node (`sound_speed_bridge`/`zda_serial_bridge` `_publish_diagnostics`, `kongsberg_em_bridge` `_sonar_info_heartbeat`). No launch file, parameter, topic or service changes; with a live context every callback behaves exactly as before. One behaviour change, deliberate: `kongsberg_em_bridge`'s heartbeat used to swallow-and-warn **every** exception, and an RCL failure on a live context is now re-raised instead — a publisher that has stopped working mid-survey must not be papered over. No shared helper: the four packages share no Python package (`marine_tools` is `ament_cmake`/C++), so a helper would add a cross-package runtime dependency for five lines | Yes — Scope widening |
-| **[SW1]**/**[SW2]**/**[SW3]**/**[SW4]** fixed here rather than filed | The operator's publish-gate decision, quoted in Scope widening; no follow-up issues filed for these four | Yes |
+| **[SW5]** `garmin_sidescan.destroy_node()` joins its threads | `garmin_sidescan` only. No launch file, parameter, topic, service or message change; the transmit-OFF retry and its ERROR are unchanged, and the only new operator-visible output is a WARN naming a thread that missed the join budget. Two deliberate behaviour changes: shutdown now takes up to `SHUTDOWN_JOIN_TIMEOUT_S` (3.0 s) longer when a socket read is wedged — bounded, and the threads are daemons so the process still exits — and the transmit OFF is now sent *after* the joins rather than first, which is what stops the startup thread overriding it. `self._running` is gone; nothing outside `node.py` referenced it | Yes — Scope widening |
+| **[SW1]**/**[SW2]**/**[SW3]**/**[SW4]**/**[SW5]** fixed here rather than filed | The operator's publish-gate decision for the first four and a direct instruction for [SW5], both quoted in Scope widening; no follow-up issues filed for these five | Yes |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
 | A new node parameter | `launch/aml_svs.launch.py` | Yes — the example launch surfaces the operator-tunable parameters, so `parser_max_buffer_bytes` is added as a launch argument at its 4096 default **[PR-R1-S8]** |
 
@@ -555,7 +633,10 @@ Rationale and the conflict surface:
 
 ## Residuals after pre-push round 5 (recorded, not done — each is a further widening or a polish item for the operator's call)
 
-- `garmin_sidescan` `destroy_node()` does not join its three daemon threads on a non-signal teardown (SIGINT path is covered by [SW3]); `sound_speed_bridge` has the join pattern to copy.
+> The first residual — `destroy_node()` not joining its daemon threads —
+> was instructed by the operator and is fixed on this branch as **[SW5]**
+> (there were four threads, not three), so it is no longer listed here.
+
 - `quiet_on_shutdown`'s docstring says a genuine fault stays loud; a real `RCLError` that coincides with a shutdown is swallowed — caveat owed in the docstring.
 - `kongsberg_em_bridge` and `garmin_sidescan` have no committed real-SIGINT subprocess test (verified by execution in rounds 4/5: all four entry points exit 0 with no traceback).
 
@@ -574,7 +655,8 @@ Rationale and the conflict surface:
 - The scope widening above ([SW1], [SW2]) landed as two further commits;
   [SW2] is why three packages beyond `sound_speed_bridge` appear in Files
   to Change. [SW3] landed as one more, in `garmin_sidescan` alone, and
-  [SW4] as one more again, in the other three nodes.
+  [SW4] as one more again, in the other three nodes. [SW5] landed as one
+  more after that, in `garmin_sidescan` alone.
 - Verification: all four touched packages are built and tested
   (`./sensors_ws/build.sh` / `./sensors_ws/test.sh` with the four package
   names). flake8 and pep257 are part of each suite and are clean. The
