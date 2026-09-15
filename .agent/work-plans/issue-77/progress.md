@@ -178,3 +178,30 @@ separation) — belongs in `marine_tools`, not the workspace repo.
 - Field fidelity: the `_field_regex_parser` fixture matches the real BizzyBoat launch (`parser: regex`, `regex_line_terminator: crlf`, same `$AML,SVM` pattern) — confirmed against `sound_speed_launch.py`.
 - Downstream: the operator annunciator consumes `status.message`, not the KeyValue list, so the two new diagnostic keys break no consumer.
 - `/diagnostics` is already in both bizzyboat record lists, so that half of the plan's recorded consequence is satisfied; `serial_tap` is the half that is not.
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 09:09 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Branch**: feature/issue-77 at `94f9f09`
+**Addressed**: `## Local Review (Pre-Push)` 2026-09-15 09:04 -04:00, round 1 (changes-requested), at `8f1b254`
+**Commits**: `a6e4339`, `f737576`, `94f9f09`
+
+### Actions
+- [x] (must-fix) Ordering invariant untested — added `test_serial_tap_publishes_after_parser_feed`, which records parser-feed, primary-`sound_speed`-publish and tap-publish markers per chunk and asserts the exact sequence — `sound_speed_bridge/test/test_node.py` (`a6e4339`). The recorder is a delegating parser whose marker is appended *inside* the generator body, so it timestamps the feed at the moment `_serial_loop` starts consuming it, which is what the invariant is about.
+- [x] (must-fix) `serial_tap` absent from the bizzyboat record lists — **deferred to host**: the host files the `unh_echoboats_project11` follow-up at the publish checkpoint and references it in the PR body. Cited sites, for the PR body: `bizzyboat_project11/config/bizzyboat.yaml:813-818` (the `logger`/`sonar_logger` record lists), `:709`, `:919` (prose still describing marine_tools#77 as future work). No change in this repo. (deferred: host-handled)
+- [x] (suggestion) `tap_byte_count` under-reported wire traffic — the increment now happens before the publish attempt, so the counter means "bytes read off the wire", which is what the silent-probe question needs; `tap_error_count` still reports failed publishes (per chunk). Docstring, the `/diagnostics` comment, `test_serial_tap_publish_failure_is_counted_not_fatal`'s assertion and plan.md steps 2/3 and the test list updated together — `sound_speed_bridge/sound_speed_bridge/node.py:225-249,367-378`, `sound_speed_bridge/test/test_node.py:355-360`, `.agent/work-plans/issue-77/plan.md` (`f737576`).
+- [x] (suggestion) `_handle_reading`'s four publishes have no exception isolation — **deferred**, pre-existing behaviour; no behaviour change in this PR. Follow-up candidate for the host to file — `sound_speed_bridge/sound_speed_bridge/node.py:269-292`. (deferred: pre-existing, out of scope)
+- [x] (suggestion) Transport-level-drop caveat wording (RELIABLE + KEEP_LAST(10)) — **deferred** by host decision — `sound_speed_bridge/sound_speed_bridge/node.py:113-125`. (deferred: host decision)
+- [x] (suggestion) File the deferred `sound_speed_bridge` README issue — **deferred**: issue filing belongs to the host at the publish checkpoint; this sub-agent files no GitHub issues. (deferred: host decision)
+- [x] (suggestion) Knowledge-doc candidate for the "diagnostic publish after the primary path, counted + throttled broad except" idiom — **deferred**, proposal recorded, no edit. (deferred: host decision)
+
+### Verification
+- `./sensors_ws/build.sh sound_speed_bridge` then `./sensors_ws/test.sh sound_speed_bridge`:
+  `Summary: 51 tests, 0 errors, 0 failures, 0 skipped` (was 50 before this pass).
+- Mutation check on the new ordering test: hoisting `self._publish_serial_tap(data)` above the `for reading in self._parser.feed(...)` loop produced `Summary: 51 tests, 0 errors, 1 failure, 0 skipped`, the single failure being `test_serial_tap_publishes_after_parser_feed`. `node.py` restored via `git checkout --` and re-verified green.
+- `ament_flake8` / `ament_pep257` are part of the suite and stayed clean; pre-commit hooks ran on every commit (no `--no-verify`).
+
+### Not pushed
+No `git push`, no PR, no issues filed — the host performs those.
