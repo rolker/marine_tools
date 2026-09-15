@@ -30,7 +30,7 @@ from marine_control_py import ControlServer
 from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
 from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
 import rclpy
-from rclpy.exceptions import InvalidHandle
+from rclpy.exceptions import InvalidHandle, InvalidParameterTypeException
 from rclpy.executors import ExternalShutdownException
 from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
@@ -414,6 +414,12 @@ class GarminSidescanNode(Node):
         # loop cannot be joined inside a bounded budget if it is parked in a
         # time.sleep. (Same shape as sound_speed_bridge's serial thread.)
         self._stop_event = threading.Event()
+        # Bound before anything that can raise, so a node whose construction
+        # failed part-way is still safe to tear down: _join_workers() reads
+        # all three and treats None / never-started as nothing to join.
+        self._rx_thread = None
+        self._aux_threads = []
+        self._startup_thread = None
         self._transmitting = False
         # True while _reconcile_transmit_param mirrors actual state into the
         # `transmit` param, so _on_param_set skips re-issuing a transmit command.
@@ -501,12 +507,17 @@ class GarminSidescanNode(Node):
         self._control_server.bind_parameter('transmit', group='sonar')
         self._control_server.bind_parameter('range_m', units='m', group='sonar')
 
+        self.create_timer(0.5, self._reconcile_transmit_param)
+        self.create_timer(2.0, self._publish_status)
+        self.create_timer(1.0, self._publish_diagnostics)
+
+        self._publish_tx_state()
+
         # Every worker thread is kept as an attribute so destroy_node() can
         # join it; an anonymous thread cannot be waited on, and these publish.
-        self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
-        self._rx_thread.start()
         # Auxiliary listeners: status feeds diagnostics (device tx flag) and is
         # captured under debug_raw; config is debug-capture only.
+        self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
         self._aux_threads = [
             threading.Thread(
                 target=self._aux_loop, name='gcv_status', daemon=True,
@@ -515,19 +526,28 @@ class GarminSidescanNode(Node):
                 target=self._aux_loop, name='gcv_config', daemon=True,
                 args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)),
         ]
-        for thread in self._aux_threads:
-            thread.start()
-        self.create_timer(0.5, self._reconcile_transmit_param)
-        self.create_timer(2.0, self._publish_status)
-        self.create_timer(1.0, self._publish_diagnostics)
-
-        self._publish_tx_state()
         self._startup_thread = threading.Thread(
             target=self._startup_transmit_state,
             args=(bool(self._p('transmit_on_startup')), int(self._p('startup_off_repeats')),
                   float(self._p('range_m'))),
             name='gcv_startup', daemon=True)
-        self._startup_thread.start()
+        # Started last, and as the only thing left to do. Every worker
+        # publishes and the startup one puts commands on the wire, so one
+        # running against a half-built node is a live daemon nobody will
+        # join: main() does not call destroy_node() on a node whose
+        # constructor raised. Nothing that can fail is left after this
+        # block, and the guard closes the one window inside it -- a start
+        # that itself fails -- by unwinding whatever did start, under
+        # _join_workers()'s own bounded budget, before propagating.
+        try:
+            self._rx_thread.start()
+            for thread in self._aux_threads:
+                thread.start()
+            self._startup_thread.start()
+        except BaseException:
+            self._stop_event.set()
+            self._join_workers()
+            raise
 
     def _p(self, name):
         """Return a declared parameter's value."""
@@ -1207,7 +1227,7 @@ class GarminSidescanNode(Node):
         super().destroy_node()
 
 
-def main():
+def main(args=None):
     """
     Entry point: spin the node until it is stopped.
 
@@ -1220,15 +1240,36 @@ def main():
     exception and using the idempotent ``try_shutdown()`` keeps a
     deliberate stop distinguishable from a real failure under
     ``Restart=on-failure``.
+
+    Construction has its own ``try`` for the opposite case: a parameter the
+    node refuses is reported as one FATAL line naming the cause, rclpy is
+    still shut down, and the process exits **non-zero** -- ``ros2 launch``
+    and systemd ``Restart=on-failure`` must see a refused start as a
+    failure, not a clean shutdown. Constructing outside the ``try`` skipped
+    the shutdown entirely and printed a traceback the operator has to read
+    backwards to find the parameter name in. A ``ValueError`` raised later,
+    from a callback during spin, is not a start failure and still
+    propagates.
     """
-    rclpy.init()
-    node = GarminSidescanNode()
+    rclpy.init(args=args)
+    node = None
     try:
+        try:
+            node = GarminSidescanNode()
+        except (ValueError, InvalidParameterTypeException) as exc:
+            # ValueError: our own parameter validation.
+            # InvalidParameterTypeException: rclpy rejecting an override of
+            # the wrong ROS type (e.g. gcv_ip:=123) at declaration, before
+            # our validation ever runs -- the same refused start.
+            rclpy.logging.get_logger('garmin_sidescan').fatal(
+                f'garmin_sidescan failed to start: {exc}')
+            raise SystemExit(1) from exc
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         rclpy.try_shutdown()
 
 

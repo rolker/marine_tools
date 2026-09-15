@@ -277,13 +277,30 @@ def test_a_late_reading_after_our_own_stop_is_quiet_on_a_live_context(mock_seria
     A read that outlives destroy_node()'s 2 s join publishes into a
     destroyed handle while the context is still live; the stop event marks
     it as teardown rather than a fault.
+
+    The stop is tripped *inside* the publish, not before the call: setting
+    it beforehand would return at the handler's own check-then-act test and
+    never reach the guard, so the guard's stop-event clause would go
+    unexercised. Here the handler enters running, the publisher sets the
+    stop event and then raises InvalidHandle -- exactly the order
+    destroy_node() produces -- and only the guard can keep it quiet.
     """
     node = _node(mock_serial_cls)
     ctx = _context(live=True)
     proxy = _ReadingProxy(node, ctx, InvalidHandle('publisher handle destroyed'))
+
+    def _stop_then_raise(_msg):
+        node._stop_event.set()
+        raise InvalidHandle('publisher handle destroyed')
+
+    proxy._pub.publish.side_effect = _stop_then_raise
     try:
-        proxy._stop_event.set()
+        proxy._stop_event.clear()
         assert SoundSpeedBridgeNode._handle_reading(proxy, _reading()) is None
+        # The handler ran past its own pre-check and into the publish; the
+        # guard, not the pre-check, is what absorbed the failure.
+        assert proxy._pub.publish.call_count == 1
+        assert node._stop_event.is_set()
     finally:
         node._stop_event.set()
         ctx.try_shutdown()
