@@ -318,6 +318,12 @@ Flagged as a documentation candidate below, decision left to the operator.
      publish is what failed. Without the `try/except` this test
      fails, as does the shutdown-guard test without its guard — both were
      verified by removing the code under test.
+   - `test_serial_tap_publishes_after_parser_feed` (added in the round-1
+     address-findings pass, closing that review's must-fix 1): a delegating
+     parser records a marker inside its `feed` generator body and the primary
+     and tap publishers record theirs; assert the per-chunk sequence
+     feed → `sound_speed` → `serial_tap`. Verified by mutation: hoisting the
+     tap publish above the feed loop fails exactly this test.
    - `test_tap_counters_surface_in_diagnostics`: after driving the loop
      with known chunks, assert `_tap_byte_count` equals the total input
      length and that `_publish_diagnostics` emits a `tap_byte_count`
