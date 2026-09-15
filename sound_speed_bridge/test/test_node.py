@@ -206,7 +206,7 @@ def test_parser_max_buffer_bytes_is_read_only(mock_serial_cls):
 @patch('sound_speed_bridge.node.serial.Serial')
 def test_main_reports_a_rejected_parameter_and_shuts_down(mock_serial_cls):
     """
-    A refused parameter exits through one FATAL line, not a raw traceback.
+    A refused parameter exits 1 through one FATAL line, not a traceback.
 
     The node constructing outside main()'s try/finally meant a parameter
     ValueError skipped rclpy.shutdown() entirely and printed a stack trace
@@ -217,12 +217,19 @@ def test_main_reports_a_rejected_parameter_and_shuts_down(mock_serial_cls):
     mock_serial_cls.return_value.__enter__.return_value = port
     rclpy.shutdown()  # main() does its own init
     logger = MagicMock()
-    with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
-               return_value=logger):
-        main(args=['--ros-args', '-p', 'parser_max_buffer_bytes:=128'])
-    assert not rclpy.ok()
-    assert 'parser_max_buffer_bytes' in logger.fatal.call_args.args[0]
-    rclpy.init()  # restore the context the autouse fixture shuts down
+    try:
+        with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+                   return_value=logger):
+            with pytest.raises(SystemExit) as excinfo:
+                main(args=['--ros-args',
+                           '-p', 'parser_max_buffer_bytes:=128'])
+        # A refused start must look like a failure to ros2 launch and to
+        # systemd Restart=on-failure, not like a clean shutdown.
+        assert excinfo.value.code == 1
+        assert not rclpy.ok()
+        assert 'parser_max_buffer_bytes' in logger.fatal.call_args.args[0]
+    finally:
+        rclpy.init()  # restore the context the autouse fixture shuts down
 
 
 @patch('sound_speed_bridge.node.serial.Serial')

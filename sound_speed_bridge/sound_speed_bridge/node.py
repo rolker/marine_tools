@@ -440,22 +440,27 @@ def main(args=None) -> None:
     """
     Entry point: spin the bridge node until interrupted.
 
-    Construction happens inside the try so a parameter the node refuses
+    Construction has its own try so a parameter the node refuses
     (see :meth:`SoundSpeedBridgeNode._validated_max_buffer_bytes`) is
-    reported as one FATAL line naming the parameter and still shuts rclpy
-    down, instead of exiting on a raw traceback with the context left
-    initialized. The node still refuses to start -- that is deliberate.
+    reported as one FATAL line naming the parameter, rclpy is still shut
+    down, and the process exits **non-zero** -- ``ros2 launch`` and
+    systemd ``Restart=on-failure`` must see a refused start as a failure,
+    not a clean shutdown. The node still refuses to start; that is
+    deliberate. A ValueError raised later, from a callback during spin,
+    is not a start failure and is left to propagate as before.
     """
     rclpy.init(args=args)
     node = None
     try:
-        node = SoundSpeedBridgeNode()
+        try:
+            node = SoundSpeedBridgeNode()
+        except ValueError as exc:
+            rclpy.logging.get_logger('sound_speed_bridge').fatal(
+                f'sound_speed_bridge failed to start: {exc}')
+            raise SystemExit(1) from exc
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    except ValueError as exc:
-        rclpy.logging.get_logger('sound_speed_bridge').fatal(
-            f'sound_speed_bridge failed to start: {exc}')
     finally:
         if node is not None:
             node.destroy_node()

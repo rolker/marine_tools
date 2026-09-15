@@ -331,10 +331,11 @@ Rationale and the conflict surface:
 |------|--------|
 | `sound_speed_bridge/launch/aml_svs.launch.py` | Add the `parser_max_buffer_bytes` launch argument at its default **[PR-R1-S8]** |
 | `sound_speed_bridge/sound_speed_bridge/parsers.py` | Move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
-| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
+| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**, exiting **1** via `SystemExit` so `ros2 launch`/systemd see a failure, with the `except` scoped to construction only, not `spin()` **[PR-R2-MF1, PR-R2-S1]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
 | `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap |
 | `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case |
 | `sound_speed_bridge/test/test_node.py` | Parameter validation; counters in `/diagnostics`; WARN once then backed off |
+| `sound_speed_bridge/package.xml` | `<depend>rcl_interfaces</depend>` for `ParameterDescriptor` **[PR-R2-S3]** |
 
 ## Principles Self-Check
 
