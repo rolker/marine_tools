@@ -263,3 +263,49 @@ is missing from Files-to-Change.
 - [ ] (suggestion) `except ValueError` spans `rclpy.spin(node)`, not just construction: patching `spin` to raise ValueError produces `sound_speed_bridge started: ...` followed by `failed to start: ...`. Narrow the try to the constructor, or word the message off `node is None` — `sound_speed_bridge/sound_speed_bridge/node.py:456`
 - [ ] (suggestion) `test_main_reports_a_rejected_parameter_and_shuts_down` restores the rclpy context with an unguarded `rclpy.init()`; an assertion failure before that line adds a confusing teardown ERROR on top of the real failure (verified). Wrap in `try/finally` — `sound_speed_bridge/test/test_node.py:218`
 - [ ] (suggestion) Plan's Files-to-Change gained the launch-file row but not `sound_speed_bridge/package.xml` (the `rcl_interfaces` depend), and the `test_node.py` row does not name the three new tests — cosmetic — `.agent/work-plans/issue-78/plan.md`
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 10:57 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: approved
+
+**Branch**: feature/issue-78 at `83f318f`
+**Mode**: pre-push
+**Depth**: Deep (round-1 tier), scoped to a bounded re-check of commit `83f318f` only
+**Must-fix**: 0 | **Suggestions**: 3
+**Round**: 3 | **Ship**: recommended — the round-2 must-fix is closed and pinned by a test; nothing new in scope. The three suggestions are one deferred pre-existing repo-wide defect, one missing regression test for a suggestion-level fix, and plan cosmetics.
+
+Specialists: Static Analysis (the package's own `ament_flake8` + `ament_pep257` tests,
+both pass; a direct `flake8` run on `test/test_node.py` shows only ament-ignored
+I1xx/I2xx/B902 codes). No adversarial fan-out — the scope is one commit and every
+claim below was verified by execution. Copilot and local-model passes off (not opted in).
+Tests: `80 passed, 16 warnings in 1.19s` (unchanged count from round 2; ament lint tests
+included).
+
+Round-2 must-fix verified closed, by execution:
+- A refused `parser_max_buffer_bytes` now exits **1**. Running the console-script entry
+  point (`sound_speed_bridge.node:main`) with `-p parser_max_buffer_bytes:=128` gives
+  exit status 1, exactly one `[FATAL] ... failed to start: parser_max_buffer_bytes must
+  be an integer >= 256 ...` line, **zero** traceback lines, and `rclpy.ok()` False
+  afterwards. Mutation: deleting `raise SystemExit(1) from exc` is **killed** by
+  `test_main_reports_a_rejected_parameter_and_shuts_down`.
+- `SystemExit` raised inside `main()` still runs the `finally`: with `spin` patched to
+  raise `SystemExit(7)` the code propagates unchanged, `destroy_node()` ran once and
+  `rclpy.ok()` is False. `SystemExit` is not an `Exception`, so the outer
+  `except KeyboardInterrupt` cannot swallow it, and setuptools' `sys.exit(main())`
+  wrapper carries the code to the process status.
+- Round-2 suggestion 1 (except scoped to construction): a `ValueError` raised from
+  `spin()` propagates out of `main()` with **0** `logger.fatal` calls — no longer
+  mislabelled a start failure.
+- Round-2 suggestion 2 (test context restore): with an assertion failure injected before
+  the restore, the run reports one clean `AssertionError` and no teardown ERROR.
+- Round-2 suggestion 3 (plan `package.xml` row): present at `plan.md:338`.
+- Healthy construction still spins: a real `rclpy.spin` on a mocked serial port runs, and
+  a `KeyboardInterrupt` out of `spin()` returns from `main()` normally with
+  `destroy_node()` called once and the context shut down.
+
+### Findings
+- [ ] (suggestion) (deferred: pre-existing and repo-wide, untouched by this change) A real SIGINT stop exits **1** with an `RCLError: failed to shutdown: rcl_shutdown already called on the given context` traceback: rclpy's own signal handler shuts the context down before `finally:` reaches `rclpy.shutdown()`. Verified by execution and reproduced identically on `origin/jazzy`, and `zda_serial_bridge`, `kongsberg_em_bridge` and `garmin_sidescan` share the unguarded pattern. It sits directly on this commit's contract — under `Restart=on-failure` a deliberate stop is indistinguishable from the refusal this commit just made exit 1. Fix is `rclpy.try_shutdown()` (or an `if rclpy.ok():` guard); file a follow-up rather than widening #78 — `sound_speed_bridge/sound_speed_bridge/node.py:467`
+- [ ] (suggestion) Nothing pins the narrowed `except` scope: mutating `main()` back to a single `except ValueError` spanning `spin()` **survives** the whole `test_node.py` suite (11 passed). A spin-time `ValueError` would again be logged `failed to start` and converted to exit 1 with no test noticing. A three-line test patching `rclpy.spin` to raise `ValueError` and asserting `logger.fatal` was not called would close it — `sound_speed_bridge/test/test_node.py`
+- [ ] (suggestion) Plan cosmetics, the residue of round-2 suggestion 3: the header's revision list stops at Revision 3 while the Files-to-Change table now carries `[PR-R2-MF1]`/`[PR-R2-S1]`/`[PR-R2-S3]` markers that no revision note defines, and the `test_node.py` row still does not name the three new tests — `.agent/work-plans/issue-78/plan.md:7`
