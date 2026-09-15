@@ -52,6 +52,51 @@ def test_valeport_skips_nan():
     assert out is None
 
 
+def test_valeport_skips_a_float_whose_mm_s_overflows():
+    """
+    A finite m/s value whose mm/s product is inf must be skipped, not raised.
+
+    RegexParser leaves raw_mm_s None, so the formatter rounds the float on
+    the serial thread; round(inf) is OverflowError, which _serial_loop does
+    not catch. 1e306 m/s is finite but 1e309 mm/s is not.
+    """
+    for value in (1e306, 1e308, -1e307, float('inf'), float('-inf')):
+        assert format_valeport(_reading(value=value, raw_mm_s=None)) is None
+
+
+def test_template_skips_nan_even_with_raw_mm_s_present():
+    """A NaN reading is never rendered, even if an integer mm/s rides along."""
+    assert format_template(
+        _reading(value=float('nan'), raw_mm_s=1500000), '{value_mm_s}', {}
+    ) is None
+
+
+def test_template_skips_a_float_whose_mm_s_overflows():
+    """Same guard on the template formatter's fallback rounding."""
+    for value in (1e306, 1e308, -1e307, float('inf'), float('-inf')):
+        assert format_template(
+            _reading(value=value, raw_mm_s=None), '{value_mm_s}', {}
+        ) is None
+
+
+def test_both_formatters_skip_a_huge_value_even_with_raw_mm_s_present():
+    """
+    The mm/s product is validated whether or not raw_mm_s rides along.
+
+    A reading can be finite as m/s and non-finite as mm/s (1e306 m/s is
+    1e309 mm/s == inf). If the raw-integer path is chosen *before* the
+    product is checked, format_template interpolates `inf` into
+    `{value_mm_s}` and format_valeport emits from an unvalidated integer --
+    both on the serial thread. Neither formatter may take that path.
+    """
+    for value in (1e306, 1e308, -1e307, float('inf'), float('-inf'),
+                  float('nan')):
+        reading = _reading(value=value, raw_mm_s=1500000)
+        assert format_valeport(reading) is None
+        assert format_template(reading, '{value_mm_s}', {}) is None
+        assert format_template(reading, '{value_int_mm_s}', {}) is None
+
+
 def test_valeport_skips_negative_or_too_large():
     """Out-of-band integer mm/s must be skipped, not emitted as a malformed packet."""
     assert format_valeport(_reading(value=-1.0, raw_mm_s=-1000)) is None

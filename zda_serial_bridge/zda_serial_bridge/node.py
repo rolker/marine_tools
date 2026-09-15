@@ -12,6 +12,9 @@ from typing import Optional
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import rclpy
+from rclpy.exceptions import InvalidHandle
+from rclpy.executors import ExternalShutdownException
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sbg_driver.msg import SbgUtcTime
@@ -469,7 +472,31 @@ class ZdaSerialBridgeNode(Node):
         diag_msg = DiagnosticArray()
         diag_msg.header.stamp = self.get_clock().now().to_msg()
         diag_msg.status = [status]
-        self._diag_pub.publish(diag_msg)
+        try:
+            self._diag_pub.publish(diag_msg)
+        except (_rclpy.RCLError, InvalidHandle):
+            # rclpy's signal handler tears the context down while the
+            # executor is still inside spin(), so this timer can reach
+            # publish() after the publisher's context has gone invalid.
+            # rcl then raises "Failed to publish: publisher's context is
+            # invalid", spin() propagates it, and a deliberate stop exits 1
+            # with a traceback -- indistinguishable from a crash under
+            # systemd Restart=on-failure, which is the operator-facing
+            # contract main() restores one layer out. InvalidHandle is the
+            # same condition one step later (the node is destroyed and the
+            # publisher handle is gone).
+            #
+            # The call is guarded rather than preceded by an `if rclpy.ok()`
+            # test: that would be check-then-act and the shutdown can land in
+            # the gap. ok() is consulted only afterwards, to decide what the
+            # failure meant -- a shutdown in flight returns quietly, a
+            # failure on a live context is re-raised unchanged, so a genuine
+            # fault is still loud. (garmin_sidescan carries the same guard as
+            # a `quiet_on_shutdown` decorator because it has many such call
+            # sites; here one publish needs only these lines.)
+            if not rclpy.ok(context=self.context):
+                return
+            raise
 
     def destroy_node(self) -> None:
         """Close the serial port before shutdown."""
@@ -478,16 +505,28 @@ class ZdaSerialBridgeNode(Node):
 
 
 def main(args=None) -> None:
-    """Entry point: spin the bridge node until interrupted."""
+    """
+    Entry point: spin the node until it is stopped.
+
+    A deliberate stop (Ctrl-C, ``ros2 launch`` shutdown, systemd
+    ``SIGINT``) must exit 0. rclpy's own signal handler shuts the context
+    down before this function sees anything, so ``spin()`` raises
+    ``ExternalShutdownException`` -- uncaught, that is exit 1 with a
+    traceback -- and ``rclpy.shutdown()`` in the ``finally`` then raises
+    ``RCLError: rcl_shutdown already called``. Catching the shutdown
+    exception and using the idempotent ``try_shutdown()`` keeps a
+    deliberate stop distinguishable from a real failure under
+    ``Restart=on-failure``.
+    """
     rclpy.init(args=args)
     node = ZdaSerialBridgeNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

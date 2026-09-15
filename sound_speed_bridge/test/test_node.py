@@ -26,14 +26,18 @@ drive :meth:`SoundSpeedBridgeNode._serial_loop` itself, via the
 ``_drive_serial_loop`` harness below, because the tap publish lives there.
 """
 
+import math
+import subprocess
+import sys
 import time
 from unittest.mock import MagicMock, patch
 
 from diagnostic_msgs.msg import DiagnosticArray
 import pytest
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.parameter import Parameter
-from sound_speed_bridge.node import SoundSpeedBridgeNode
+from sound_speed_bridge.node import main, SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import RegexParser, SoundSpeedReading
 from std_msgs.msg import UInt8MultiArray
 
@@ -189,6 +193,344 @@ def test_handle_reading_noop_after_stop(mock_serial_cls):
         node.destroy_node()
 
 
+# --- Accumulation-buffer cap (rolker/marine_tools#78) -----------------------
+
+
+def _reinit_with_overrides(*overrides: str) -> None:
+    """
+    Restart the ROS context with global parameter overrides.
+
+    The node takes no constructor arguments, so a parameter override has to
+    come from the context's ``--ros-args``. The autouse fixture's shutdown
+    still applies to the context created here.
+    """
+    rclpy.shutdown()
+    args = ['--ros-args']
+    for override in overrides:
+        args += ['-p', override]
+    rclpy.init(args=args)
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_parser_max_buffer_bytes_reaches_the_parser(mock_serial_cls):
+    """A configured cap is validated and handed to the parser instance."""
+    _reinit_with_overrides('parser_max_buffer_bytes:=512')
+    node = _make_node(mock_serial_cls)
+    try:
+        assert node._parser_max_buffer_bytes == 512
+        assert node._parser._max_buffer_bytes == 512
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_parser_max_buffer_bytes_below_floor_is_rejected(mock_serial_cls):
+    """
+    A cap below the serial read size fails at startup, naming the parameter.
+
+    Validated in the node as well as in the parser so the operator sees the
+    parameter they set, not a constructor argument they never wrote.
+    """
+    _reinit_with_overrides('parser_max_buffer_bytes:=128')
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    with pytest.raises(ValueError, match='parser_max_buffer_bytes'):
+        SoundSpeedBridgeNode()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_parser_max_buffer_bytes_is_read_only(mock_serial_cls):
+    """
+    The cap is declared read-only, so a field `ros2 param set` is rejected.
+
+    It is read once at construction and handed to the parser; a runtime set
+    that reported success and changed nothing would be worse than a refusal.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        assert node.describe_parameter('parser_max_buffer_bytes').read_only
+        result = node.set_parameters(
+            [Parameter('parser_max_buffer_bytes', Parameter.Type.INTEGER, 1024)])
+        assert not result[0].successful
+        assert node._parser._max_buffer_bytes != 1024
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_main_reports_a_wrong_typed_parameter_and_shuts_down(mock_serial_cls):
+    """
+    An override of the wrong ROS type is the same refused start.
+
+    rclpy raises InvalidParameterTypeException at declaration, before our
+    own validation runs; it must reach the same one FATAL line and exit 1.
+    """
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    rclpy.shutdown()
+    logger = MagicMock()
+    try:
+        with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+                   return_value=logger):
+            with pytest.raises(SystemExit) as excinfo:
+                main(args=['--ros-args',
+                           '-p', 'parser_max_buffer_bytes:=4096.0'])
+        assert excinfo.value.code == 1
+        assert not rclpy.ok()
+        assert 'parser_max_buffer_bytes' in logger.fatal.call_args.args[0]
+    finally:
+        rclpy.init()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_main_reports_a_rejected_parameter_and_shuts_down(mock_serial_cls):
+    """
+    A refused parameter exits 1 through one FATAL line, not a traceback.
+
+    The node constructing outside main()'s try/finally meant a parameter
+    ValueError skipped rclpy.shutdown() entirely and printed a stack trace
+    an operator has to read backwards to find the parameter name in.
+    """
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    rclpy.shutdown()  # main() does its own init
+    logger = MagicMock()
+    try:
+        with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+                   return_value=logger):
+            with pytest.raises(SystemExit) as excinfo:
+                main(args=['--ros-args',
+                           '-p', 'parser_max_buffer_bytes:=128'])
+        # A refused start must look like a failure to ros2 launch and to
+        # systemd Restart=on-failure, not like a clean shutdown.
+        assert excinfo.value.code == 1
+        assert not rclpy.ok()
+        assert 'parser_max_buffer_bytes' in logger.fatal.call_args.args[0]
+    finally:
+        rclpy.init()  # restore the context the autouse fixture shuts down
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_buffer_counters_surface_in_diagnostics(mock_serial_cls):
+    """Both trim counters are published as /diagnostics KeyValues."""
+    node = _make_node(mock_serial_cls)
+    try:
+        node._diag_pub = MagicMock()
+        node._parser._trim_stats = (4321, 7)
+        node._publish_diagnostics()
+        status = node._diag_pub.publish.call_args.args[0].status[0]
+        values = {kv.key: kv.value for kv in status.values}
+        assert values['buffer_dropped_bytes'] == '4321'
+        assert values['buffer_trim_count'] == '7'
+    finally:
+        node.destroy_node()
+
+
+class _CountingCounters:
+    """Parser stand-in that records how often the trim snapshot is read."""
+
+    def __init__(self, dropped, trims):
+        self._dropped = dropped
+        self._trims = trims
+        self.reads = 0
+
+    @property
+    def trim_stats(self):
+        self.reads += 1
+        # Simulate the serial thread bumping the pair between reads: a
+        # second read in the same tick would see different values.
+        self._dropped += 1000
+        self._trims += 1
+        return (self._dropped, self._trims)
+
+    @property
+    def buffer_dropped_bytes(self):
+        raise AssertionError(
+            'the node must take the trim_stats snapshot, not the '
+            'individual counters: separate reads can straddle a trim')
+
+    @property
+    def buffer_trim_count(self):
+        raise AssertionError(
+            'the node must take the trim_stats snapshot, not the '
+            'individual counters: separate reads can straddle a trim')
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_trim_counters_are_snapshotted_once_per_tick(mock_serial_cls):
+    """
+    The WARN text and the published KeyValues come from one snapshot.
+
+    The two counters are a correlated pair bumped on the serial thread. Read
+    separately -- once for the WARN, again for the KeyValues, or once per
+    counter -- they can describe instants a chunk apart, so an operator
+    correlating the log with /diagnostics sees numbers that do not add up.
+    The pair is taken as one ``trim_stats`` tuple, exactly once per tick;
+    the stand-in fails loudly if either individual counter is touched.
+    """
+    node = _make_node(mock_serial_cls)
+    logger = MagicMock()
+    try:
+        node._diag_pub = MagicMock()
+        node.get_logger = MagicMock(return_value=logger)
+        node._parser = _CountingCounters(dropped=0, trims=0)
+
+        node._publish_diagnostics()
+
+        assert node._parser.reads == 1  # one snapshot of the pair
+        status = node._diag_pub.publish.call_args.args[0].status[0]
+        values = {kv.key: kv.value for kv in status.values}
+        assert values['buffer_dropped_bytes'] == '1000'
+        assert values['buffer_trim_count'] == '1'
+        warn = logger.warning.call_args.args[0]
+        assert '1000 B since' in warn
+        assert '1000 B over 1 trims' in warn
+    finally:
+        del node.get_logger
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_buffer_trim_warns_once_then_backs_off(mock_serial_cls):
+    """
+    The first trim warns immediately; the next ones are held back.
+
+    A framing stall trims once per serial read for as long as it lasts
+    (1-5 h in the field), so warning on every diagnostics tick would be
+    ~18k lines on top of the stale-reading ERROR this method already emits.
+    """
+    node = _make_node(mock_serial_cls)
+    logger = MagicMock()
+    try:
+        node._diag_pub = MagicMock()
+        node.get_logger = MagicMock(return_value=logger)
+
+        node._parser._trim_stats = (100, 1)
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+        assert '100 B since' in logger.warning.call_args.args[0]
+
+        # A further trim on the very next tick is inside the back-off.
+        node._parser._trim_stats = (200, 2)
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+
+        # No new trim at all: also silent.
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+
+        # Once the interval has elapsed a new trim warns again, reporting
+        # only what was dropped since the previous warning.
+        node._last_trim_warn_ns -= 10 * 1_000_000_000
+        node._parser._trim_stats = (350, 3)
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 2
+        assert '250 B since' in logger.warning.call_args.args[0]
+    finally:
+        del node.get_logger
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_buffer_trim_warn_backoff_resets_after_a_quiet_period(mock_serial_cls):
+    """A later, separate stall is loud again once the ceiling has passed."""
+    node = _make_node(mock_serial_cls)
+    logger = MagicMock()
+    try:
+        node._diag_pub = MagicMock()
+        node.get_logger = MagicMock(return_value=logger)
+
+        node._parser._trim_stats = (100, 1)
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+        node._parser._trim_stats = (100, 2)
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+
+        # A long gap since the last WARN is not a quiet period: the stall
+        # is still trimming, it is just inside the back-off. The reset is
+        # anchored to the last trim observed, not the last WARN.
+        quiet_ns = int((node._TRIM_WARN_MAX_INTERVAL_S + 1.0) * 1_000_000_000)
+        node._last_trim_warn_ns -= quiet_ns
+        node._publish_diagnostics()
+        assert node._trim_warn_interval_s != 0.0
+
+        # Quiet for longer than the back-off ceiling, with no new trims.
+        node._last_trim_seen_ns -= quiet_ns
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+        assert node._trim_warn_interval_s == 0.0
+
+        # The next stall warns on its first trim.
+        node._parser._trim_stats = (500, 3)
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 2
+    finally:
+        del node.get_logger
+        node.destroy_node()
+
+
+# --- Serial-thread survival (non-finite sentences) --------------------------
+
+
+def _serial_port_replaying(chunks):
+    """Build a mocked serial port that replays chunks, then idles on empty reads."""
+    remaining = list(chunks)
+
+    def _read(*args, **kwargs):
+        if remaining:
+            return remaining.pop(0)
+        time.sleep(0.01)  # idle without burning a core on b'' reads
+        return b''
+
+    port = MagicMock()
+    port.read.side_effect = _read
+    return port
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_thread_survives_a_non_finite_sentence(mock_serial_cls):
+    """
+    A nan/inf sentence must not kill the reader thread.
+
+    This is the whole point of the parser's finiteness guard: the loop
+    catches only (SerialException, OSError), so a conversion raising
+    ValueError/OverflowError out of feed() ends the daemon thread with
+    _serial_connected still True -- the node reports a live serial link
+    and never publishes another reading, for the rest of the deployment.
+
+    ``1e306`` is the finite-in-m/s, infinite-in-mm/s case: it survives a
+    finiteness test on the value alone, and its exact Decimal ``raw_mm_s``
+    then rides downstream into ``round()``/``{value_mm_s}`` on this same
+    thread.
+    """
+    port = _serial_port_replaying(
+        [b'nan\r\r\n', b'inf\r\r\n', b'1e999\r\r\n', b'1e306\r\r\n',
+         b'1500.500\r\r\n'])
+    mock_serial_cls.return_value.__enter__.return_value = port
+    node = SoundSpeedBridgeNode()
+    try:
+        last = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with node._lock:
+                last = node._last_reading
+            if last is not None and not math.isnan(last.sound_speed_m_s):
+                break
+            time.sleep(0.01)
+        assert node._serial_thread.is_alive()
+        assert node._serial_connected
+        assert last is not None, 'no reading published; the thread died'
+        assert last.sound_speed_m_s == 1500.5
+        assert last.raw_mm_s == 1500500
+        assert node._parse_error_count == 4
+    finally:
+        node.destroy_node()
+
+
 def _drive_serial_loop(
     node, mock_serial_cls, chunks, stop_before_index=None, before_chunk=None,
 ):
@@ -283,6 +625,121 @@ def test_serial_tap_publishes_read_chunk(mock_serial_cls):
         assert bytes(msg.data) == chunk
     finally:
         node.destroy_node()
+
+
+# --- Shutdown: a deliberate stop is exit 0 ----------------------------------
+
+_SIGINT_HARNESS = """
+import os
+import signal
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import sound_speed_bridge.node as node_mod
+
+port = MagicMock()
+
+
+def _read(*args, **kwargs):
+    time.sleep(0.02)
+    return b''
+
+
+port.read.side_effect = _read
+
+
+def _interrupt():
+    time.sleep(2.0)
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+threading.Thread(target=_interrupt, daemon=True).start()
+with patch.object(node_mod.serial, 'Serial') as serial_cls:
+    serial_cls.return_value.__enter__.return_value = port
+    sys.exit(node_mod.main())
+"""
+
+
+def test_sigint_exits_zero_without_a_traceback(tmp_path):
+    """
+    A real SIGINT to the console entry point exits 0 and prints no traceback.
+
+    rclpy's own signal handler shuts the context down before main()'s
+    finally runs, so rclpy.shutdown() raised RCLError ("rcl_shutdown
+    already called") and spin() raised an uncaught
+    ExternalShutdownException: Ctrl-C exited **1** with two tracebacks.
+    Under systemd Restart=on-failure or a launch file's on-exit handler,
+    an operator stopping the node deliberately was indistinguishable from
+    a crash -- and this package now exits 1 for a genuinely refused
+    parameter, which that noise would hide.
+
+    This runs the real entry point in a subprocess with the serial port
+    mocked out, because the behaviour under test *is* signal delivery.
+    """
+    script = tmp_path / 'sigint_main.py'
+    script.write_text(_SIGINT_HARNESS)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f'exit {proc.returncode}\n{combined}'
+    assert 'Traceback' not in combined, combined
+    assert 'rcl_shutdown already called' not in combined, combined
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_main_returns_cleanly_on_an_external_shutdown(mock_serial_cls):
+    """
+    An externally shut-down context ends main() quietly, not with a raise.
+
+    The in-process twin of the SIGINT test: it pins both halves of the fix
+    (catching ExternalShutdownException, and try_shutdown() over shutdown())
+    deterministically, without depending on signal delivery.
+    """
+    port = _serial_port_replaying([])
+    mock_serial_cls.return_value.__enter__.return_value = port
+
+    def _spin(_node):
+        rclpy.utilities.get_default_context().shutdown()
+        raise ExternalShutdownException()
+
+    rclpy.shutdown()  # main() does its own init
+    try:
+        with patch('sound_speed_bridge.node.rclpy.spin', side_effect=_spin):
+            main()  # must not raise
+        assert not rclpy.ok()
+    finally:
+        rclpy.init()  # restore the context the autouse fixture shuts down
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_a_valueerror_from_spin_is_not_reported_as_a_start_failure(mock_serial_cls):
+    """
+    The construction `except ValueError` must not span spin().
+
+    A ValueError raised later, from a callback during spin, is not a start
+    failure: logging it as one ("sound_speed_bridge failed to start") sends
+    an operator hunting a parameter problem that does not exist, and would
+    convert a mid-run fault into the refusal exit code. Widening the except
+    back over spin() must fail this test.
+    """
+    port = _serial_port_replaying([])
+    mock_serial_cls.return_value.__enter__.return_value = port
+    logger = MagicMock()
+    rclpy.shutdown()  # main() does its own init
+    try:
+        with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+                   return_value=logger):
+            with patch('sound_speed_bridge.node.rclpy.spin',
+                       side_effect=ValueError('mid-run fault')):
+                with pytest.raises(ValueError, match='mid-run fault'):
+                    main()
+        assert logger.fatal.call_count == 0
+        assert not rclpy.ok()
+    finally:
+        rclpy.init()  # restore the context the autouse fixture shuts down
 
 
 @patch('sound_speed_bridge.node.serial.Serial')

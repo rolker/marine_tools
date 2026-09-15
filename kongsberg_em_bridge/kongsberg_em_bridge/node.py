@@ -35,6 +35,9 @@ from kongsberg_em_bridge import em_datagrams as em
 from marine_acoustic_msgs.msg import DetectionFlag, PingInfo, SonarDetections
 from marine_interfaces.msg import SonarInfo
 import rclpy
+from rclpy.exceptions import InvalidHandle
+from rclpy.executors import ExternalShutdownException
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, qos_profile_sensor_data, QoSProfile,
                        ReliabilityPolicy)
@@ -643,16 +646,38 @@ class KongsbergEmBridge(Node):
         silently breaking the "most recent SonarInfo at or before the ping
         stamp" association rule. rosbag2 assigns messages to segments by
         receive time, so the unchanged header stamp does not hinder the
-        split-segment purpose. Guarded like the recv-thread publish: a
-        publish-time error (e.g. rclpy context mid-shutdown) must not
-        propagate out of the timer callback.
+        split-segment purpose.
+
+        Guarded twice over. rclpy's signal handler tears the context down
+        while the executor is still inside spin(), so this timer can reach
+        publish() after the publisher's context has gone invalid; rcl then
+        raises "Failed to publish: publisher's context is invalid", spin()
+        propagates it, and a deliberate stop exits 1 with a traceback --
+        indistinguishable from a crash under systemd ``Restart=on-failure``,
+        which is the operator-facing contract ``main()`` restores one layer
+        out. The call is guarded rather than preceded by an ``if rclpy.ok()``
+        test, which would be check-then-act with the shutdown free to land in
+        the gap; ``ok()`` is consulted only afterwards, to decide what the
+        failure *meant*. A shutdown in flight returns quietly; an RCL failure
+        on a **live** context is re-raised unchanged, because that is a real
+        broken publisher and not something a heartbeat should paper over.
+        (``garmin_sidescan`` carries the same guard as a ``quiet_on_shutdown``
+        decorator; it has many such call sites, this has one.) Any other
+        exception keeps the previous behaviour -- a throttled warning -- so a
+        non-RCL bug in the heartbeat still cannot kill the node.
         """
         try:
             with self._sonar_info_lock:
                 if self._last_sonar_info is None:
                     return    # no ping decoded yet -- nothing to declare
                 self.sonar_info_pub.publish(self._last_sonar_info)
-        except Exception as exc:  # noqa: B902 - intentional: shutdown race
+        except (_rclpy.RCLError, InvalidHandle):
+            # InvalidHandle is the same condition one step later: the node
+            # has been destroyed and the publisher handle is gone.
+            if not rclpy.ok(context=self.context):
+                return
+            raise
+        except Exception as exc:  # noqa: B902 - intentional: heartbeat is best-effort
             self.get_logger().warning(
                 f'sonar_info heartbeat publish failed: {exc}',
                 throttle_duration_sec=10.0)
@@ -700,16 +725,28 @@ class KongsbergEmBridge(Node):
 
 
 def main(args=None):
+    """
+    Entry point: spin the node until it is stopped.
+
+    A deliberate stop (Ctrl-C, ``ros2 launch`` shutdown, systemd
+    ``SIGINT``) must exit 0. rclpy's own signal handler shuts the context
+    down before this function sees anything, so ``spin()`` raises
+    ``ExternalShutdownException`` -- uncaught, that is exit 1 with a
+    traceback -- and ``rclpy.shutdown()`` in the ``finally`` then raises
+    ``RCLError: rcl_shutdown already called``. Catching the shutdown
+    exception and using the idempotent ``try_shutdown()`` keeps a
+    deliberate stop distinguishable from a real failure under
+    ``Restart=on-failure``.
+    """
     rclpy.init(args=args)
     node = KongsbergEmBridge()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

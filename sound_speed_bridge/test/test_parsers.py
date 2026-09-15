@@ -2,6 +2,8 @@
 
 import math
 
+import pytest
+
 from sound_speed_bridge.parsers import AMLParser, SoundSpeedReading
 
 
@@ -87,3 +89,231 @@ def test_aml_skips_empty_lines():
     readings = _readings(p, b'\r\r\n\r\r\n1500.000\r\r\n')
     values = [r.sound_speed_m_s for r in readings]
     assert values == [1500.0]
+
+
+# --- Accumulation-buffer cap (rolker/marine_tools#78) -----------------------
+#
+# The cap bounds the *unframed residue* after framing, so a serial read
+# larger than the cap still frames every complete sentence it carried. When
+# the residue does overflow, the oldest bytes go and the parser discards
+# through the next terminator: the survivor starts mid-sentence, and framing
+# it would publish a head-truncated fragment as a whole sentence.
+
+CAP = 256  # AMLParser.MIN_MAX_BUFFER_BYTES: the smallest legal cap
+
+
+def test_aml_buffer_is_capped():
+    """Terminator-free bytes past the cap are bounded, and the drop is counted."""
+    p = AMLParser(max_buffer_bytes=CAP)
+    assert _readings(p, b'9' * 5000) == []
+    assert len(p._buffer) <= CAP
+    assert p.buffer_dropped_bytes == 5000 - CAP
+    assert p.buffer_trim_count > 0
+
+
+def test_aml_trim_discards_through_next_terminator():
+    """
+    The fragment left by a trim is never framed as a sentence.
+
+    Feeding garbage past the cap and then a terminator flushes the suspect
+    residue and must yield nothing at all -- publishing the truncated head
+    as a sentence would put a garbage (or, for a numeric stream, a
+    plausible-but-wrong) value on the reliable topics.
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    assert p.buffer_trim_count > 0
+    assert _readings(p, b'\r\r\n') == []
+
+
+def test_aml_resyncs_to_the_next_good_sentence():
+    """After a trim, every following complete sentence frames normally."""
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    readings = _readings(p, b'99\r\r\n1500.000\r\r\n1501.000\r\r\n')
+    # The broken sentence (trimmed head + '99') is discarded, not framed.
+    assert [r.sound_speed_m_s for r in readings] == [1500.0, 1501.0]
+    assert p.buffer_trim_count == 1
+
+
+def test_aml_dropped_bytes_counts_the_resync_discard_too():
+    r"""
+    Every byte that never becomes a reading is counted, not just the trim.
+
+    ``buffer_dropped_bytes`` reports how much of the stream was lost, so it
+    has to include the head fragment the resync throws away as well as the
+    bytes trimmed off the front. 1000 bytes of garbage at a 256-byte cap
+    trims 744; the following ``99\r\r\n`` flushes the 256-byte survivor
+    plus its ``99`` and the CR that ends the damaged sentence (259 more).
+    Counting only the trim would report 744 for 1002 lost payload bytes.
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    assert p.buffer_dropped_bytes == 1000 - CAP
+    assert _readings(p, b'99\r\r\n') == []
+    assert p.buffer_dropped_bytes == 1003
+    # The trim count still counts trims only -- one overflow, one event.
+    assert p.buffer_trim_count == 1
+
+
+def test_aml_trim_preserves_the_padding_boundary():
+    r"""
+    A trim ending mid-CRCRLF resyncs on the CR and keeps the '\n' as padding.
+
+    The AML terminator is a single CR, so the resync consumes it and leaves
+    the padding '\n' at the head of the buffer -- which the framing loop's
+    lstrip must absorb rather than framing an empty sentence out of it.
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    readings = _readings(p, b'\r\n1500.000\r\r\n')
+    assert len(readings) == 1
+    assert readings[0].sound_speed_m_s == 1500.0
+    assert readings[0].raw_bytes == b'1500.000\r'
+
+
+def test_aml_no_trim_when_an_oversize_chunk_frames_completely():
+    """
+    A read chunk far larger than the cap loses nothing if it frames.
+
+    Regression test for trimming on append: trimming before the framing loop
+    ran would silently drop complete sentences out of any chunk bigger than
+    the cap (node.py reads 256 bytes at a time).
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    chunk = b'1500.000\r\r\n' * 100
+    assert len(chunk) > CAP
+    readings = _readings(p, chunk)
+    assert len(readings) == 100
+    assert p.buffer_trim_count == 0
+    assert p.buffer_dropped_bytes == 0
+
+
+def test_aml_no_trim_at_exactly_the_cap():
+    """A residue of exactly max_buffer_bytes is not a trim."""
+    p = AMLParser(max_buffer_bytes=CAP)
+    assert _readings(p, b'9' * CAP) == []
+    assert p.buffer_trim_count == 0
+    assert len(p._buffer) == CAP
+
+
+@pytest.mark.parametrize('bad', [0, -1, 1, 255])
+def test_aml_rejects_max_buffer_bytes_below_the_floor(bad):
+    """A cap below the serial read size would shred healthy traffic."""
+    with pytest.raises(ValueError, match='max_buffer_bytes'):
+        AMLParser(max_buffer_bytes=bad)
+
+
+@pytest.mark.parametrize('bad', [4096.0, '4096', None, True])
+def test_aml_rejects_non_integer_max_buffer_bytes(bad):
+    """A non-integer cap is rejected at construction, not silently coerced."""
+    with pytest.raises(ValueError, match='max_buffer_bytes'):
+        AMLParser(max_buffer_bytes=bad)
+
+
+# --- Non-finite sentences must not kill the serial thread -------------------
+
+NON_FINITE = ['nan', 'NaN', 'inf', '-inf', 'Infinity', 'snan', '1e999', '-1e999']
+
+
+@pytest.mark.parametrize('text', NON_FINITE)
+def test_aml_non_finite_sentence_is_a_parse_failure(text):
+    """
+    A sentence that cannot yield a finite number parses to NaN, not a raise.
+
+    ``nan``/``inf``/``snan`` are valid Decimal literals and ``1e999`` is a
+    finite Decimal that overflows to an infinite float; converting any of
+    them to int raises out of feed(), past the node's
+    (SerialException, OSError) catch, killing the serial reader thread.
+    """
+    p = AMLParser()
+    readings = _readings(p, text.encode('ascii') + b'\r\r\n')
+    assert len(readings) == 1
+    r = readings[0]
+    assert math.isnan(r.sound_speed_m_s)
+    assert r.raw_mm_s is None
+    assert r.raw_bytes == text.encode('ascii') + b'\r'
+
+
+@pytest.mark.parametrize('text', ['1e306', '-1e306', '1e308'])
+def test_aml_finite_value_with_a_non_finite_mm_s_product_is_a_parse_failure(text):
+    """
+    A value finite in m/s but infinite in mm/s is a parse failure, like RegexParser.
+
+    1e306 m/s converts to a perfectly finite float, so a finiteness test on
+    the value alone passes it through -- and the exact Decimal-derived
+    raw_mm_s comes with it. Downstream, mm/s is what the sinks render:
+    format_template's {value_mm_s} would interpolate `inf` into the
+    datagram, and round() of the product raises OverflowError, both on the
+    serial thread where nothing catches it.
+    """
+    p = AMLParser()
+    readings = _readings(p, text.encode('ascii') + b'\r\r\n')
+    assert len(readings) == 1
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[0].raw_mm_s is None
+
+
+def test_aml_keeps_framing_after_a_non_finite_sentence():
+    """The stream recovers: the next good sentence parses normally."""
+    p = AMLParser()
+    readings = _readings(p, b'inf\r\r\n1500.250\r\r\n')
+    assert len(readings) == 2
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[1].sound_speed_m_s == 1500.25
+    assert readings[1].raw_mm_s == 1500250
+
+
+# --- The trim counters are one atomic pair ----------------------------------
+
+
+def test_a_trim_rebinds_the_counter_pair_in_a_single_assignment():
+    """
+    Every observable trim state is a whole pair, never half of one.
+
+    The counters are written on the serial thread and read on the node's
+    diagnostics timer. As two independent attributes, a snapshot taken
+    between the two writes of one trim reports a trim count without the
+    bytes it lost -- a WARN line and a /diagnostics KeyValue the operator
+    is meant to correlate, describing a state that never existed. They are
+    therefore one tuple, rebound in a single (GIL-atomic) assignment.
+    """
+    writes = []
+
+    class _Watched(AMLParser):
+
+        def __setattr__(self, name, value):
+            if name == '_trim_stats':
+                writes.append(value)
+            super().__setattr__(name, value)
+
+    p = _Watched(max_buffer_bytes=256)
+    p.feed(b'x' * 5000, 0)
+    p.feed(b'x' * 5000, 0)
+
+    assert len(writes) > 2, 'no trim happened; the test proves nothing'
+    # Each write is a complete pair, and no state ever shows a trim that
+    # dropped no bytes -- which is exactly what a torn read would produce.
+    for state in writes:
+        assert isinstance(state, tuple) and len(state) == 2
+        dropped, count = state
+        assert count == 0 or dropped > 0
+    # Every rebind after the initial (0, 0) moves the dropped-byte half
+    # forward. This is what pins *one* assignment per event: splitting a
+    # trim into two writes -- in either order -- leaves one of them with
+    # the byte count unchanged, which this rejects.
+    assert all(later[0] > earlier[0]
+               for earlier, later in zip(writes, writes[1:]))
+    assert p.trim_stats == writes[-1]
+
+
+def test_the_public_counters_are_read_only_views_of_the_pair():
+    """The named attributes still work, but only as views -- no second source."""
+    p = AMLParser(max_buffer_bytes=256)
+    p.feed(b'x' * 1000, 0)
+    dropped, count = p.trim_stats
+    assert (p.buffer_dropped_bytes, p.buffer_trim_count) == (dropped, count)
+    with pytest.raises(AttributeError):
+        p.buffer_dropped_bytes = 1
+    with pytest.raises(AttributeError):
+        p.buffer_trim_count = 1

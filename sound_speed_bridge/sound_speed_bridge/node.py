@@ -20,6 +20,9 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_interfaces.msg import SoundSpeed
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 import rclpy
+from rclpy.exceptions import InvalidHandle, InvalidParameterTypeException
+from rclpy.executors import ExternalShutdownException
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.publisher import Publisher
@@ -28,7 +31,7 @@ from sensor_msgs.msg import FluidPressure, Temperature
 import serial
 from std_msgs.msg import UInt8MultiArray
 
-from .parsers import PARSERS, SoundSpeedReading
+from .parsers import PARSERS, SoundSpeedParser, SoundSpeedReading
 from .sinks import decode_template, FORMATTERS
 
 
@@ -55,6 +58,9 @@ class _UdpTarget:
 class SoundSpeedBridgeNode(Node):
     """ROS 2 node bridging a sound-speed sensor's serial stream to ROS + UDP."""
 
+    _TRIM_WARN_MAX_INTERVAL_S = 300.0
+    """Ceiling on the buffer-trim WARN back-off, and the quiet period that resets it."""
+
     def __init__(self) -> None:
         super().__init__('sound_speed_bridge')
 
@@ -77,6 +83,35 @@ class SoundSpeedBridgeNode(Node):
         self.declare_parameter('regex_pattern', '')
         self.declare_parameter('regex_sound_speed_scale', 1.0)
         self.declare_parameter('regex_line_terminator', 'cr')
+        # Cap on each parser's unframed accumulation buffer. An
+        # out-of-range value is fail-loud: the node refuses to start
+        # rather than silently clamping, and main() turns that refusal
+        # into one FATAL line naming this parameter. Read once here and
+        # handed to the parser factory below, so it is declared
+        # read-only: a field `ros2 param set` is then rejected outright
+        # rather than reporting success and changing nothing. Changing the
+        # cap means restarting the node.
+        self.declare_parameter(
+            'parser_max_buffer_bytes',
+            SoundSpeedParser.DEFAULT_MAX_BUFFER_BYTES,
+            ParameterDescriptor(
+                read_only=True,
+                description=(
+                    'Maximum unframed residue the parser buffers, in bytes. '
+                    'Must be >= '
+                    f'{SoundSpeedParser.MIN_MAX_BUFFER_BYTES} (the serial '
+                    'read size; a floor, not a line-length guarantee). '
+                    'Size it well above the longest legitimate sentence of '
+                    'the configured protocol: the cap bounds residue after '
+                    'framing, so a long line still frames when it and its '
+                    'terminator arrive in one read, but residue that '
+                    'reaches the cap before a terminator is seen is '
+                    'trimmed and discarded -- an undersized cap therefore '
+                    'loses whichever sentences straddle a read boundary. '
+                    'An out-of-range value fails node startup rather than '
+                    'being silently clamped. Static: takes effect at '
+                    'construction only.')))
+
         # The pre-framing wire tap is a diagnostic probe, not a
         # normal-operations topic, so it is OFF by default (operator decision,
         # recorded in .agent/work-plans/issue-77/plan.md): it is turned on only
@@ -109,6 +144,7 @@ class SoundSpeedBridgeNode(Node):
         self._valid_max = self.get_parameter('valid_sound_speed_max').value
         self._stale_warn = self.get_parameter('stale_age_warn_sec').value
         self._stale_error = self.get_parameter('stale_age_error_sec').value
+        self._parser_max_buffer_bytes = self._validated_max_buffer_bytes()
 
         if self._parser_name not in PARSERS:
             raise ValueError(
@@ -168,6 +204,22 @@ class SoundSpeedBridgeNode(Node):
         self._last_reading_time_ns: Optional[int] = None
         self._parse_error_count = 0
         self._udp_send_error_count = 0
+        # Buffer-trim reporting. The parser owns the counters, and owns
+        # them as ONE tuple (`trim_stats`, rebound in a single assignment
+        # on the serial thread), not as two ints: they are a correlated
+        # pair, and two separate reads on this timer thread can straddle a
+        # trim and report a trim count without the bytes that go with it.
+        # `buffer_dropped_bytes` / `buffer_trim_count` remain as read-only
+        # views for a caller that wants one number; _publish_diagnostics
+        # needs both, so it takes the tuple once and uses that snapshot
+        # throughout.
+        # The node owns the WARN back-off state so a multi-hour framing
+        # stall cannot flood the log at the diagnostics rate.
+        self._last_buffer_trim_count = 0
+        self._last_warned_dropped_bytes = 0
+        self._last_trim_warn_ns: Optional[int] = None
+        self._last_trim_seen_ns: Optional[int] = None
+        self._trim_warn_interval_s = 0.0
         self._serial_reconnect_count = 0
         self._tap_byte_count = 0
         self._tap_error_count = 0
@@ -200,6 +252,75 @@ class SoundSpeedBridgeNode(Node):
             f'parser={self._parser_name} '
             f'serial_tap_enabled={self._serial_tap_enabled} '
             f'udp_targets={[(t.host, t.port, t.format_name) for t in self._udp_targets]}')
+
+    def _validated_max_buffer_bytes(self) -> int:
+        """
+        Read and validate the parser_max_buffer_bytes parameter.
+
+        Validated here as well as in the parser constructor so the failure
+        names the *parameter* the operator set, not a constructor argument
+        they never see. The floor is the parser's own: 256 B is the serial
+        read size, so a cap below it would be overflowed by a single
+        healthy read chunk -- shredding good traffic instead of bounding a
+        stall. It is a sanity floor, **not** a guarantee that the
+        configured protocol's sentences fit: nothing bounds the length of a
+        `regex_pattern` line, so the cap must be sized above the longest
+        sentence of the protocol in use (AML ~11 B, BizzyBoat `$AML,SVM`
+        ~32 B).
+        """
+        value = self.get_parameter('parser_max_buffer_bytes').value
+        floor = SoundSpeedParser.MIN_MAX_BUFFER_BYTES
+        if not isinstance(value, int) or isinstance(value, bool) or value < floor:
+            raise ValueError(
+                f'parser_max_buffer_bytes must be an integer >= {floor} '
+                f'(the serial read size -- a sanity floor, not a '
+                f'line-length guarantee; size the cap above the longest '
+                f'sentence of the configured protocol); got {value!r}')
+        return value
+
+    def _warn_on_buffer_trim(self, now_ns: int, trim_count: int, dropped: int) -> None:
+        """
+        Log a backed-off WARN while the parser is trimming its buffer.
+
+        A framing stall (misconfigured terminator, or UART corruption of the
+        framing byte) lasts hours in the field and trims once per serial
+        read, so a WARN per diagnostics tick would be ~18k lines -- on top
+        of the stale-reading ERROR this same method already emits. The first
+        trim warns immediately; the minimum interval then doubles after each
+        WARN up to a 5-minute ceiling, and resets once a full ceiling passes
+        with **no further trims** -- the quiet period is measured from the
+        last trim observed, not from the last WARN, so a stall that is still
+        trimming inside the back-off never looks quiet.
+
+        The counters are passed in rather than re-read: the caller snapshots
+        the pair once so this WARN and the published KeyValues describe the
+        same instant.
+        """
+        if trim_count == self._last_buffer_trim_count:
+            if (self._last_trim_seen_ns is not None
+                    and (now_ns - self._last_trim_seen_ns) / 1e9
+                    >= self._TRIM_WARN_MAX_INTERVAL_S):
+                self._trim_warn_interval_s = 0.0
+            return
+
+        self._last_buffer_trim_count = trim_count
+        self._last_trim_seen_ns = now_ns
+        if self._last_trim_warn_ns is not None:
+            elapsed = (now_ns - self._last_trim_warn_ns) / 1e9
+            if elapsed < self._trim_warn_interval_s:
+                return
+
+        since_last = dropped - self._last_warned_dropped_bytes
+        self.get_logger().warning(
+            f'Parser buffer overflowed: dropped {since_last} B since the last '
+            f'warning ({dropped} B over {trim_count} trims, cap '
+            f'{self._parser_max_buffer_bytes} B). Sentences are not framing -- '
+            f'check the line terminator and the serial wiring.')
+        self._last_warned_dropped_bytes = dropped
+        self._last_trim_warn_ns = now_ns
+        self._trim_warn_interval_s = min(
+            self._trim_warn_interval_s * 2 or 1.0,
+            self._TRIM_WARN_MAX_INTERVAL_S)
 
     def _build_udp_targets(self) -> List[_UdpTarget]:
         hosts_raw = list(self.get_parameter('udp_hosts').value or [])
@@ -338,7 +459,7 @@ class SoundSpeedBridgeNode(Node):
                         # Diagnostic-only, deliberately after the parser feed
                         # so the primary SoundSpeed path is never delayed or
                         # preempted by it (same rule as the raw publish in
-                        # _handle_reading). The helper carries its own
+                        # _publish_reading). The helper carries its own
                         # exception isolation — see _publish_serial_tap.
                         self._publish_serial_tap(data)
             except (serial.SerialException, OSError) as exc:
@@ -494,12 +615,55 @@ class SoundSpeedBridgeNode(Node):
         return SetParametersResult(successful=True)
 
     def _handle_reading(self, reading: SoundSpeedReading) -> None:
+        """
+        Record and publish one reading. Runs on the serial thread.
+
+        The body lives in :meth:`_publish_reading` so the shutdown guard
+        below wraps a single call rather than fifty lines.
+        """
         # Shutdown guard: destroy_node()'s join is best-effort (2 s) — a read
         # wedged in the UART layer can outlast it, after which the publishers
         # are destroyed while this daemon thread still runs. Once the stop
         # event is set, publishing is no longer safe.
         if self._stop_event.is_set():
             return
+        try:
+            self._publish_reading(reading)
+        except (_rclpy.RCLError, InvalidHandle):
+            # [SW4] call-level guard, the same one _publish_diagnostics
+            # carries, for the same reason one layer over. The stop-event
+            # test above is check-then-act: rclpy's signal handler can tear
+            # the context down in the gap between it and any publish below,
+            # and rcl then raises "Failed to publish: publisher's context is
+            # invalid". Nothing on this thread would catch it — _serial_loop
+            # catches only (SerialException, OSError) — so a deliberate
+            # Ctrl-C ends the serial reader with a thread traceback.
+            # InvalidHandle is the same condition one step later, once
+            # destroy_node() has taken the publisher handles.
+            #
+            # ok() is consulted only *after* the failure, never before it, so
+            # the decision is made on what actually happened: a shutdown in
+            # flight returns quietly; the same failure on a live context is
+            # re-raised unchanged, so a publisher that has stopped working
+            # mid-deployment is still loud. Non-RCL exceptions are
+            # deliberately not caught — a formatter or socket bug must still
+            # surface.
+            # The stop event counts as teardown too: destroy_node() sets it,
+            # joins the reader for 2 s best-effort, then destroys the
+            # publishers -- a read that outlives that join publishes into
+            # InvalidHandle with the context still live.
+            if not rclpy.ok(context=self.context) or self._stop_event.is_set():
+                return
+            raise
+
+    def _publish_reading(self, reading: SoundSpeedReading) -> None:
+        """
+        Publish one reading on every configured sink (serial thread).
+
+        Every RCL call on this path — ``sound_speed``, ``raw``, the optional
+        ``temperature``/``pressure``, and the logging inside the UDP
+        error path — is covered by :meth:`_handle_reading`'s guard.
+        """
         with self._lock:
             self._last_reading = reading
             self._last_reading_time_ns = self.get_clock().now().nanoseconds
@@ -594,6 +758,15 @@ class SoundSpeedBridgeNode(Node):
             msg_text = (f'Reading {last_value:.3f} m/s outside '
                         f'[{self._valid_min:.1f}, {self._valid_max:.1f}]')
 
+        # One snapshot of the correlated counter pair, used for both the
+        # WARN below and the KeyValues published from it. Read as a single
+        # tuple: the pair is written on the serial thread, and two separate
+        # reads can straddle a trim, reporting a trim count without the
+        # bytes that go with it -- numbers that never coexisted, in a log
+        # line and a KeyValue an operator is expected to correlate.
+        dropped_bytes, trim_count = self._parser.trim_stats
+        self._warn_on_buffer_trim(now_ns, trim_count, dropped_bytes)
+
         status = DiagnosticStatus()
         status.level = level
         status.name = 'sound_speed_bridge'
@@ -606,6 +779,8 @@ class SoundSpeedBridgeNode(Node):
             KeyValue(key='last_age_s', value=f'{last_age:.2f}'),
             KeyValue(key='parser_rate_hz', value=f'{self._rate_hz:.2f}'),
             KeyValue(key='parse_error_count', value=str(self._parse_error_count)),
+            KeyValue(key='buffer_dropped_bytes', value=str(dropped_bytes)),
+            KeyValue(key='buffer_trim_count', value=str(trim_count)),
             KeyValue(key='udp_send_error_count',
                      value=str(self._udp_send_error_count)),
             KeyValue(key='serial_reconnect_count',
@@ -636,7 +811,31 @@ class SoundSpeedBridgeNode(Node):
         diag_msg = DiagnosticArray()
         diag_msg.header.stamp = self.get_clock().now().to_msg()
         diag_msg.status = [status]
-        self._diag_pub.publish(diag_msg)
+        try:
+            self._diag_pub.publish(diag_msg)
+        except (_rclpy.RCLError, InvalidHandle):
+            # rclpy's signal handler tears the context down while the
+            # executor is still inside spin(), so this timer can reach
+            # publish() after the publisher's context has gone invalid.
+            # rcl then raises "Failed to publish: publisher's context is
+            # invalid", spin() propagates it, and a deliberate stop exits 1
+            # with a traceback -- indistinguishable from a crash under
+            # systemd Restart=on-failure, which is the operator-facing
+            # contract main() restores one layer out. InvalidHandle is the
+            # same condition one step later (the node is destroyed and the
+            # publisher handle is gone).
+            #
+            # The call is guarded rather than preceded by an `if rclpy.ok()`
+            # test: that would be check-then-act and the shutdown can land in
+            # the gap. ok() is consulted only afterwards, to decide what the
+            # failure meant -- a shutdown in flight returns quietly, a
+            # failure on a live context is re-raised unchanged, so a genuine
+            # fault is still loud. (garmin_sidescan carries the same guard as
+            # a `quiet_on_shutdown` decorator because it has many such call
+            # sites; here one publish needs only these lines.)
+            if not rclpy.ok(context=self.context):
+                return
+            raise
 
     def destroy_node(self) -> bool:
         """Stop the serial thread and close the UDP socket before shutdown."""
@@ -649,16 +848,47 @@ class SoundSpeedBridgeNode(Node):
 
 
 def main(args=None) -> None:
-    """Entry point: spin the bridge node until interrupted."""
+    """
+    Entry point: spin the bridge node until interrupted.
+
+    Construction has its own try so a parameter the node refuses
+    (see :meth:`SoundSpeedBridgeNode._validated_max_buffer_bytes`) is
+    reported as one FATAL line naming the parameter, rclpy is still shut
+    down, and the process exits **non-zero** -- ``ros2 launch`` and
+    systemd ``Restart=on-failure`` must see a refused start as a failure,
+    not a clean shutdown. The node still refuses to start; that is
+    deliberate. A ValueError raised later, from a callback during spin,
+    is not a start failure and is left to propagate as before.
+
+    A deliberate stop is exit 0. rclpy installs its own SIGINT
+    handler, which shuts the context down *before* the handler here runs:
+    ``spin()`` then raises ``ExternalShutdownException`` (uncaught, exit 1)
+    and a plain ``rclpy.shutdown()`` in the ``finally`` raises ``RCLError:
+    rcl_shutdown already called``. ``try_shutdown()`` is the idempotent
+    form, and it still shuts down when the process ends any other way.
+    Under ``Restart=on-failure`` the difference decides whether an operator
+    stopping a node gets it restarted under them.
+    """
     rclpy.init(args=args)
-    node = SoundSpeedBridgeNode()
+    node = None
     try:
+        try:
+            node = SoundSpeedBridgeNode()
+        except (ValueError, InvalidParameterTypeException) as exc:
+            # ValueError: our own validation (parser name, buffer cap).
+            # InvalidParameterTypeException: rclpy rejecting an override of
+            # the wrong ROS type (e.g. parser_max_buffer_bytes:=4096.0)
+            # before our validation ever runs -- the same refused start.
+            rclpy.logging.get_logger('sound_speed_bridge').fatal(
+                f'sound_speed_bridge failed to start: {exc}')
+            raise SystemExit(1) from exc
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

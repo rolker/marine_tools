@@ -92,3 +92,158 @@ def test_regex_rejects_empty_pattern():
     """An empty pattern is rejected at construction."""
     with pytest.raises(ValueError):
         RegexParser('', line_terminator='lf')
+
+
+# --- Accumulation-buffer cap (rolker/marine_tools#78) -----------------------
+#
+# RegexParser is the parser the cap most matters for: its framing is exact
+# (a misconfigured line_terminator never frames at all, for the whole run),
+# and _parse uses re.search, so a head-truncated fragment can match a
+# plausible but wrong sound speed anywhere in the line and publish it on the
+# RELIABLE sound_speed topic. A wrong-but-credible value is worse than NaN.
+
+CAP = 256  # RegexParser.MIN_MAX_BUFFER_BYTES: the smallest legal cap
+
+_NUMBER = r'(?P<sound_speed>[0-9.]+)'
+
+
+def test_regex_buffer_is_capped():
+    """Bytes that never frame are bounded, and the drop is counted."""
+    p = RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=CAP)
+    assert _readings(p, b'1' * 5000) == []
+    assert len(p._buffer) <= CAP
+    assert p.buffer_dropped_bytes == 5000 - CAP
+    assert p.buffer_trim_count > 0
+
+
+def test_regex_trimmed_fragment_never_publishes_a_value():
+    """
+    A trimmed digit run must not search-match a plausible sound speed.
+
+    Without the discard-through-terminator rule the retained tail would
+    frame as a sentence and re.search would happily pull a number out of
+    it -- a wrong reading indistinguishable from a real one downstream.
+    """
+    p = RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=CAP)
+    _readings(p, b'1500.5' * 200)
+    assert p.buffer_trim_count > 0
+    assert _readings(p, b'\n') == []
+
+
+def test_regex_resyncs_to_the_next_good_sentence():
+    """After a trim, the following complete sentences frame normally."""
+    p = RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=CAP)
+    _readings(p, b'1' * 1000)
+    readings = _readings(p, b'11\n1500.5\n1501.5\n')
+    assert [r.sound_speed_m_s for r in readings] == [1500.5, 1501.5]
+    assert p.buffer_trim_count == 1
+
+
+def test_regex_crlf_terminator_straddling_a_trim():
+    r"""
+    A CRLF split across the trim boundary still resyncs on that terminator.
+
+    Drop-oldest keeps the newest bytes precisely so a retained '\r' whose
+    '\n' arrives in the next chunk is still recognized as the terminator.
+    Clearing the buffer outright would miss it and swallow one extra
+    sentence. (A trim can never cut *inside* a complete CRLF: if both bytes
+    were buffered, framing or resync would already have consumed them.)
+    """
+    p = RegexParser(_NUMBER, line_terminator='crlf', max_buffer_bytes=CAP)
+    assert _readings(p, b'1' * CAP + b'\r') == []
+    assert p.buffer_trim_count == 1
+    assert p._buffer.endswith(b'\r')
+    readings = _readings(p, b'\n1500.5\r\n')
+    assert [r.sound_speed_m_s for r in readings] == [1500.5]
+
+
+def test_regex_no_trim_when_an_oversize_chunk_frames_completely():
+    """
+    A read chunk far larger than the cap loses nothing if it frames.
+
+    Regression test for trimming on append, which would have dropped whole
+    sentences out of any chunk bigger than the cap.
+    """
+    p = RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=CAP)
+    chunk = b'1500.5\n' * 100
+    assert len(chunk) > CAP
+    readings = _readings(p, chunk)
+    assert len(readings) == 100
+    assert p.buffer_trim_count == 0
+    assert p.buffer_dropped_bytes == 0
+
+
+def test_regex_no_trim_at_exactly_the_cap():
+    """A residue of exactly max_buffer_bytes is not a trim."""
+    p = RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=CAP)
+    assert _readings(p, b'1' * CAP) == []
+    assert p.buffer_trim_count == 0
+    assert len(p._buffer) == CAP
+
+
+@pytest.mark.parametrize('bad', [0, -1, 1, 255])
+def test_regex_rejects_max_buffer_bytes_below_the_floor(bad):
+    """A cap below the serial read size would shred healthy traffic."""
+    with pytest.raises(ValueError, match='max_buffer_bytes'):
+        RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=bad)
+
+
+@pytest.mark.parametrize('bad', [4096.0, '4096', None, True])
+def test_regex_rejects_non_integer_max_buffer_bytes(bad):
+    """A non-integer cap is rejected at construction, not silently coerced."""
+    with pytest.raises(ValueError, match='max_buffer_bytes'):
+        RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=bad)
+
+
+# --- Non-finite captures must not kill the serial thread --------------------
+
+NON_FINITE = ['nan', 'inf', '-inf', 'Infinity', 'snan', '1e999', '-1e999',
+              # finite as m/s, infinite as mm/s -- the formatters' round()
+              '1e306', '1e308', '-1e307']
+
+
+@pytest.mark.parametrize('text', NON_FINITE)
+def test_regex_non_finite_capture_is_a_parse_failure(text):
+    r"""
+    A non-finite capture becomes NaN rather than an infinite reading.
+
+    float() accepts 'nan'/'inf' and overflows '1e999' to inf, and a loose
+    pattern hands them straight through. An infinite sound speed reaches
+    format_valeport/format_template, whose round() raises OverflowError on
+    the serial thread -- past the node's (SerialException, OSError) catch.
+    """
+    p = RegexParser(r'(?P<sound_speed>\S+)', line_terminator='lf')
+    readings = _readings(p, text.encode('ascii') + b'\n')
+    assert len(readings) == 1
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[0].raw_bytes == text.encode('ascii') + b'\n'
+
+
+def test_regex_non_finite_scale_product_is_a_parse_failure():
+    """A finite capture scaled to infinity is still a parse failure."""
+    p = RegexParser(
+        r'(?P<sound_speed>\S+)', sound_speed_scale=1e300, line_terminator='lf')
+    readings = _readings(p, b'1e300\n')
+    assert len(readings) == 1
+    assert math.isnan(readings[0].sound_speed_m_s)
+
+
+def test_regex_non_finite_optional_fields_are_not_reported():
+    r"""An infinite temperature/pressure is dropped, not published as inf."""
+    p = RegexParser(
+        r'(?P<sound_speed>[0-9.]+),(?P<temperature>\S+),(?P<pressure>\S+)',
+        line_terminator='lf')
+    readings = _readings(p, b'1500.0,inf,nan\n')
+    assert len(readings) == 1
+    assert readings[0].sound_speed_m_s == 1500.0
+    assert readings[0].temperature_c is None
+    assert readings[0].pressure_pa is None
+
+
+def test_regex_keeps_framing_after_a_non_finite_sentence():
+    """The stream recovers: the next good sentence parses normally."""
+    p = RegexParser(r'(?P<sound_speed>\S+)', line_terminator='lf')
+    readings = _readings(p, b'inf\n1500.250\n')
+    assert len(readings) == 2
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[1].sound_speed_m_s == 1500.25

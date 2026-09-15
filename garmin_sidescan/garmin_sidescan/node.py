@@ -18,6 +18,7 @@ Safety: the node asserts transmit OFF at startup and never pings without an
 explicit command.  The GCV stops pinging on its own when out of the water, so
 no external sound-speed interlock is needed to protect the transducer.
 """
+import functools
 import math
 import socket
 import threading
@@ -29,6 +30,9 @@ from marine_control_py import ControlServer
 from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
 from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
 import rclpy
+from rclpy.exceptions import InvalidHandle
+from rclpy.executors import ExternalShutdownException
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -55,6 +59,21 @@ STATUS_GROUP, STATUS_PORT = '239.254.2.2', 50050    # 8e03 status (tx flag)
 CONFIG_GROUP, CONFIG_PORT = '239.254.2.11', 51000   # chartplotter CDP config (debug-capture only)
 GEN_VOTE_MIN = 5                # packets to vote before latching the generation
 
+# Total budget for joining the driver's daemon threads in destroy_node().
+# The longest a worker can block is one _send() in the startup thread: the
+# 2.0 s socket timeout is per operation, so connect() and sendall() can each
+# spend it -- 4.0 s worst case. The two receive loops block at most on
+# _open_mcast's 1.0 s socket timeout, and every reconnect / repeat back-off is
+# an interruptible wait on _stop_event rather than time.sleep. 5.0 s is that
+# worst case plus a second of scheduling slack. It is a budget for the whole
+# set, not per thread, so several wedged sockets cannot multiply it -- and
+# the startup thread is joined FIRST, because it is the one holding
+# _send_lock: if a wedged receive loop ate the budget ahead of it, the
+# transmit-OFF that destroy_node() sends next would block on that lock past
+# the budget. A thread that still misses the budget is a daemon and dies
+# with the process.
+SHUTDOWN_JOIN_TIMEOUT_S = 5.0
+
 
 def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
     """
@@ -70,6 +89,57 @@ def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
     if ping_age > stale_after:
         return DiagnosticStatus.ERROR, f'transmitting but imagery stale ({ping_age:.1f}s)'
     return DiagnosticStatus.OK, f'receiving (last ping {ping_age:.1f}s ago)'
+
+
+def quiet_on_shutdown(method):
+    """
+    Wrap a node method so a context teardown under it cannot fail the process.
+
+    rclpy's SIGINT handler shuts the context down while the executor is still
+    inside ``spin()``, so a timer callback, a subscription callback or one of
+    the driver's own daemon threads can reach a publish (or the parameter-event
+    publish inside ``set_parameters()``) *after* every publisher's context has
+    gone invalid. rcl then raises ``RCLError: Failed to publish: publisher's
+    context is invalid`` -- which ``spin()`` propagates, so a deliberate stop
+    exits 1 with a traceback and is indistinguishable from a crash under
+    systemd ``Restart=on-failure``. That is the same operator-facing contract
+    ``main()`` restores below, one layer in.
+
+    Testing ``rclpy.ok()`` *before* the call would be check-then-act: the
+    shutdown can land in the gap. The call itself is therefore guarded, and
+    ``rclpy.ok()`` is consulted only afterwards, to decide what the failure
+    meant -- a shutdown in flight is returned from quietly, and a failure on a
+    live context is re-raised unchanged, so a genuine fault on a **running**
+    node is still loud.
+
+    The caveat that buys: a real RCL fault that happens to coincide with a
+    shutdown is swallowed, because after the fact the two are
+    indistinguishable -- all the guard can see is that the call failed and
+    the context is down. That is the deliberate trade. A genuine fault
+    during teardown has nowhere useful to go anyway (the node is going away
+    either way), whereas the alternative -- letting it out -- fails the
+    process on every deliberate stop, which is the condition this guard
+    exists to remove. So: loud while running, quiet while shutting down.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except (_rclpy.RCLError, InvalidHandle) as exc:
+            # InvalidHandle is the same condition one step later: the node has
+            # been destroyed and the publisher handle is gone. That can happen
+            # with the context still live -- a worker that outlived the
+            # bounded join publishes after super().destroy_node() and before
+            # rclpy shuts down -- so our own stop event is a teardown
+            # condition too, not only the context state.
+            stopping = getattr(self, '_stop_event', None) is not None \
+                and self._stop_event.is_set()
+            if isinstance(exc, InvalidHandle) and stopping:
+                return None
+            if rclpy.ok(context=self.context):
+                raise
+            return None
+    return wrapper
 
 
 SIDES = ('port', 'stbd', 'down')
@@ -338,6 +408,12 @@ class GarminSidescanNode(Node):
         # state
         self._tx_lock = threading.Lock()      # guards transmit state changes
         self._send_lock = threading.Lock()    # serializes TCP command sends
+        # Single stop signal for every worker thread, set by destroy_node().
+        # An Event rather than a bool so the back-off sleeps inside the loops
+        # are interruptible: a thread whose only check is at the top of its
+        # loop cannot be joined inside a bounded budget if it is parked in a
+        # time.sleep. (Same shape as sound_speed_bridge's serial thread.)
+        self._stop_event = threading.Event()
         self._transmitting = False
         # True while _reconcile_transmit_param mirrors actual state into the
         # `transmit` param, so _on_param_set skips re-issuing a transmit command.
@@ -371,7 +447,6 @@ class GarminSidescanNode(Node):
         # applied in _make_sonar_msg -- the GCV-10 side-scan is 8-bit while its
         # water-column and all GCV-20 channels are 16-bit, so there is no single
         # device-wide dtype.
-        self._running = True
         # diagnostics state
         self._last_ping_t = None          # monotonic time of last emitted ping
         self._device_transmitting = None  # tx flag from the :50050 status frame
@@ -426,26 +501,33 @@ class GarminSidescanNode(Node):
         self._control_server.bind_parameter('transmit', group='sonar')
         self._control_server.bind_parameter('range_m', units='m', group='sonar')
 
+        # Every worker thread is kept as an attribute so destroy_node() can
+        # join it; an anonymous thread cannot be waited on, and these publish.
         self._rx_thread = threading.Thread(target=self._rx_loop, name='gcv_rx', daemon=True)
         self._rx_thread.start()
         # Auxiliary listeners: status feeds diagnostics (device tx flag) and is
         # captured under debug_raw; config is debug-capture only.
-        threading.Thread(
-            target=self._aux_loop, name='gcv_status', daemon=True,
-            args=(STATUS_GROUP, STATUS_PORT, self._pub_raw_status, self._on_status)).start()
-        threading.Thread(
-            target=self._aux_loop, name='gcv_config', daemon=True,
-            args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)).start()
+        self._aux_threads = [
+            threading.Thread(
+                target=self._aux_loop, name='gcv_status', daemon=True,
+                args=(STATUS_GROUP, STATUS_PORT, self._pub_raw_status, self._on_status)),
+            threading.Thread(
+                target=self._aux_loop, name='gcv_config', daemon=True,
+                args=(CONFIG_GROUP, CONFIG_PORT, self._pub_raw_config, None)),
+        ]
+        for thread in self._aux_threads:
+            thread.start()
         self.create_timer(0.5, self._reconcile_transmit_param)
         self.create_timer(2.0, self._publish_status)
         self.create_timer(1.0, self._publish_diagnostics)
 
         self._publish_tx_state()
-        threading.Thread(
+        self._startup_thread = threading.Thread(
             target=self._startup_transmit_state,
             args=(bool(self._p('transmit_on_startup')), int(self._p('startup_off_repeats')),
                   float(self._p('range_m'))),
-            name='gcv_startup', daemon=True).start()
+            name='gcv_startup', daemon=True)
+        self._startup_thread.start()
 
     def _p(self, name):
         """Return a declared parameter's value."""
@@ -458,7 +540,10 @@ class GarminSidescanNode(Node):
             for _ in range(max(1, off_repeats)):
                 if self._send(TRANSMIT_OFF):
                     ok = True
-                time.sleep(0.3)
+                # Interruptible: destroy_node() joins this thread within a
+                # bounded budget, so the inter-repeat pause must not wait out.
+                if self._stop_event.wait(0.3):
+                    break
             # If every OFF send failed the GCV may be pinging; stay "on" so
             # status reflects reality rather than reporting a false OFF.
             self._transmitting = not ok
@@ -469,13 +554,22 @@ class GarminSidescanNode(Node):
             self.get_logger().error(
                 'startup: could not assert transmit OFF (GCV unreachable?); '
                 'assuming sonar may be pinging')
+        if self._stop_event.is_set():
+            # Shutting down. destroy_node() asserts transmit OFF itself, after
+            # joining this thread; issuing a range command -- or worse, the
+            # startup ON below -- now would put a command on the wire after
+            # that OFF and could leave the sonar pinging unattended.
+            return
         if range_m > 0:
             if self._send(build_range_cmd(range_m)):
                 self._controls['range'] = f'{range_m:.1f}'
                 self.get_logger().info(f'startup: range set to {range_m} m')
             else:
                 self.get_logger().error(f'startup: range command ({range_m} m) failed to send')
-        if want_on:
+        if want_on and not self._stop_event.is_set():
+            # Re-checked here, not only before the range command: a shutdown
+            # signalled while that _send() was in flight must not let a
+            # startup ON follow destroy_node()'s final OFF onto the wire.
             self._set_transmit(True, 'startup (transmit_on_startup)')
 
     # ----- TCP command send --------------------------------------------------
@@ -509,6 +603,7 @@ class GarminSidescanNode(Node):
                 f'transmit {"ON" if self._transmitting else "OFF"} ({reason})')
         self._publish_tx_state()
 
+    @quiet_on_shutdown
     def _publish_tx_state(self):
         self._pub_tx.publish(Bool(data=bool(self._transmitting)))
         # keep the operator-control mirror in sync with actual transmit state
@@ -538,6 +633,7 @@ class GarminSidescanNode(Node):
         return resp
 
     # ----- operator control set (radar-style) -------------------------------
+    @quiet_on_shutdown
     def _publish_control_set(self):
         rcs = RadarControlSet()
         status = RadarControlItem()
@@ -568,6 +664,7 @@ class GarminSidescanNode(Node):
                 rcs.items.append(item)
         self._pub_state.publish(rcs)
 
+    @quiet_on_shutdown
     def _on_control_value(self, msg):
         key, value = msg.key, msg.value
         if key == 'status':
@@ -603,6 +700,7 @@ class GarminSidescanNode(Node):
             return
         self._publish_control_set()
 
+    @quiet_on_shutdown
     def _reconcile_transmit_param(self):
         """
         Mirror actual transmit state into the `transmit` parameter.
@@ -640,6 +738,7 @@ class GarminSidescanNode(Node):
         sock.settimeout(1.0)
         return sock
 
+    @quiet_on_shutdown
     def _aux_loop(self, group, port, raw_pub, on_payload):
         """
         Listen to an auxiliary GCV multicast stream (status / config).
@@ -649,12 +748,12 @@ class GarminSidescanNode(Node):
         captured for offline decode. Mirrors ``_rx_loop``'s reconnect handling.
         """
         sock = None
-        while self._running:
+        while not self._stop_event.is_set():
             if sock is None:
                 try:
                     sock = self._open_mcast(group, port)
                 except OSError:
-                    time.sleep(2.0)
+                    self._stop_event.wait(2.0)
                     continue
             try:
                 payload, _addr = sock.recvfrom(8192)
@@ -677,9 +776,10 @@ class GarminSidescanNode(Node):
             self._device_transmitting = tx
             self._last_status_t = time.monotonic()
 
+    @quiet_on_shutdown
     def _rx_loop(self):
         sock = None
-        while self._running:
+        while not self._stop_event.is_set():
             if sock is None:
                 try:
                     sock = self._open_mcast(self._group, self._mport)
@@ -689,7 +789,7 @@ class GarminSidescanNode(Node):
                 except OSError as exc:
                     self.get_logger().error(f'multicast join failed: {exc}; retrying',
                                             throttle_duration_sec=5.0)
-                    time.sleep(2.0)
+                    self._stop_event.wait(2.0)
                     continue
             try:
                 payload, addr = sock.recvfrom(8192)
@@ -908,6 +1008,7 @@ class GarminSidescanNode(Node):
         msg.image.data = bytes(samples)
         return msg
 
+    @quiet_on_shutdown
     def _publish_diagnostics(self):
         now = time.monotonic()
         ping_age = None if self._last_ping_t is None else now - self._last_ping_t
@@ -947,6 +1048,7 @@ class GarminSidescanNode(Node):
         arr.status = [imagery, transmit]
         self._pub_diag.publish(arr)
 
+    @quiet_on_shutdown
     def _publish_status(self):
         self._pub_status.publish(String(data=(
             f'tx={"ON" if self._transmitting else "OFF"} '
@@ -1037,9 +1139,62 @@ class GarminSidescanNode(Node):
                     if self._debug_raw else 'debug_raw off')
         return SetParametersResult(successful=True)
 
+    def _join_workers(self):
+        """
+        Join every worker thread inside one bounded budget.
+
+        The threads are daemons, so a wedged socket read must never hang the
+        process on shutdown -- but it must not be abandoned silently either:
+        a thread that outlives the join still holds a publisher this node is
+        about to destroy. Each join gets whatever is left of
+        :data:`SHUTDOWN_JOIN_TIMEOUT_S`, so the total wait is that budget no
+        matter how many threads are stuck, and a thread that misses it is
+        named in a WARN.
+        """
+        deadline = time.monotonic() + SHUTDOWN_JOIN_TIMEOUT_S
+        # Startup thread first: it is the only worker that takes _send_lock,
+        # which destroy_node()'s transmit-OFF needs right after this returns.
+        for thread in [self._startup_thread, self._rx_thread, *self._aux_threads]:
+            if thread is None or not thread.is_alive():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                self.get_logger().warn(
+                    f'shutdown: thread {thread.name} did not exit within '
+                    f'{SHUTDOWN_JOIN_TIMEOUT_S:.1f}s; it is a daemon and dies '
+                    'with the process')
+
     def destroy_node(self):
-        """Stop the receive loop and assert transmit off on shutdown."""
-        self._running = False
+        """
+        Stop and join the worker threads, assert transmit off, then tear down.
+
+        The order is load-bearing in both directions.
+
+        **Joins before ``super().destroy_node()``**: all four threads publish
+        (imagery, nadir range, water temperature, transmit state), so one
+        still running when the node's publishers are destroyed either raises
+        into a daemon thread or -- via ``quiet_on_shutdown`` -- is swallowed
+        while still doing work on a torn-down node.
+
+        **Transmit OFF after the joins**: the startup thread issues commands
+        of its own, including a ``transmit_on_startup`` ON, so an OFF sent
+        before it is joined can be overridden and leave the sonar pinging
+        unattended. Sending OFF last makes it the last command on the wire.
+        Nothing is lost by waiting for the joins first: an OFF is confirmed by
+        :meth:`_send`'s own TCP ``sendall``, not by anything the receive loops
+        decode -- they carry imagery and the device status flag, and
+        ``destroy_node`` consults neither.
+
+        The joins are bounded (:data:`SHUTDOWN_JOIN_TIMEOUT_S`), so a wedged
+        socket read delays the OFF by that budget rather than blocking it:
+        the threads are daemons and the process can still exit. The one
+        residual wait beyond the budget is ``_send_lock``: the startup thread
+        holds it while inside ``_send``, which is why it is joined first --
+        if it still outlives the budget, the OFF below waits for its current
+        ``_send`` (at most one connect + one sendall, 4 s) before going out.
+        """
+        self._stop_event.set()
+        self._join_workers()
         # Retry the OFF; a single dropped frame on shutdown must not leave the
         # sonar pinging unattended. _send already swallows OSError -> bool.
         off_ok = False
@@ -1053,16 +1208,28 @@ class GarminSidescanNode(Node):
 
 
 def main():
-    """Entry point."""
+    """
+    Entry point: spin the node until it is stopped.
+
+    A deliberate stop (Ctrl-C, ``ros2 launch`` shutdown, systemd
+    ``SIGINT``) must exit 0. rclpy's own signal handler shuts the context
+    down before this function sees anything, so ``spin()`` raises
+    ``ExternalShutdownException`` -- uncaught, that is exit 1 with a
+    traceback -- and ``rclpy.shutdown()`` in the ``finally`` then raises
+    ``RCLError: rcl_shutdown already called``. Catching the shutdown
+    exception and using the idempotent ``try_shutdown()`` keeps a
+    deliberate stop distinguishable from a real failure under
+    ``Restart=on-failure``.
+    """
     rclpy.init()
     node = GarminSidescanNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

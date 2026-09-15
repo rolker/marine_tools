@@ -1,18 +1,45 @@
 r"""
 Parsers for sound speed sensor serial protocols.
 
-Each parser consumes raw serial bytes via feed() and yields zero or more
+Each parser consumes raw serial bytes via feed() and returns zero or more
 SoundSpeedReading records. Parsers are registered by name in the PARSERS
 dict so the node can instantiate them by parameter.
 
 Sentence framing and quirks (e.g. AML's CRCRLF terminator) live inside the
 parser implementations, not in the node.
+
+Unframed bytes accumulate in a per-parser buffer until the configured
+terminator arrives. That buffer is capped (``max_buffer_bytes``): if the
+terminator never comes -- a misconfigured regex_line_terminator, or UART
+corruption of the framing byte itself -- the buffer would otherwise grow
+for the whole run and then emit the entire accumulation as one enormous
+"sentence" on the reliable raw topic. See rolker/marine_tools#78.
+
+The cap is on the *unframed residue*, applied after framing, so a read
+chunk larger than the cap still frames every complete sentence it
+contains. When the residue does exceed the cap the oldest bytes are
+dropped (keeping the newest, so framing can resume) and the parser then
+discards everything through the next terminator: the surviving residue
+starts mid-sentence, and framing it would publish a head-truncated
+fragment as if it were a whole sentence -- which for RegexParser can
+re.search out a plausible but wrong sound speed. Dropped bytes are not
+recoverable here; rolker/marine_tools#77's serial tap is the byte-exact
+capture path.
+
+A framed sentence that does not yield a *finite* number -- ``nan``,
+``inf``, ``-inf``, ``snan``, or an exponent that overflows a float
+(``1e999``) -- is treated as a parse failure (NaN reading, raw bytes
+preserved) rather than converted. Converting one raises past the node's
+``(SerialException, OSError)`` catch and kills the serial reader thread,
+and an infinite value reaching the Valeport/template UDP formatters
+raises there instead: one corrupt sentence would end the sensor feed.
 """
 
 from abc import ABC, abstractmethod
 from decimal import Decimal, InvalidOperation
+import math
 import re
-from typing import Iterable, NamedTuple, Optional
+from typing import Iterable, List, NamedTuple, Optional, Tuple
 
 
 class SoundSpeedReading(NamedTuple):
@@ -46,16 +73,182 @@ class SoundSpeedReading(NamedTuple):
 
 
 class SoundSpeedParser(ABC):
-    """Base class for sound speed sensor parsers."""
+    r"""
+    Base class for sound speed sensor parsers.
+
+    Owns the accumulation buffer and its cap. Subclasses set
+    ``self._terminator`` to the byte string they frame on, call
+    ``super().__init__()``, and structure ``feed()`` as:
+
+    1. append the new bytes to ``self._buffer``;
+    2. call :meth:`_resync` -- if it returns False the parser is still
+       throwing away the remains of a trimmed sentence, so call
+       :meth:`_trim_residue` and return no readings;
+    3. frame and collect readings as usual;
+    4. call :meth:`_trim_residue` on whatever is left.
+
+    Trimming *after* framing is what makes the cap mean "maximum unframed
+    residue": a serial read larger than the cap still frames every
+    complete sentence in it (node.py reads 256 bytes at a time, and the
+    cap may legitimately be set that small).
+
+    ``feed()`` is deliberately eager -- it returns a list rather than
+    yielding -- so buffer accumulation, trimming and resync happen on the
+    call and never depend on the caller exhausting a generator.
+
+    Trim accounting is exposed as :attr:`trim_stats`, a
+    ``(dropped_bytes, trim_count)`` tuple polled by the node's diagnostics
+    timer: ``dropped_bytes`` is the actionable magnitude -- how much of the
+    stream was lost, counting both the bytes trimmed off the front of the
+    residue and the head fragment :meth:`_resync` then discards through the
+    next terminator -- and ``trim_count`` is the event count, which counts
+    *trims* only, so it distinguishes one overflow from a sustained stall
+    and is the node's edge trigger for its backed-off WARN.
+
+    The pair is **one tuple, rebound in a single assignment**, because it is
+    written on the serial thread and read on the diagnostics timer: two
+    independent counters can be sampled between the two writes of one trim,
+    and the operator correlating the WARN text with ``/diagnostics`` then
+    sees a trim count without its bytes. Rebinding one tuple is atomic under
+    the GIL, so every snapshot is a state that actually existed.
+    :attr:`buffer_dropped_bytes` and :attr:`buffer_trim_count` remain as
+    read-only views onto it for callers that want one number; a reader that
+    needs both must take :attr:`trim_stats` once.
+    """
+
+    DEFAULT_MAX_BUFFER_BYTES = 4096
+    """Default cap on unframed residue.
+
+    16x the node's 256-byte serial read, ~5 s of wire at the ~800 B/s
+    observed field rate, and >100x the sentences of the protocols in use
+    (AML ~11 B, BizzyBoat ``$AML,SVM`` ~32 B). It is a default, not a
+    bound on sentence length: ``regex_pattern`` bounds nothing, so a
+    protocol with longer lines needs a correspondingly larger cap.
+    """
+
+    MIN_MAX_BUFFER_BYTES = 256
+    """Floor for ``max_buffer_bytes``.
+
+    256 bytes is the node's serial read size (node.py: ``ser.read(256)``):
+    below it a single healthy read chunk would overflow the cap, so a smaller
+    value is rejected outright. The floor is a sanity bound, **not** a
+    guarantee that every configuration's sentences fit: ``regex_pattern``
+    puts no upper bound on line length, so the cap must be sized above the
+    longest legitimate sentence of the configured protocol.
+
+    What an undersized cap costs is *timing-dependent*, which is why it is
+    worth sizing for rather than relying on: the cap bounds **unframed
+    residue**, and trimming happens only after framing. A line longer than
+    the cap still frames whenever it and its terminator arrive inside one
+    ``feed()`` -- the 256-byte read is large enough that short sentences
+    usually do. It is only residue that reaches the cap *before* a
+    terminator is seen -- a long sentence split across reads, or a stream
+    that has stopped terminating at all -- that is trimmed and then
+    discarded through the next terminator by ``_resync``. So an undersized
+    cap does not fail cleanly; it drops the sentences that happen to
+    straddle a read boundary. The AML sentence is ~11 bytes and the
+    BizzyBoat ``$AML,SVM`` sentence ~32, so the 4096 default leaves >100x
+    margin; an operator configuring a long-line protocol must raise
+    ``parser_max_buffer_bytes`` accordingly.
+    """
+
+    _terminator = b'\r'
+    """Byte string this parser frames on; subclasses override."""
+
+    def __init__(self, max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES) -> None:
+        """Initialize the accumulation buffer and validate the cap."""
+        if isinstance(max_buffer_bytes, bool) or not isinstance(max_buffer_bytes, int):
+            raise ValueError(
+                f'max_buffer_bytes must be an int, got {max_buffer_bytes!r}')
+        if max_buffer_bytes < self.MIN_MAX_BUFFER_BYTES:
+            raise ValueError(
+                f'max_buffer_bytes must be >= {self.MIN_MAX_BUFFER_BYTES} '
+                f'(the serial read size -- a sanity floor, not a line-length '
+                f'guarantee; size the cap above the longest sentence of the '
+                f'configured protocol); '
+                f'got {max_buffer_bytes}')
+        self._max_buffer_bytes = max_buffer_bytes
+        self._buffer = b''
+        self._discarding = False
+        self._trim_stats: Tuple[int, int] = (0, 0)
+
+    @property
+    def trim_stats(self) -> Tuple[int, int]:
+        """Return ``(dropped_bytes, trim_count)`` as one consistent snapshot."""
+        return self._trim_stats
+
+    @property
+    def buffer_dropped_bytes(self) -> int:
+        """Bytes lost to trims and resyncs (read-only view of :attr:`trim_stats`)."""
+        return self._trim_stats[0]
+
+    @property
+    def buffer_trim_count(self) -> int:
+        """Trim events (read-only view of :attr:`trim_stats`)."""
+        return self._trim_stats[1]
 
     @abstractmethod
     def feed(self, data: bytes, receive_time_ns: int) -> Iterable[SoundSpeedReading]:
         """
-        Feed raw bytes from serial; yield zero or more readings.
+        Feed raw bytes from serial; return zero or more readings.
 
-        Implementations buffer partial sentences internally and yield a reading
-        for each fully-framed sentence.
+        Implementations buffer partial sentences internally and produce a
+        reading for each fully-framed sentence. The returned sequence is
+        fully realized before the call returns.
         """
+
+    def _resync(self) -> bool:
+        """
+        Drop buffered bytes through the next terminator after a trim.
+
+        Returns True when the buffer is framable -- either no trim is
+        pending, or the remains of the trimmed sentence have now been
+        discarded. Returns False while still waiting for the terminator
+        that ends the broken sentence.
+
+        The residue left by a trim never contains a terminator (framing
+        runs first), so this discards exactly the tail of the one damaged
+        sentence and never a complete one.
+
+        Every byte discarded here is added to ``trim_stats``' dropped-byte
+        half:
+        those bytes arrived on the wire and never became a reading, which
+        is exactly what that counter reports. Only the head fragment
+        through (and including) the terminator is counted -- bytes still
+        waiting for a terminator stay in the buffer and are counted if and
+        when they are trimmed or discarded.
+        """
+        if not self._discarding:
+            return True
+        idx = self._buffer.find(self._terminator)
+        if idx < 0:
+            return False
+        discarded = idx + len(self._terminator)
+        self._buffer = self._buffer[discarded:]
+        dropped, trims = self._trim_stats
+        self._trim_stats = (dropped + discarded, trims)
+        self._discarding = False
+        return True
+
+    def _trim_residue(self) -> None:
+        r"""
+        Cap the unframed residue, dropping the oldest bytes.
+
+        Keeps the newest ``max_buffer_bytes`` so framing can resume --
+        and so a terminator straddling the trim (a retained ``\r`` whose
+        ``\n`` arrives in the next chunk) is still recognized. Marks the
+        survivor suspect: it begins mid-sentence, so :meth:`_resync`
+        discards through the next terminator before framing resumes.
+        """
+        excess = len(self._buffer) - self._max_buffer_bytes
+        if excess <= 0:
+            return
+        self._buffer = self._buffer[excess:]
+        # One rebind, so the diagnostics timer can never observe the count
+        # without the bytes that go with it (see the class docstring).
+        dropped, trims = self._trim_stats
+        self._trim_stats = (dropped + excess, trims + 1)
+        self._discarding = True
 
 
 class AMLParser(SoundSpeedParser):
@@ -73,13 +266,24 @@ class AMLParser(SoundSpeedParser):
     """
 
     _TERMINATOR = b'\r'
+    _terminator = _TERMINATOR
 
-    def __init__(self) -> None:
-        self._buffer = b''
+    def __init__(
+        self,
+        max_buffer_bytes: int = SoundSpeedParser.DEFAULT_MAX_BUFFER_BYTES,
+    ) -> None:
+        """Create an AML parser with the given unframed-residue cap."""
+        super().__init__(max_buffer_bytes)
 
-    def feed(self, data: bytes, receive_time_ns: int) -> Iterable[SoundSpeedReading]:
-        """Frame on CR and yield one reading per non-empty sentence."""
+    def feed(self, data: bytes, receive_time_ns: int) -> List[SoundSpeedReading]:
+        """Frame on CR and return one reading per non-empty sentence."""
         self._buffer += data
+        if not self._resync():
+            # Still discarding the remains of a trimmed sentence; nothing
+            # here can be framed, but the residue still has to stay capped.
+            self._trim_residue()
+            return []
+        readings: List[SoundSpeedReading] = []
         while True:
             # Drop inter-sentence padding (the trailing '\n' of CRCRLF)
             # before framing so raw_bytes for the next sentence does not
@@ -96,22 +300,51 @@ class AMLParser(SoundSpeedParser):
             stripped = line.lstrip(b' \t').rstrip(b' \t')
             if not stripped:
                 continue
-            yield self._parse(stripped, raw, receive_time_ns)
+            readings.append(self._parse(stripped, raw, receive_time_ns))
+        # Trim only what is left unframed, so a read chunk larger than the
+        # cap still yields every complete sentence it carried.
+        self._trim_residue()
+        return readings
 
     @staticmethod
     def _parse(stripped: bytes, raw: bytes, receive_time_ns: int) -> SoundSpeedReading:
+        """
+        Parse one framed sentence, returning a NaN reading on any failure.
+
+        ``nan``, ``inf``, ``-inf`` and ``snan`` are all valid Decimal
+        literals, and an overflowing exponent (``1e999``) is a *finite*
+        Decimal that converts to an infinite float. Every numeric
+        conversion therefore happens inside the guarded region and the
+        result is checked for finiteness: ``int()`` of a non-finite value
+        raises ``OverflowError``/``ValueError``/``InvalidOperation``, which
+        escapes ``_serial_loop``'s ``(SerialException, OSError)`` catch and
+        kills the reader thread outright -- one corrupt sentence silently
+        ending the sensor feed. A sentence that cannot yield a finite
+        number is a parse failure like any other: NaN, raw bytes preserved,
+        counted by the node's parse-error path.
+
+        The finiteness test is on the **mm/s product**, matching
+        :class:`RegexParser`: ``1e306`` m/s is a perfectly finite float, but
+        ``1e306 * 1000`` is ``inf``, and mm/s is what the downstream sinks
+        render -- ``format_template``'s ``{value_mm_s}`` would interpolate
+        ``inf`` and ``round()`` would raise ``OverflowError``, both on the
+        serial thread. Rejecting the product here also keeps ``raw_mm_s``
+        (an exact Decimal-derived integer that would *not* have raised)
+        from carrying a value the float path has already disowned.
+        """
+        value = float('nan')
+        raw_mm_s: Optional[int] = None
         try:
             decimal_value = Decimal(stripped.decode('ascii'))
-        except (UnicodeDecodeError, InvalidOperation):
-            return SoundSpeedReading(
-                sound_speed_m_s=float('nan'),
-                raw_mm_s=None,
-                raw_bytes=raw,
-                receive_time_ns=receive_time_ns,
-            )
+            parsed = float(decimal_value)
+            if math.isfinite(parsed) and math.isfinite(parsed * 1000.0):
+                value = parsed
+                raw_mm_s = int(decimal_value * 1000)
+        except (UnicodeDecodeError, InvalidOperation, ValueError, OverflowError):
+            pass
         return SoundSpeedReading(
-            sound_speed_m_s=float(decimal_value),
-            raw_mm_s=int(decimal_value * 1000),
+            sound_speed_m_s=value,
+            raw_mm_s=raw_mm_s,
             raw_bytes=raw,
             receive_time_ns=receive_time_ns,
         )
@@ -142,7 +375,10 @@ class RegexParser(SoundSpeedParser):
         pattern: str,
         sound_speed_scale: float = 1.0,
         line_terminator: str = 'cr',
+        max_buffer_bytes: int = SoundSpeedParser.DEFAULT_MAX_BUFFER_BYTES,
     ) -> None:
+        """Compile the pattern and validate the terminator and residue cap."""
+        super().__init__(max_buffer_bytes)
         if line_terminator not in self._TERMINATORS:
             raise ValueError(
                 f'Unknown line_terminator {line_terminator!r}; '
@@ -155,11 +391,17 @@ class RegexParser(SoundSpeedParser):
                 "regex_pattern must contain a named group 'sound_speed'")
         self._terminator = self._TERMINATORS[line_terminator]
         self._scale = float(sound_speed_scale)
-        self._buffer = b''
 
-    def feed(self, data: bytes, receive_time_ns: int) -> Iterable[SoundSpeedReading]:
-        """Frame on the configured terminator and yield one reading per non-empty line."""
+    def feed(self, data: bytes, receive_time_ns: int) -> List[SoundSpeedReading]:
+        """Frame on the configured terminator; one reading per non-empty line."""
         self._buffer += data
+        if not self._resync():
+            # Still discarding the remains of a trimmed sentence. Framing it
+            # would hand a head-truncated fragment to _parse, whose re.search
+            # can match a plausible but wrong value anywhere in the line.
+            self._trim_residue()
+            return []
+        readings: List[SoundSpeedReading] = []
         sep = self._terminator
         sep_len = len(sep)
         while True:
@@ -172,7 +414,11 @@ class RegexParser(SoundSpeedParser):
             stripped = line.strip()
             if not stripped:
                 continue
-            yield self._parse(stripped, raw, receive_time_ns)
+            readings.append(self._parse(stripped, raw, receive_time_ns))
+        # Trim only what is left unframed, so a read chunk larger than the
+        # cap still yields every complete sentence it carried.
+        self._trim_residue()
+        return readings
 
     def _parse(
         self, stripped: bytes, raw: bytes, receive_time_ns: int,
@@ -198,6 +444,18 @@ class RegexParser(SoundSpeedParser):
             value = float(match.group('sound_speed')) * self._scale
         except (TypeError, ValueError):
             value = float('nan')
+        if not math.isfinite(value) or not math.isfinite(value * 1000.0):
+            # float() accepts 'nan'/'inf'/'-inf' and overflows a huge
+            # exponent ('1e999') to inf, and a pattern as loose as
+            # (?P<sound_speed>\S+) will hand them straight through. An
+            # infinite sound_speed is not merely wrong downstream, it is
+            # fatal: format_valeport/format_template round() the mm/s
+            # product on the serial thread, raising OverflowError past
+            # _serial_loop's (SerialException, OSError) catch and killing
+            # the reader. The check is on the *mm/s product*, not the
+            # value alone: a finite 1e306 m/s is still 1e309 mm/s == inf.
+            # Non-finite is a parse failure, same as no match at all.
+            value = float('nan')
         temperature = self._optional_float(match, 'temperature')
         pressure = self._optional_float(match, 'pressure')
         return SoundSpeedReading(
@@ -217,19 +475,25 @@ class RegexParser(SoundSpeedParser):
         if captured is None:
             return None
         try:
-            return float(captured)
+            value = float(captured)
         except (TypeError, ValueError):
             return None
+        # Same non-finite rule as sound_speed: an unreported optional field
+        # is better than inf in a Temperature/FluidPressure message.
+        return value if math.isfinite(value) else None
 
 
 # Mapping of parser name -> factory(node) -> SoundSpeedParser. Factories take
-# the node so they can read parser-specific parameters; AMLParser has no
-# tunables and ignores the argument.
+# the node so they can read parser-specific parameters; both parsers read the
+# shared parser_max_buffer_bytes cap.
 PARSERS = {
-    'aml': lambda _node: AMLParser(),
+    'aml': lambda node: AMLParser(
+        max_buffer_bytes=node.get_parameter('parser_max_buffer_bytes').value,
+    ),
     'regex': lambda node: RegexParser(
         pattern=node.get_parameter('regex_pattern').value,
         sound_speed_scale=node.get_parameter('regex_sound_speed_scale').value,
         line_terminator=node.get_parameter('regex_line_terminator').value,
+        max_buffer_bytes=node.get_parameter('parser_max_buffer_bytes').value,
     ),
 }

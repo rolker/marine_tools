@@ -7,6 +7,8 @@ That gate lives in :meth:`ZdaSerialBridgeNode._on_utc_time` and is
 exercised here directly with mocked serial I/O.
 """
 
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 from diagnostic_msgs.msg import DiagnosticStatus
@@ -476,3 +478,52 @@ def test_diagnostic_stale_after_emit_then_silence(mock_serial_cls):
         assert 'No SbgUtcTime for' in msg_text, msg_text
     finally:
         node.destroy_node()
+
+
+# --- Shutdown: a deliberate stop is exit 0 ----------------------------------
+
+_SIGINT_HARNESS = """
+import os
+import signal
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import zda_serial_bridge.node as node_mod
+
+
+def _interrupt():
+    time.sleep(2.0)
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+threading.Thread(target=_interrupt, daemon=True).start()
+with patch.object(node_mod.serial, 'Serial') as serial_cls:
+    serial_cls.return_value = MagicMock()
+    sys.exit(node_mod.main())
+"""
+
+
+def test_sigint_exits_zero_without_a_traceback(tmp_path):
+    """
+    A real SIGINT to the console entry point exits 0 and prints no traceback.
+
+    rclpy's signal handler shuts the context down before main()'s finally
+    runs, so rclpy.shutdown() raised RCLError ("rcl_shutdown already
+    called") and spin() raised an uncaught ExternalShutdownException: a
+    deliberate Ctrl-C exited 1 with two tracebacks, and systemd
+    Restart=on-failure could not tell it from a crash.
+
+    Run in a subprocess with the serial port mocked out, because the
+    behaviour under test is signal delivery.
+    """
+    script = tmp_path / 'sigint_main.py'
+    script.write_text(_SIGINT_HARNESS)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f'exit {proc.returncode}\n{combined}'
+    assert 'Traceback' not in combined, combined
+    assert 'rcl_shutdown already called' not in combined, combined
