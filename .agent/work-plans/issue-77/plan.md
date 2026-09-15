@@ -220,6 +220,39 @@ defers destruction while a publish is in flight and otherwise raises
 `InvalidHandle` (a plain `Exception` subclass), so at worst a disable costs
 one counted, logged tap error.
 
+**Failure handling in the callback** (added in the round-3 address-findings
+pass): creating or destroying the tap publisher can fail (RMW resource
+exhaustion, a dying context). rclpy wraps on-set callbacks in no `try` of its
+own and its executor re-raises a handler exception straight out of
+`rclpy.spin()`, which `main()` guards only for `KeyboardInterrupt` — so an
+unguarded failure during a live `ros2 param set` would have killed the
+primary `SoundSpeed`/`Temperature`/`FluidPressure` publishing over a
+diagnostic topic, the very outcome the tap's broad `except` prevents on the
+serial-thread side. The create/destroy is caught, logged at ERROR with the
+exception, and returned as `SetParametersResult(successful=False,
+reason=...)`: the set is rejected and the parameter keeps its previous value.
+State stays consistent — a failed create never assigns `_tap_pub`, and a
+failed destroy leaves the reference *dropped* rather than restored, because
+rclpy removes the publisher from the node's registry before `destroy()` can
+raise, so restoring it would hand the serial thread a publisher nothing owns
+and `destroy_node()` would no longer clean up. The tap therefore reads as off
+(which it is) while the rejected set leaves the parameter store saying
+otherwise; the `serial_tap_enabled` diagnostic is derived from the publisher,
+so it reports the reality.
+
+**The unlocked check-then-act, and its invariant** (same pass): the enable
+branch reads `_tap_pub` outside `_tap_lock` before acting on it. That is safe
+only because `_set_tap_publishing` has a single caller thread — `__init__`
+before anything spins, and the set-parameters callback on the one thread of
+`main()`'s single-threaded `rclpy.spin()`. Under a `MultiThreadedExecutor`
+two concurrent enables could each create a publisher and leak the loser,
+invisibly to a single-threaded suite. The invariant is now stated at the
+check itself, together with why taking `_tap_lock` across the create/destroy
+was rejected as the alternative: it would put an RMW publisher
+create/destroy on the serial reader's critical path (`_publish_serial_tap`
+takes the same lock), the exact coupling this lock was split off from
+`self._lock` to avoid.
+
 **Deliberately not done** (operator: "not worry about writing to a bag yet"):
 the `unh_echoboats_project11` follow-up to add `serial_tap` to the deployment
 bag record list — the round-1 review's must-fix 2 — is **not filed**, at the
@@ -448,9 +481,27 @@ filed (see above).
      `test_set_parameters_callback_leaves_other_parameters_alone` (the
      deliberate non-rejection of startup parameters);
      `test_serial_tap_enabled_surfaces_in_diagnostics` (the KeyValue reads
-     `false` then `true`). The existing tap tests enable the parameter in the
-     `_make_node` fixture (`tap_enabled=True`) rather than weakening their
-     assertions.
+     `false` then `true`);
+     `test_serial_tap_enabled_at_launch_needs_no_runtime_set` (added during
+     the round-3 address-findings pass, closing that review's must-fix 1:
+     every other gate test constructs the node with the default and enables
+     afterwards, so the *launch-time* path — `__init__` reading the
+     parameter — was asserted by prose only. The override is supplied the way
+     a launch file supplies it, as a global ROS argument on the context, since
+     `SoundSpeedBridgeNode.__init__` forwards no `parameter_overrides`; the
+     test asserts the publisher exists with the `/serial_tap` contract and
+     publishes the first chunk with no `set_parameters` call anywhere.
+     Verified by mutation: replacing `__init__`'s `_set_tap_publishing` call
+     with `pass` fails exactly this test and nothing else);
+     `test_tap_enable_publisher_failure_is_rejected_not_fatal` and
+     `test_tap_disable_publisher_failure_is_rejected_not_fatal` (also
+     round 3, closing must-fix 2: a `create_publisher` / `destroy_publisher`
+     injected to raise must yield an unsuccessful `SetParametersResult` with
+     the reason, a surviving node whose primary path still publishes, and
+     consistent tap state — verified by mutation, removing the callback's
+     `try/except` fails exactly these two). The existing tap tests enable the
+     parameter in the `_make_node` fixture (`tap_enabled=True`) rather than
+     weakening their assertions.
    - `test_tap_counters_surface_in_diagnostics`: after driving the loop
      with known chunks, assert `_tap_byte_count` equals the total input
      length and that `_publish_diagnostics` emits a `tap_byte_count`
