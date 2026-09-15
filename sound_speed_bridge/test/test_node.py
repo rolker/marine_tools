@@ -802,3 +802,73 @@ def test_serial_tap_enabled_at_launch_needs_no_runtime_set(mock_serial_cls):
         assert bytes(node._tap_pub.publish.call_args.args[0].data) == chunk
     finally:
         node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_tap_enable_publisher_failure_is_rejected_not_fatal(mock_serial_cls):
+    """
+    A failing create_publisher rejects the set instead of killing the bridge.
+
+    rclpy wraps on-set callbacks in no try of its own and its executor
+    re-raises a handler exception straight out of rclpy.spin(), so an
+    RMW/resource failure during a live `ros2 param set serial_tap_enabled
+    true` would otherwise take down the primary SoundSpeed path over a
+    diagnostic topic. The set must degrade to an unsuccessful result with a
+    reason, the tap must stay off, the parameter must keep its old value, and
+    the node must keep reading and publishing.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        with patch.object(node, 'create_publisher',
+                          side_effect=RuntimeError('rmw out of resources')):
+            results = node.set_parameters(
+                [Parameter('serial_tap_enabled', Parameter.Type.BOOL, True)])
+        assert not results[0].successful
+        assert 'rmw out of resources' in results[0].reason
+        # State is consistent: no publisher, tap reads as off, and the
+        # rejected set left the parameter store untouched.
+        assert node._tap_pub is None
+        assert node._serial_tap_enabled is False
+        assert node.get_parameter('serial_tap_enabled').value is False
+        # The node is alive and the primary path is unaffected.
+        node._raw_pub = MagicMock()
+        node._pub = MagicMock()
+        _drive_serial_loop(node, mock_serial_cls, [b'1500.123\r\r\n'])
+        assert node._pub.publish.call_count == 1
+        assert node._raw_pub.publish.call_count == 1
+        # A later, non-failing enable still works — nothing was wedged.
+        _set_tap_enabled(node, True)
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_tap_disable_publisher_failure_is_rejected_not_fatal(mock_serial_cls):
+    """
+    A failing destroy_publisher rejects the set instead of killing the bridge.
+
+    The teardown half of the same guard. The documented consequence is that
+    the reference is dropped rather than restored — rclpy has already
+    removed the publisher from the node's registry by the time destroy can
+    raise — so the tap reads as off (which is what it is) while the rejected
+    set leaves the parameter store still saying true. The diagnostic key is
+    derived from the publisher, so it reports the reality.
+    """
+    node = _make_node(mock_serial_cls, tap_enabled=True)
+    try:
+        with patch.object(node, 'destroy_publisher',
+                          side_effect=RuntimeError('rmw teardown failed')):
+            results = node.set_parameters(
+                [Parameter('serial_tap_enabled', Parameter.Type.BOOL, False)])
+        assert not results[0].successful
+        assert 'rmw teardown failed' in results[0].reason
+        assert node._tap_pub is None
+        assert node._serial_tap_enabled is False
+        # The node survived: the reader still runs and the primary path still
+        # publishes.
+        node._raw_pub = MagicMock()
+        node._pub = MagicMock()
+        _drive_serial_loop(node, mock_serial_cls, [b'1500.123\r\r\n'])
+        assert node._pub.publish.call_count == 1
+    finally:
+        node.destroy_node()

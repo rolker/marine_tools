@@ -280,7 +280,10 @@ class SoundSpeedBridgeNode(Node):
                 return
             # Created outside the lock: create_publisher touches the node's
             # own structures, not the tap reference, and the reader treats a
-            # None reference as "off" until the swap lands.
+            # None reference as "off" until the swap lands. A failure
+            # therefore leaves _tap_pub None — the tap stays off and the
+            # state stays consistent; the caller turns that into a rejected
+            # set (see _on_set_parameters).
             pub = self.create_publisher(
                 UInt8MultiArray, 'serial_tap', self._topic_qos)
             with self._tap_lock:
@@ -290,7 +293,16 @@ class SoundSpeedBridgeNode(Node):
                 pub, self._tap_pub = self._tap_pub, None
             if pub is not None:
                 # Destroyed after the reference is cleared, so no reader can
-                # pick it up again while it is being torn down.
+                # pick it up again while it is being torn down. If the
+                # destroy raises, the reference stays dropped rather than
+                # being restored: rclpy has already removed the publisher
+                # from the node's registry by then, so putting it back would
+                # hand the serial thread a publisher nothing owns and
+                # destroy_node() would no longer clean up. Dropping it means
+                # the tap reads as off, which is what it is — and the
+                # serial_tap_enabled diagnostic, derived from _tap_pub,
+                # reports that reality even though the rejected set leaves
+                # the parameter store saying otherwise.
                 self.destroy_publisher(pub)
 
     def _serial_loop(self) -> None:
@@ -410,6 +422,15 @@ class SoundSpeedBridgeNode(Node):
         Thread-safety: the publisher swap is done under ``_tap_lock``; see
         ``_set_tap_publishing`` for why that is its own lock and why a
         publish racing a disable is already covered.
+
+        Failure handling: creating or destroying the tap publisher can fail
+        (RMW resource exhaustion, a dying context). An exception raised out
+        of this callback would propagate through ``rclpy.spin()`` and end the
+        process, so the whole bridge would die over a diagnostic topic. It is
+        caught and turned into an unsuccessful ``SetParametersResult``
+        instead: the set is rejected, the parameter keeps its previous value,
+        the node keeps publishing SoundSpeed, and the operator sees the
+        reason in the ``ros2 param set`` response and in the log.
         """
         requested = None
         for param in params:
@@ -424,7 +445,27 @@ class SoundSpeedBridgeNode(Node):
             requested = bool(param.value)
 
         if requested is not None:
-            self._set_tap_publishing(requested)
+            try:
+                self._set_tap_publishing(requested)
+            except Exception as exc:  # noqa: B902 - see docstring
+                # An RMW/resource failure creating or destroying the tap
+                # publisher must not take the bridge down with it. rclpy
+                # wraps on-set callbacks in no try of its own and its
+                # executor re-raises a handler exception straight out of
+                # rclpy.spin(), which main() guards only for
+                # KeyboardInterrupt — so without this, a failed `ros2 param
+                # set serial_tap_enabled true` would kill the primary
+                # SoundSpeed/Temperature/FluidPressure publishing. Same rule
+                # as _publish_serial_tap's broad except: a diagnostic must
+                # not be able to kill the sensor. The failure degrades to a
+                # rejected set (the parameter store keeps its old value), is
+                # logged at ERROR with the exception, and leaves the tap
+                # state consistent — see _set_tap_publishing.
+                reason = (
+                    f'serial_tap_enabled={requested} could not be applied: '
+                    f'{exc!r}')
+                self.get_logger().error(f'{reason}; rejected')
+                return SetParametersResult(successful=False, reason=reason)
             # Logged on every accepted set, not only on a transition: the
             # operator needs confirmation that the command landed, and a
             # re-set to the current value is an operator asking exactly that.
