@@ -67,7 +67,7 @@ def test_valeport_skips_a_float_whose_mm_s_overflows():
 def test_template_skips_nan_even_with_raw_mm_s_present():
     """A NaN reading is never rendered, even if an integer mm/s rides along."""
     assert format_template(
-        _reading(value=float('nan'), raw_mm_s=1500000), '{sound_speed_mm_s}', {}
+        _reading(value=float('nan'), raw_mm_s=1500000), '{value_mm_s}', {}
     ) is None
 
 
@@ -75,7 +75,7 @@ def test_template_skips_a_float_whose_mm_s_overflows():
     """Same guard on the template formatter's fallback rounding."""
     for value in (1e306, 1e308, -1e307, float('inf'), float('-inf')):
         assert format_template(
-            _reading(value=value, raw_mm_s=None), '{sound_speed_mm_s}', {}
+            _reading(value=value, raw_mm_s=None), '{value_mm_s}', {}
         ) is None
 
 
