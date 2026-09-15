@@ -77,9 +77,11 @@ not repoint or deprecate it.
 
 ### 2. Publish cadence: one message per non-empty `ser.read(256)` return
 
-Tap directly at the existing read boundary — publish `data` as-is,
-immediately after `ser.read(256)` returns and before it reaches
-`self._parser.feed()`. No additional buffering, batching, or re-chunking.
+Tap directly at the existing read boundary — publish `data` as-is, once
+per `ser.read(256)` return, **after** the chunk has been fed to
+`self._parser.feed()` and the readings handled (see Design Decision 5 /
+Approach step 2 for why the tap never precedes the primary path). No
+additional buffering, batching, or re-chunking.
 
 **Rationale** (bag-volume / rate impact, per the "Only what's needed"
 review flag):
@@ -314,8 +316,12 @@ filed (see above).
        if self._stop_event.is_set():
            return
        self._tap_byte_count += len(data)
+       with self._tap_lock:
+           pub = self._tap_pub          # None while the tap is disabled
+       if pub is None:
+           return
        try:
-           self._tap_pub.publish(UInt8MultiArray(data=data))
+           pub.publish(UInt8MultiArray(data=data))
        except Exception as exc:
            self._tap_error_count += 1
            self.get_logger().warning(
@@ -531,7 +537,7 @@ filed (see above).
 
 | Principle | Consideration |
 |---|---|
-| Human control and transparency | New topic is observable/bag-recordable; no change to existing `sound_speed`/`raw`/diagnostics topic behavior or schema |
+| Human control and transparency | New topic is observable/bag-recordable; `sound_speed`/`raw` behaviour unchanged; `/diagnostics` gains three KeyValues (`tap_byte_count`, `tap_error_count`, `serial_tap_enabled`) — additive, no existing key changed |
 | Capture decisions, not just implementations | Replace-vs-complement, cadence, and #78 ordering are recorded above with rationale, not defaulted |
 | Only what's needed | Tap reuses the existing bounded `read(256)` boundary — no new buffer, no re-chunking scheme; rate/volume impact is derived from the probe's sentence rate (~1 Hz tap, ~8 MB/8 h) with the baud/10 hard bound as the ceiling (see Design Decision 2) |
 | A change includes its consequences | Stale in-code references repointed; `/diagnostics` record-list dependency recorded; reconnect discontinuity qualified; diagnostics counters added so the tap's aliveness is visible without bag inspection; README decided (not needed now) rather than left silently unaddressed; #78 cross-link keeps the shared-region change visible to whichever PR lands second |
@@ -590,8 +596,8 @@ filed (see above).
   (`raw` and `serial_tap`), the node's parameters, and the two-topic RCA
   story (per-sentence correlation vs. byte-exact wire capture) would be
   useful now that the gap has widened to two related-but-distinct topics.
-  Not proposed as part of this PR (Design Decision 4) — worth its own issue
-  if the operator wants it tracked.
+  Not proposed as part of this PR (Design Decision 4) — filed as
+  rolker/marine_tools#88 at the operator's request at the publish gate.
 
 ## Open Questions
 
