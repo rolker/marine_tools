@@ -88,8 +88,8 @@ All three are therefore in scope for this branch — [SW1] and [SW2] from
 the reviews, and [SW3], which surfaced while verifying [SW2]. The
 operator's quoted decision was given for [SW1]/[SW2]; the host
 orchestrator applied that standing decision to [SW3] on its own
-judgement, and the operator's confirmation of [SW3] is owed (it is
-called out in the PR body). None was introduced by #78; all sit on its
+judgement, and the operator confirmed it after the PR was opened
+(2026-09-15: "garmin fix is ok"). None was introduced by #78; all sit on its
 contract, which is why the reviews raised them.
 
 ### [SW1] A non-finite sentence kills the serial reader thread
