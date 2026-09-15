@@ -237,3 +237,60 @@ No `git push`, no PR, no issues filed — the host performs those.
 
 ### Adjudicated in round 1 — not re-raised
 RELIABLE QoS choice; the deliberately broad `except`; `parsers.py`'s unbounded accumulation buffer (tracked as marine_tools#78); `_handle_reading`'s lack of exception isolation (pre-existing, follow-up candidate); the transport-drop caveat wording; the `sound_speed_bridge` README; the knowledge-doc idiom candidate. All carry recorded reasons; no new evidence surfaced against any of them this round.
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 09:33 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Branch**: feature/issue-77 at `ae6139a`
+**Addressed**: operator scope change at the publish checkpoint (not a review round) — the approved branch published the tap unconditionally
+**Commits**: `b33471f` (feature), `16b6a55` (tests), `ae6139a` (plan sync)
+
+### Operator decision driving this pass
+
+> "I'm not sure I want this enabled all the time, so let's default to not
+> enabled, make sure it can get enable on the fly, and not worry about writing
+> to a bag yet."
+
+and, on reviewing the first cut of that (which kept the publisher advertised
+while disabled so a recorder could attach early):
+
+> "Why is the topic published when it's not enabled? I'd rather it only publish
+> if we enable it."
+
+Both are recorded verbatim in `plan.md` Design Decision 5.
+
+### Actions
+- [x] Added the `serial_tap_enabled` parameter, **default `false`**, declared with a `ParameterDescriptor` whose `read_only=False` is stated explicitly (rclpy's only descriptor-level "settable at runtime" marker) and whose `description` names the exact `ros2 param set` command — `sound_speed_bridge/sound_speed_bridge/node.py` (`b33471f`)
+- [x] Registered `add_on_set_parameters_callback(self._on_set_parameters)`, before the serial thread starts, so a set applies to the running reader: `ros2 param set /sound_speed_bridge serial_tap_enabled true` takes effect on the next serial chunk with no restart — restarting to enable a diagnostic would drop the very stream being diagnosed and reset the counters that frame the question
+- [x] **No publisher and no topic while disabled** (the operator's correction): `_set_tap_publishing()` creates the publisher on true and `destroy_publisher`s it on false, so `ros2 topic list` shows `serial_tap` exactly when the tap runs. Enabled state is a **property derived from the publisher reference**, not a parallel bool that could disagree with it. `__init__` routes a launch-time `serial_tap_enabled: true` through the same helper, so "enabled at startup" and "enabled later" are one code path. Idempotent, so a repeated set never tears down a live topic under a recorder
+- [x] Thread-safety, documented at `_set_tap_publishing`: the publisher reference is swapped under a **dedicated `_tap_lock`** — deliberately not `self._lock`, which is held on the primary reading path (`_handle_reading`) and by the diagnostics timer, so reusing it would let a diagnostic contend with the `SoundSpeed` path, the exact coupling this file's ordering rule exists to prevent. The serial thread copies the reference under the lock and publishes outside it. The one remaining race — publishing on a reference taken just before a disable — is already covered by the existing broad `except` + `tap_error_count`: `Publisher.publish` holds a use-count that defers destruction and otherwise raises `InvalidHandle` (a plain `Exception` subclass), so a disable costs at worst one counted, logged tap error
+- [x] `tap_byte_count` **keeps counting wire bytes while disabled** — incremented before the gate as well as before the publish. It is the cheap always-on answer to "is the probe silent?", costs one integer add per chunk, and is what tells an operator whether there is anything to enable the tap *for*
+- [x] Surfaced `serial_tap_enabled` as a `/diagnostics` KeyValue, and added it to the startup INFO log line. With the tap off by default, an absence of tap messages in a bag would otherwise be ambiguous between "the probe was silent" and "nobody switched the tap on"; `tap_byte_count` separates silent from corrupt, this key separates both from not-enabled
+- [x] The callback **validates** the type rather than coercing (`bool('false')` is `True`, so coercion would enable the tap for an operator who asked for the opposite) and logs INFO on every accepted set — including a re-set to the current value, which is an operator asking for exactly that confirmation
+- [x] Tests (`16b6a55`), all driving the real set-parameters callback via `node.set_parameters(...)` rather than poking internals: default-disabled publishes nothing / has no publisher / still counts bytes / leaves the primary path untouched; enable-then-publish; the **ROS-graph** view (`get_publisher_names_and_types_by_node`, i.e. what `ros2 topic list` shows) has no `serial_tap` while disabled, has it when enabled, loses it on disable, with `/raw` as the control proving the query answers; off→on→off mid-stream publishes exactly the enabled chunk; repeated enable keeps the same publisher; non-bool rejected at both layers; an unrelated parameter set is accepted and leaves the tap alone; the diagnostics key reads `false` then `true`. Existing tap tests enable the parameter in the `_make_node` fixture (`tap_enabled=True`) — no assertion was weakened
+- [x] **Deliberately not filed**, at the operator's request ("not worry about writing to a bag yet"): the `unh_echoboats_project11` follow-up adding `serial_tap` to the deployment bag record list (round-1 review must-fix 2). The cited sites stay in `plan.md` for whenever it is wanted. With the tap off by default, the record-list gap is no longer what makes the tap inert — the parameter is
+- [x] **Deliberately not done**: the callback applies only `serial_tap_enabled` and does not start *rejecting* runtime sets of the node's other startup-only parameters the way `garmin_sidescan`'s node does. That is a behaviour change well beyond this issue; accepting them is what rclpy already did before any callback existed. Recorded in `plan.md`, not filed
+
+### Verification
+- `./sensors_ws/build.sh sound_speed_bridge` then `./sensors_ws/test.sh sound_speed_bridge`:
+  `Summary: 59 tests, 0 errors, 0 failures, 0 skipped` (was 51 before this pass).
+- `ament_flake8` / `ament_pep257` run inside the suite and are clean.
+- Mutation-verified, each against a file backup (not `git checkout`), each failing exactly the tests that guard it:
+  always creating the publisher regardless of the gate → every `_make_node` test;
+  counting bytes only while enabled → `test_serial_tap_disabled_by_default_publishes_nothing` + `test_serial_tap_runtime_toggle_takes_effect_mid_stream`;
+  skipping the callback's type check → `test_serial_tap_enabled_rejects_non_bool`;
+  never destroying the publisher on disable → `test_serial_tap_topic_advertised_only_when_enabled`.
+- Probed rclpy's own behaviour rather than assuming it: a wrong-typed `set_parameters` returns `successful=False` with a reason and never reaches the callback — it does **not** raise `InvalidParameterTypeException`. The test asserts what rclpy actually does.
+- Pre-commit hooks ran on every commit; no `--no-verify`.
+
+### Consequence accepted
+A subscriber cannot attach before the tap is enabled, so the first chunk or
+two after enabling may be lost to subscriber/publisher discovery. That is the
+operator's explicit trade — a topic that exists only when the tap is on is
+worth more than the first ~1 s of bytes after enabling — and the missed bytes
+are still counted in `tap_byte_count`.
+
+### Not pushed
+No `git push`, no PR, no issues filed — the host performs those.
