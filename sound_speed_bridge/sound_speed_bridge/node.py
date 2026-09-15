@@ -21,7 +21,7 @@ from sensor_msgs.msg import FluidPressure, Temperature
 import serial
 from std_msgs.msg import UInt8MultiArray
 
-from .parsers import PARSERS, SoundSpeedReading
+from .parsers import PARSERS, SoundSpeedParser, SoundSpeedReading
 from .sinks import decode_template, FORMATTERS
 
 
@@ -48,6 +48,9 @@ class _UdpTarget:
 class SoundSpeedBridgeNode(Node):
     """ROS 2 node bridging a sound-speed sensor's serial stream to ROS + UDP."""
 
+    _TRIM_WARN_MAX_INTERVAL_S = 300.0
+    """Ceiling on the buffer-trim WARN back-off, and the quiet period that resets it."""
+
     def __init__(self) -> None:
         super().__init__('sound_speed_bridge')
 
@@ -70,6 +73,11 @@ class SoundSpeedBridgeNode(Node):
         self.declare_parameter('regex_pattern', '')
         self.declare_parameter('regex_sound_speed_scale', 1.0)
         self.declare_parameter('regex_line_terminator', 'cr')
+        # Cap on each parser's unframed accumulation buffer. Static: read
+        # once here and passed to the parser factory below.
+        self.declare_parameter(
+            'parser_max_buffer_bytes',
+            SoundSpeedParser.DEFAULT_MAX_BUFFER_BYTES)
 
         self._device = self.get_parameter('device').value
         self._baud = self.get_parameter('baud').value
@@ -81,6 +89,7 @@ class SoundSpeedBridgeNode(Node):
         self._valid_max = self.get_parameter('valid_sound_speed_max').value
         self._stale_warn = self.get_parameter('stale_age_warn_sec').value
         self._stale_error = self.get_parameter('stale_age_error_sec').value
+        self._parser_max_buffer_bytes = self._validated_max_buffer_bytes()
 
         if self._parser_name not in PARSERS:
             raise ValueError(
@@ -115,6 +124,15 @@ class SoundSpeedBridgeNode(Node):
         self._last_reading_time_ns: Optional[int] = None
         self._parse_error_count = 0
         self._udp_send_error_count = 0
+        # Buffer-trim reporting. The parser owns the counters (plain ints,
+        # bumped on the serial thread, read here on the timer thread -- the
+        # same GIL-atomic pattern the other counters use); the node owns the
+        # WARN back-off state so a multi-hour framing stall cannot flood the
+        # log at the diagnostics rate.
+        self._last_buffer_trim_count = 0
+        self._last_warned_dropped_bytes = 0
+        self._last_trim_warn_ns: Optional[int] = None
+        self._trim_warn_interval_s = 0.0
         self._serial_reconnect_count = 0
         self._readings_in_window = 0
         self._window_start_ns = self.get_clock().now().nanoseconds
@@ -132,6 +150,65 @@ class SoundSpeedBridgeNode(Node):
             f'sound_speed_bridge started: device={self._device} baud={self._baud} '
             f'parser={self._parser_name} '
             f'udp_targets={[(t.host, t.port, t.format_name) for t in self._udp_targets]}')
+
+    def _validated_max_buffer_bytes(self) -> int:
+        """
+        Read and validate the parser_max_buffer_bytes parameter.
+
+        Validated here as well as in the parser constructor so the failure
+        names the *parameter* the operator set, not a constructor argument
+        they never see. The floor is the parser's own: a cap below the
+        256-byte serial read (or the longest legitimate sentence) would
+        shred healthy traffic instead of bounding a stall.
+        """
+        value = self.get_parameter('parser_max_buffer_bytes').value
+        floor = SoundSpeedParser.MIN_MAX_BUFFER_BYTES
+        if not isinstance(value, int) or isinstance(value, bool) or value < floor:
+            raise ValueError(
+                f'parser_max_buffer_bytes must be an integer >= {floor} '
+                f'(the serial read size and the longest legitimate '
+                f'sentence); got {value!r}')
+        return value
+
+    def _warn_on_buffer_trim(self, now_ns: int) -> None:
+        """
+        Log a backed-off WARN while the parser is trimming its buffer.
+
+        A framing stall (misconfigured terminator, or UART corruption of the
+        framing byte) lasts hours in the field and trims once per serial
+        read, so a WARN per diagnostics tick would be ~18k lines -- on top
+        of the stale-reading ERROR this same method already emits. The first
+        trim warns immediately; the minimum interval then doubles after each
+        WARN up to a 5-minute ceiling, and resets once a full ceiling passes
+        with no further trims so a later, separate stall is loud again.
+        """
+        trim_count = self._parser.buffer_trim_count
+        dropped = self._parser.buffer_dropped_bytes
+
+        if trim_count == self._last_buffer_trim_count:
+            if (self._last_trim_warn_ns is not None
+                    and (now_ns - self._last_trim_warn_ns) / 1e9
+                    >= self._TRIM_WARN_MAX_INTERVAL_S):
+                self._trim_warn_interval_s = 0.0
+            return
+
+        self._last_buffer_trim_count = trim_count
+        if self._last_trim_warn_ns is not None:
+            elapsed = (now_ns - self._last_trim_warn_ns) / 1e9
+            if elapsed < self._trim_warn_interval_s:
+                return
+
+        since_last = dropped - self._last_warned_dropped_bytes
+        self.get_logger().warning(
+            f'Parser buffer overflowed: dropped {since_last} B since the last '
+            f'warning ({dropped} B over {trim_count} trims, cap '
+            f'{self._parser_max_buffer_bytes} B). Sentences are not framing -- '
+            f'check the line terminator and the serial wiring.')
+        self._last_warned_dropped_bytes = dropped
+        self._last_trim_warn_ns = now_ns
+        self._trim_warn_interval_s = min(
+            self._trim_warn_interval_s * 2 or 1.0,
+            self._TRIM_WARN_MAX_INTERVAL_S)
 
     def _build_udp_targets(self) -> List[_UdpTarget]:
         hosts_raw = list(self.get_parameter('udp_hosts').value or [])
@@ -291,6 +368,8 @@ class SoundSpeedBridgeNode(Node):
             msg_text = (f'Reading {last_value:.3f} m/s outside '
                         f'[{self._valid_min:.1f}, {self._valid_max:.1f}]')
 
+        self._warn_on_buffer_trim(now_ns)
+
         status = DiagnosticStatus()
         status.level = level
         status.name = 'sound_speed_bridge'
@@ -303,6 +382,10 @@ class SoundSpeedBridgeNode(Node):
             KeyValue(key='last_age_s', value=f'{last_age:.2f}'),
             KeyValue(key='parser_rate_hz', value=f'{self._rate_hz:.2f}'),
             KeyValue(key='parse_error_count', value=str(self._parse_error_count)),
+            KeyValue(key='buffer_dropped_bytes',
+                     value=str(self._parser.buffer_dropped_bytes)),
+            KeyValue(key='buffer_trim_count',
+                     value=str(self._parser.buffer_trim_count)),
             KeyValue(key='udp_send_error_count',
                      value=str(self._udp_send_error_count)),
             KeyValue(key='serial_reconnect_count',
