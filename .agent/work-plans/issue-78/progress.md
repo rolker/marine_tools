@@ -834,13 +834,58 @@ are untouched by this pass.
 **CI**: all-pass
 
 ### Findings
-- [ ] (cross-confirmed: Copilot + Local Review round 1 deferred suggestion) the serial thread's `_handle_reading()` publishes `sound_speed`/`raw` with no call-level shutdown guard; a SIGINT between the `_stop_event` check and a publish lets `RCLError` escape `_serial_loop` as a thread traceback — apply the [SW4] guard to those publishes with a forced-ordering regression test — `sound_speed_bridge/node.py:765` (and `_handle_reading`)
-- [ ] (cross-confirmed: Copilot ×2 + Local Review round 5 residual) `garmin_sidescan` and `kongsberg_em_bridge` have no committed real-SIGINT subprocess test; add the harness the other two packages have — `garmin_sidescan/node.py:1122`, `kongsberg_em_bridge/node.py:749`
-- [ ] (must-fix, Copilot inline + suppressed ×2) "a line longer than the cap can never frame" is too absolute: the cap applies after framing, so a long line frames when it and its terminator arrive in one `feed()`; only residue exceeding the cap before a terminator is discarded — reword in `parsers.py:138`, the node parameter description (`node.py:106`), and `plan.md:307`
-- [ ] (low, Copilot) stale comment: parser no longer owns two plain ints; it is one `_trim_stats` tuple with read-only views — `node.py:207`
-- [ ] (low, Copilot ×3) plan records: self-check "two source files, three test files" is stale (`plan.md:520`); verification record omits `garmin_sidescan` (`plan.md:586`); #88 out-of-scope line should list the two counters too (`plan.md:486`)
+- [x] (cross-confirmed: Copilot + Local Review round 1 deferred suggestion) the serial thread's `_handle_reading()` publishes `sound_speed`/`raw` with no call-level shutdown guard; a SIGINT between the `_stop_event` check and a publish lets `RCLError` escape `_serial_loop` as a thread traceback — apply the [SW4] guard to those publishes with a forced-ordering regression test — `sound_speed_bridge/node.py:765` (and `_handle_reading`)
+- [x] (cross-confirmed: Copilot ×2 + Local Review round 5 residual) `garmin_sidescan` and `kongsberg_em_bridge` have no committed real-SIGINT subprocess test; add the harness the other two packages have — `garmin_sidescan/node.py:1122`, `kongsberg_em_bridge/node.py:749`
+- [x] (must-fix, Copilot inline + suppressed ×2) "a line longer than the cap can never frame" is too absolute: the cap applies after framing, so a long line frames when it and its terminator arrive in one `feed()`; only residue exceeding the cap before a terminator is discarded — reword in `parsers.py:138`, the node parameter description (`node.py:106`), and `plan.md:307`
+- [x] (low, Copilot) stale comment: parser no longer owns two plain ints; it is one `_trim_stats` tuple with read-only views — `node.py:207`
+- [x] (low, Copilot ×3) plan records: self-check "two source files, three test files" is stale (`plan.md:520`); verification record omits `garmin_sidescan` (`plan.md:586`); #88 out-of-scope line should list the two counters too (`plan.md:486`)
 - [x] (low, Copilot) PR description floor wording — updated host-side
-- [ ] (carried, Local Review round 5) `quiet_on_shutdown` docstring overstates "a genuine fault stays loud" — add the coinciding-shutdown caveat
+- [x] (carried, Local Review round 5) `quiet_on_shutdown` docstring overstates "a genuine fault stays loud" — add the coinciding-shutdown caveat
 
 ### False positives
 - (Copilot, `node.py:103`) "add the parameter/counter/topic README with this change" — deferred by explicit operator decision at the #77 publish gate (README filed as rolker/marine_tools#88, scope widened by comment to carry `parser_max_buffer_bytes`, `buffer_dropped_bytes`, `buffer_trim_count`); not a defect in this PR.
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 13:52 -04:00
+**By**: Claude Code Agent (Claude Opus 5 (1M context))
+
+**PR**: #91 at `565b738` (branch `feature/issue-78`; not pushed)
+**Addressed**: `## Integrated Review` (Copilot round 4), When 2026-09-15 13:40 -04:00, reviewed head `6d5d84b`
+**Commits**: 9b4316e, 2279c45, e5b618f, e841a54, 60dd149, 565b738
+
+### Actions
+- [x] (cross-confirmed) [SW4] call-level guard on the serial thread's publishes — the body of `_handle_reading` moves into `_publish_reading()` so one guard covers `sound_speed`, `raw`, `temperature`/`pressure` and the UDP error path's logging; `RCLError`/`InvalidHandle` caught, `rclpy.ok(context=...)` consulted only after the failure, non-RCL errors not swallowed. `_publish_serial_tap` needs no guard (its own broad counted/logged except). Four forced-ordering tests against a real shut-down `Context`, including a synchronous `_serial_loop` run that must consume every chunk — `sound_speed_bridge/sound_speed_bridge/node.py:609`, `sound_speed_bridge/test/test_shutdown_guard.py` (9b4316e)
+- [x] (cross-confirmed) real-SIGINT subprocess tests for `garmin_sidescan` and `kongsberg_em_bridge`, matching the harness the other two packages carry (I/O mocked, real SIGINT, exit 0 and no traceback, `timeout=120`, no skip conditions) — `garmin_sidescan/test/test_main_shutdown.py`, `kongsberg_em_bridge/test/test_main_shutdown.py` (2279c45)
+- [x] (must-fix) "a line longer than the cap can never frame" reworded in all three places: a long line still frames when it and its terminator arrive within one `feed()`; only residue reaching the cap before a terminator is trimmed and resynced away, so an undersized cap loses the sentences that straddle a read boundary. Sizing guidance kept — `sound_speed_bridge/sound_speed_bridge/parsers.py:130`, `node.py:106`, `plan.md:418` (e5b618f)
+- [x] (low) stale counter comment now describes the single `_trim_stats` tuple and its read-only views — `sound_speed_bridge/sound_speed_bridge/node.py:201` (e841a54)
+- [x] (carried) `quiet_on_shutdown` docstring states the trade: a real RCL fault coinciding with a shutdown is swallowed, because after the fact the two are indistinguishable; loud while running, quiet while shutting down — `garmin_sidescan/garmin_sidescan/node.py:88` (60dd149)
+- [x] (low) plan records: self-check now says four packages rather than "two source files, three test files"; the verification record covers all four entry points including `garmin_sidescan` and notes the execution is now committed as tests; the #88 out-of-scope line names `parser_max_buffer_bytes`, `buffer_dropped_bytes` and `buffer_trim_count` — `plan.md` (565b738, 2279c45)
+
+### Plan sync
+
+The [SW4] extension is recorded in `plan.md` as an extension of [SW4] (same defect class, same package, same operator standing decision, raised by Copilot on the PR) — not a new SW number: new `#### [SW4] extension` subsection, plus the Consequences and Files-to-Change rows. The round-5 residuals list is now empty: both remaining items were addressed above.
+
+### Deferred
+
+- none. The README finding stands as the review recorded it — a false positive by explicit operator decision at the #77 publish gate (README is rolker/marine_tools#88); no README was written and the checkbox was left as-is.
+
+### Verification
+
+Built and tested from the worktree's `sensors_ws` (`./sensors_ws/build.sh` / `./sensors_ws/test.sh`, all four packages). `colcon test-result --test-result-base sensors_ws/build/<pkg>`:
+
+- `sound_speed_bridge`: `Summary: 141 tests, 0 errors, 0 failures, 0 skipped`
+- `zda_serial_bridge`: `Summary: 47 tests, 0 errors, 0 failures, 0 skipped`
+- `kongsberg_em_bridge`: `Summary: 60 tests, 0 errors, 0 failures, 0 skipped`
+- `garmin_sidescan`: `Summary: 93 tests, 0 errors, 0 failures, 0 skipped`
+
+flake8 and pep257 run inside each of the four suites and are clean.
+
+**Mutation checks** (out-of-tree copies under the scratchpad; the worktree was never mutated):
+
+- removing the `_handle_reading` guard fails `test_a_reading_publish_is_quiet_once_the_context_is_shut_down` and `test_the_serial_loop_survives_a_shutdown_race_on_a_publish` (2 failed, 5 passed)
+- restoring the pre-fix `main()` (`except KeyboardInterrupt` + plain `rclpy.shutdown()`) fails the new `test_sigint_exits_zero_without_a_traceback` in both `garmin_sidescan` and `kongsberg_em_bridge`
+
+### Next step
+
+Lifecycle: **Implementation** → **review-code** (fresh-context re-review of these fixes).
