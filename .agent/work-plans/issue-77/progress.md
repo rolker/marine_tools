@@ -93,3 +93,15 @@ separation) — belongs in `marine_tools`, not the workspace repo.
 - [ ] Cross-link with #78 in the PR description (shared `_serial_loop`/`parsers.py` region), even though #77 does not functionally block on #78
 - [ ] Add tests for unframeable-garbage capture, no byte loss/duplication across chunks, and the existing shutdown-race guard applied to the new publish path
 - [ ] Decide whether a `sound_speed_bridge` README is now warranted (pre-existing gap, not required to fix here, but worth a deliberate yes/no)
+
+## Plan Authored
+**Status**: complete
+**When**: 2026-09-15 08:42 -04:00
+**By**: Claude Code Agent (Claude Sonnet)
+
+**Plan**: `.agent/work-plans/issue-77/plan.md` at `5f8cc9b`
+**Branch**: feature/issue-77 at `5f8cc9b`
+**Phases**: single
+
+### Open questions
+- [ ] No open questions — plan is review-plan-ready.
