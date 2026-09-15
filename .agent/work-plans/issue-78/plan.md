@@ -253,12 +253,15 @@ miss — costing one extra discarded sentence per trim.
   longest legitimate configured regex line (~256 B; AML sentences are
   under 32 B), and ~5 s of wire at 800 B/s. It bounds the multi-MB hazard
   by roughly three orders of magnitude.
-- **Floor 256, `ValueError` below it**: 256 B is simultaneously the serial
-  read size (`node.py:178`) and the longest legitimate sentence. Below
-  that floor, every single read chunk would overflow the cap even in
-  healthy traffic, and a legitimate long sentence could never frame at
-  all. Above it, trimming can only ever be triggered by unframed residue,
-  i.e. by a genuine framing stall. Validated identically in the ABC and at
+- **Floor 256, `ValueError` below it**: 256 B is the serial read size
+  (`node.py:178`). Below that floor, every single read chunk would
+  overflow the cap even in healthy traffic. The floor is a sanity bound,
+  not a line-length guarantee: `regex_pattern` bounds nothing, so the cap
+  must be sized above the longest legitimate sentence of the configured
+  protocol (AML ~11 B, BizzyBoat `$AML,SVM` ~32 B; the 4096 default leaves
+  >100x margin) — a longer line can never frame and is discarded. Sized
+  that way, trimming can only ever be triggered by unframed residue, i.e.
+  by a genuine framing stall. Validated identically in the ABC and at
   the node parameter declaration.
 
 **Honest statement of what the cap loses** **[PR-F6]**: rev 1 claimed the
