@@ -105,3 +105,40 @@ separation) — belongs in `marine_tools`, not the workspace repo.
 
 ### Open questions
 - [ ] No open questions — plan is review-plan-ready.
+
+## Plan Review
+**Status**: complete
+**When**: 2026-09-15 08:46 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Plan**: `.agent/work-plans/issue-77/plan.md` at `5f8cc9b`
+**PR**: PR-less (dispatched fresh-context sub-agent; independent of the plan author)
+**Verdict**: changes-requested
+
+### Evaluation
+
+| Dimension | Verdict | Notes |
+|---|---|---|
+| Scope | Good | Two files, one publisher, one counter, four tests — single PR |
+| Issue alignment | Good | All three design points the issue left open are settled with rationale; all five `## Issue Review` actions are addressed |
+| File targeting | Needs work | `node.py` + `test_node.py` are right, but the test harness change `_make_node` needs (finding 6) is unlisted, and two stale in-file comments are missed (finding 2) |
+| Consequences | Needs work | Reconnect discontinuity unqualified (3); `/diagnostics` record-list dependency unstated (4) |
+| Documentation & instruction impact | Concern | Section is present and non-silent, but its "Stale docs: None" claim is factually wrong — see finding 2 |
+| Principle alignment | Needs work | "Only what's needed" volume rationale rests on a wrong derivation (5); "Improve incrementally" broken by the publish-ordering change (1) |
+| ADR compliance | Good | ADR-0008 satisfied (bare relative name, RELIABLE, `UInt8MultiArray`, matching the `raw` publisher); ADR-0013 followed |
+| ROS conventions | Good | One minor unrecorded decision: `UInt8MultiArray` has no header, so bag receive time is the tap's only time base (8) |
+
+### Field-evidence check (host scenario, 17 BizzyBoat bags)
+
+- **Silent vs. corrupt**: the corrupt case is served — glitch bytes and all-NUL chunks still return from `ser.read(256)` and are published verbatim, so the bag shows bytes arriving that never framed. The silent case is inferred from *absence* of tap messages, which is only sound if the `tap_byte_count` diagnostic is in the bag; see finding 4.
+- **Volume**: acceptable. At the field probe's 25 Hz with an 11-byte AML sentence (`1500.123\r\r\n`) the wire carries ~275 B/s, so `read(256)` returns roughly once per second → ~1.1 Hz tap, ~32k messages and ~8 MB of payload over an 8 h recording. Hard bound is baud/10 = 960 B/s at the default 9600 baud → ≤27.6 MB per 8 h. The plan's own estimate (~4–8 Hz, 1–2 KB/s) is ~4x high but conservative; see finding 5.
+
+### Findings
+- [ ] (must-fix) Tap publish placed before `self._parser.feed()` violates this file's explicit exception-isolation rule (`node.py:219-221`): `_serial_loop` catches only `(SerialException, OSError)`, so an unexpected error from the diagnostic publish kills the serial thread and stops all readings — failing in exactly the degraded condition the tap exists for. Publish after the feed loop, or wrap in its own `try/except`, and record which — `plan.md` Approach step 2
+- [ ] (must-fix) "Stale docs: None" is wrong: `node.py:107` ("See rolker/marine_tools#77 for a true byte-stream tap") and `test/test_node.py:9` both describe this tap as future work and must be repointed at `serial_tap` in this PR — both are in files the plan already edits — `plan.md` Documentation & Instruction Impact
+- [ ] (should-fix) Byte-exact-reconstruction claim is unqualified but false across a serial reconnect (`node.py:184-190` reopens after SerialException with no in-band marker) — the bus-sag case the field evidence produces; qualify it and name `serial_reconnect_count` as the cross-check — `plan.md` Design Decision 2
+- [ ] (should-fix) Distinguishing "probe silent" from "node/topic absent" rests entirely on the new `tap_byte_count` diagnostic, so `/diagnostics` must be in the deployment bag record list (echoboats#396, the same contract the `raw` test cites); state that as a consequence — `plan.md` Approach step 3 / Consequences
+- [ ] (should-fix) Rate/volume rationale derives the tap rate from *baud* (link capacity) rather than the probe's sentence rate; restate with the field numbers above and the baud/10 hard bound — same conclusion, sounder record — `plan.md` Design Decision 2
+- [ ] (should-fix) All four new tests must drive `_serial_loop`, but the shared `_make_node` helper deliberately kills the serial thread right after construction (`test_node.py:31-62`) and every existing test calls `_handle_reading` directly; name the harness work (second helper or direct `_serial_loop()` call with a `side_effect` that sets `_stop_event`) and preserve `_make_node`'s busy-spin rationale — `plan.md` Approach step 4
+- [ ] (suggestion) Context attributes non-framing to "the CRLF regex framer", but the default/field parser is `aml`, which frames on a single `\r` (`parsers.py:76`); conclusion holds for both, but the rationale record should name the right framer — `plan.md` Context
+- [ ] (suggestion) Record as a decision that `UInt8MultiArray` carries no header, so bag receive time is the tap's only time base — acceptable (`raw` is the same) but post-hoc temporal correlation is the tap's whole purpose — `plan.md` Approach step 1
