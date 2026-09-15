@@ -1015,3 +1015,22 @@ the [SW4] extension and round-4 fixes (`9b4316e`, `2279c45`, `e5b618f`, `e841a54
 - [ ] (latent, round 6) garmin `main()` constructs outside its `try` — recorded in plan as a sixth-widening candidate for the operator
 
 garmin_sidescan: `Summary: 93 tests, 0 errors, 0 failures, 0 skipped`; layer: 341/341.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-09-15 14:15 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #91 at `3e68e1d`
+**Sources**: 2 (Copilot R5 @ `3e68e1d` — 5 inline + 4 suppressed; CI rollup)
+**Cross-source confirmations**: 0
+**CI**: all-pass
+
+### Findings (all fixed host-inline; operator wrap-up at 15:00, no separate local review round — changes are small and each carries a test)
+- [x] (must-fix, Copilot) garmin startup thread: stop checked only before the range command; a stop landing during that send could let a startup ON follow the final OFF — ON now gated on the stop event; test
+- [x] (should-fix, Copilot ×2) `InvalidHandle` after the node's own stop is teardown even with a live context (worker outliving the bounded join) — garmin decorator and sound_speed_bridge guard treat the stop event as teardown; tests on a live context
+- [x] (should-fix, Copilot) `main()` caught only `ValueError`; an override of the wrong ROS type raises `InvalidParameterTypeException` before validation — caught, one FATAL, exit 1; test with `:=4096.0`
+- [x] (low, Copilot) README claimed an unconditional join — now "bounded join attempted; the stop event prevents a later command"
+
+### False positives
+- (Copilot ×4 inline, all four nodes) "`InvalidHandle` is provided by `rclpy.handle`, not `rclpy.exceptions`; the import fails at load" — verified in the Jazzy environment: `from rclpy.exceptions import InvalidHandle` succeeds and `rclpy.handle` does not exist (ModuleNotFoundError); the committed real-SIGINT subprocess tests load and run every entry point.
