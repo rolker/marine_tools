@@ -126,3 +126,35 @@ with the defect.
 
 ### Open questions
 - [ ] No open questions — plan is review-plan-ready.
+
+## Plan Review
+**Status**: complete
+**When**: 2026-09-15 10:13 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Plan**: `.agent/work-plans/issue-78/plan.md` at `11242d6`
+**PR**: PR-less (`--issue` mode, dispatched sub-agent — independent of the plan author)
+**Verdict**: changes-requested
+
+Evaluation: scope Good (single PR, two source + two test files); issue alignment
+Good (all four review-issue actions are answered); file targeting Needs work (test
+file split, see F7); consequences Needs work (fragment semantics and the #89
+conflict surface, F1/F8); documentation impact Good; principle alignment Needs work
+("Test what breaks" — the drop-oldest test as written asserts the wrong thing, F4);
+ADR compliance Good (ADR-0008 param pattern, ADR-0013 vocabulary); ROS conventions
+Good (static param, declare + construct-time `ValueError`, additive `KeyValue`, no
+new topic — matches the operator's no-added-bag-volume preference).
+
+### Findings
+- [ ] (must-fix) Drop-oldest leaves a mid-sentence fragment at the buffer front, and the next terminator frames it as a whole sentence — for `RegexParser` a fragment can `search`-match and publish a plausible-but-wrong sound speed on the RELIABLE `sound_speed` topic. The cap must mark the residue suspect and discard through the next terminator; plan has no such rule — `plan.md` step 1 (drop-oldest bullet)
+- [ ] (must-fix) Trim-before-frame drops complete framable sentences: `_append_and_trim` trims on append, before `feed()`'s framing loop runs, so any `ser.read(256)` chunk (`node.py:178`) larger than the cap loses whole terminated sentences silently (+1 on a trim counter). Safe at the 4096 default, silent data loss at any configured cap < 256. Trim the *residue at the end of `feed()`* instead (cap then means "max unframed residue", independent of chunk size), or enforce a floor >= the serial read size — `plan.md` step 1
+- [ ] (must-fix) The stated field mechanism is contradicted by the code it cites: `AMLParser._TERMINATOR` is a bare `\r` (`parsers.py:75,89`), so LF->NUL alone never stalls the AML buffer — only corruption of the `\r` itself does. Name which parser the field unit ran and restate the mechanism; the 4 KiB sizing rationale rests on it — `plan.md` Context
+- [ ] (must-fix) Related, and not fixed by this issue: under LF->NUL on the `aml` parser the NUL survives framing (`lstrip(b'\n')` at `parsers.py:88` does not strip NUL), so every subsequent sentence parses NaN (verified: `Decimal('\x001500.0')` raises `InvalidOperation`). #78's cap does nothing for that failure. File a follow-up so #78 is not recorded as the field fix — `plan.md` Context
+- [ ] (must-fix) The plan's own drop-oldest test asserts the wrong outcome: feeding unframed garbage past the cap then "a well-formed sentence" frames `garbage+sentence` as one line and yields NaN, not a correct reading. The test must flush the fragment with a terminator first, then assert the *following* sentence frames — `plan.md` step 8
+- [ ] (suggestion) "never truncating a real sentence" is not true of the case the cap exists for: during a stall the framed unit is the glued multi-sentence line (field data shows sentences joined by `\r\x00`), and 4 KiB truncates it by ~3 orders of magnitude. The 4096 default is otherwise well argued and accepted (~5 s at 800 B/s, 16x the 256 B read chunk, 16x the longest configured regex line) — state the loss honestly, and that #77's `serial_tap` is the recovery path for the dropped bytes — `plan.md` step 2
+- [ ] (suggestion) Count bytes dropped, not trim events: at 25 Hz a stall produces one trim per chunk, so `buffer_trim_count` is a proxy for elapsed time; bytes-dropped is the actionable number for both the `KeyValue` and the WARN text — `plan.md` steps 1, 4, 6
+- [ ] (suggestion) 1 Hz WARN over a 1-5 h field stall is ~18k log lines, and `_publish_diagnostics` already reports ERROR (stale reading) throughout that window, so the WARN adds little after the first. Back off after the first trim (e.g. <=1/60 s) — `plan.md` step 5
+- [ ] (suggestion) `RegexParser` tests live in `test/test_regex_parser.py`; `test/test_parsers.py` is AML-only. The plan puts both parsers' new tests in `test_parsers.py` — `plan.md` step 8, Files to Change
+- [ ] (suggestion) The #89 conflict surface is two files, not one: PR #89 also edits `test_node.py` and node docstrings. State that whoever merges second rebases, and that #89 (4 review rounds, field check still open) re-runs its 62-test suite — `plan.md` Branch sequencing
+- [ ] (suggestion) Add a boundary test for a terminator straddling the trim (a kept `\r` with `\n` next, and a trim cutting inside `\r\n`). Verified benign today — `RegexParser`'s `line.strip()` and `AMLParser`'s `lstrip(b'\n')` absorb the orphan — but nothing pins it — `plan.md` step 8
+- [ ] (suggestion) Record that the cap also bounds the pre-existing per-chunk O(n) cost (`lstrip` + slice rebuild the whole buffer each framing iteration); trimming itself is O(cap) = 4 KiB per chunk at 25 Hz, negligible. Also move `self._buffer` initialization into the ABC alongside the helper that mutates it, and add the new parameter to the package README when #88 lands — `plan.md` steps 1, 7
