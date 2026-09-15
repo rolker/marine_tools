@@ -11,7 +11,13 @@ frames (e.g. wrong baud) publishes nothing there.
 The ``serial_tap`` topic covers exactly that gap (rolker/marine_tools#77):
 it carries every chunk ``ser.read()`` returns, verbatim and pre-framing, so
 unframeable garbage — the field failure mode, where bus-voltage sag
-corrupts the line terminator — still reaches the bag.
+corrupts the line terminator — still reaches the bag. It is gated on the
+``serial_tap_enabled`` parameter, which defaults to **off**: while off the
+publisher does not exist and the topic is not advertised at all. The
+parameter is toggled live through the node's set-parameters callback, so
+the tap tests below enable it explicitly
+(``_make_node(..., tap_enabled=True)``) and a dedicated group covers the
+default-off, topic-lifecycle and runtime-toggle behaviour.
 
 ``raw`` tests exercise :meth:`SoundSpeedBridgeNode._handle_reading`
 directly with mocked serial I/O, following the
@@ -20,11 +26,13 @@ drive :meth:`SoundSpeedBridgeNode._serial_loop` itself, via the
 ``_drive_serial_loop`` harness below, because the tap publish lives there.
 """
 
+import time
 from unittest.mock import MagicMock, patch
 
 from diagnostic_msgs.msg import DiagnosticArray
 import pytest
 import rclpy
+from rclpy.parameter import Parameter
 from sound_speed_bridge.node import SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import RegexParser, SoundSpeedReading
 from std_msgs.msg import UInt8MultiArray
@@ -37,7 +45,23 @@ def _ros_context():
     rclpy.shutdown()
 
 
-def _make_node(mock_serial_cls) -> SoundSpeedBridgeNode:
+def _set_tap_enabled(node, value):
+    """
+    Set ``serial_tap_enabled`` the way an operator does, and assert it took.
+
+    ``set_parameters`` runs the node's registered set-parameters callback
+    synchronously, so no spin is needed and the flag is applied by the time
+    this returns — the same path ``ros2 param set`` drives.
+    """
+    results = node.set_parameters(
+        [Parameter('serial_tap_enabled', Parameter.Type.BOOL, value)])
+    assert all(r.successful for r in results), [r.reason for r in results]
+    assert node._serial_tap_enabled is value
+    assert (node._tap_pub is not None) is value
+    assert node.get_parameter('serial_tap_enabled').value is value
+
+
+def _make_node(mock_serial_cls, tap_enabled: bool = False) -> SoundSpeedBridgeNode:
     """
     Build a real node with the serial port mocked out and its serial thread stopped.
 
@@ -47,6 +71,13 @@ def _make_node(mock_serial_cls) -> SoundSpeedBridgeNode:
     running would busy-spin at full CPU for the node's lifetime. These tests
     drive :meth:`SoundSpeedBridgeNode._handle_reading` directly and never need
     the thread, so it is stopped deterministically right after construction.
+
+    ``serial_tap`` is off by default (operator decision, #77) and its
+    publisher does not exist until enabled, so the tap tests pass
+    ``tap_enabled=True``. It is enabled the way an operator does it — through
+    ``set_parameters`` and therefore through the node's real set-parameters
+    callback, which is what creates the publisher — rather than by poking node
+    internals, so every tap test also exercises the enable path it depends on.
     """
     port = MagicMock()
     port.read.return_value = b''
@@ -65,11 +96,18 @@ def _make_node(mock_serial_cls) -> SoundSpeedBridgeNode:
         # on the real publisher, before any test swaps in a mock.
         assert node._raw_pub.topic_name == '/raw'
         assert node._raw_pub.msg_type is UInt8MultiArray
-        # Same contract for the pre-framing tap: a bare relative `serial_tap`
-        # of type UInt8MultiArray, so a rename is caught here rather than by a
-        # deployment bag that turns out to be missing the topic.
-        assert node._tap_pub.topic_name == '/serial_tap'
-        assert node._tap_pub.msg_type is UInt8MultiArray
+        # Off by default means no publisher at all, not a silent one.
+        assert node._tap_pub is None
+        assert node._serial_tap_enabled is False
+        if tap_enabled:
+            _set_tap_enabled(node, True)
+            # Same external contract as `raw`, checked on the real publisher
+            # the enable path just created and before any test swaps in a
+            # mock: a bare relative `serial_tap` of type UInt8MultiArray, so a
+            # rename is caught here rather than by a deployment bag that turns
+            # out to be missing the topic.
+            assert node._tap_pub.topic_name == '/serial_tap'
+            assert node._tap_pub.msg_type is UInt8MultiArray
     except BaseException:
         node.destroy_node()
         raise
@@ -151,7 +189,9 @@ def test_handle_reading_noop_after_stop(mock_serial_cls):
         node.destroy_node()
 
 
-def _drive_serial_loop(node, mock_serial_cls, chunks, stop_before_index=None):
+def _drive_serial_loop(
+    node, mock_serial_cls, chunks, stop_before_index=None, before_chunk=None,
+):
     """
     Run :meth:`SoundSpeedBridgeNode._serial_loop` synchronously over ``chunks``.
 
@@ -168,6 +208,12 @@ def _drive_serial_loop(node, mock_serial_cls, chunks, stop_before_index=None):
     - ``stop_before_index`` sets the stop event *before* returning the chunk
       at that index, which is how the shutdown-guard test reaches the tap
       publish with the event already set.
+    - ``before_chunk(index)``, when given, is called just before the chunk at
+      that index is returned from ``read``. That is the only point at which a
+      test can change node state *between* two chunks of one synchronous loop
+      run, which is what the runtime-toggle test needs: it flips
+      ``serial_tap_enabled`` through the real set-parameters callback while
+      the reader is mid-stream.
 
     The real parser is left in place so "garbage yields no readings" is
     asserted against the actual framing code.
@@ -184,6 +230,8 @@ def _drive_serial_loop(node, mock_serial_cls, chunks, stop_before_index=None):
         state['index'] += 1
         if stop_before_index is not None and index == stop_before_index:
             node._stop_event.set()
+        if before_chunk is not None:
+            before_chunk(index)
         return remaining.pop(0)
 
     port.read.side_effect = _read
@@ -225,7 +273,7 @@ _FIELD_GARBAGE = (
 @patch('sound_speed_bridge.node.serial.Serial')
 def test_serial_tap_publishes_read_chunk(mock_serial_cls):
     """One ser.read() chunk publishes verbatim as one serial_tap message."""
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._tap_pub = MagicMock()
         chunk = b'1500.123\r\r\n'
@@ -246,7 +294,7 @@ def test_serial_tap_captures_unframeable_field_garbage(mock_serial_cls):
     yields no readings and `raw` publishes nothing, so before this topic
     existed the bag showed silence — indistinguishable from a dead probe.
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._parser = _field_regex_parser()
         node._tap_pub = MagicMock()
@@ -271,7 +319,7 @@ def test_serial_tap_captures_all_nul_chunk(mock_serial_cls):
     Nothing frames, so `raw` is silent; the tap must still show that bytes
     were arriving, which is what separates "wrong baud" from "no probe".
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._parser = _field_regex_parser()
         node._tap_pub = MagicMock()
@@ -295,7 +343,7 @@ def test_serial_tap_concatenation_reconstructs_stream(mock_serial_cls):
     parser still frames across the same boundaries, so the tap is shown not
     to disturb the primary path.
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._tap_pub = MagicMock()
         node._pub = MagicMock()
@@ -322,7 +370,7 @@ def test_serial_tap_noop_after_stop(mock_serial_cls):
     1 s past it, so the loop may return one last chunk after the publishers
     are destroyed — the tap's shutdown guard must swallow it.
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._tap_pub = MagicMock()
         _drive_serial_loop(
@@ -344,7 +392,7 @@ def test_serial_tap_publish_failure_is_counted_not_fatal(mock_serial_cls):
     exactly the degraded condition the tap exists to observe. The failure is
     counted and logged instead, never silent.
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._tap_pub = MagicMock()
         node._tap_pub.publish.side_effect = RuntimeError('publisher destroyed')
@@ -374,7 +422,7 @@ def test_tap_counters_surface_in_diagnostics(mock_serial_cls):
     /diagnostics belongs in the deployment record list alongside the topic
     (rolker/unh_echoboats_project11#396).
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         node._tap_pub = MagicMock()
         chunks = [b'1500.123\r\r\n', b'\x00\x00\x00']
@@ -424,7 +472,7 @@ def test_serial_tap_publishes_after_parser_feed(mock_serial_cls):
     green. This test asserts the relative order directly, per chunk, so the
     mutation fails here.
     """
-    node = _make_node(mock_serial_cls)
+    node = _make_node(mock_serial_cls, tap_enabled=True)
     try:
         log = []
         node._parser = _OrderRecordingParser(node._parser, log)
@@ -444,5 +492,266 @@ def test_serial_tap_publishes_after_parser_feed(mock_serial_cls):
             ('sound_speed', 1499.900),
             ('tap', chunks[1]),
         ]
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_disabled_by_default_publishes_nothing(mock_serial_cls):
+    """
+    With no parameter set, the tap publishes nothing but still counts bytes.
+
+    The operator decision for #77 is that the tap is off unless someone is
+    asking a framing question, so "default" here is the field's normal state:
+    no serial_tap messages in the bag, no bag volume spent, and the primary
+    SoundSpeed path completely unaffected. tap_byte_count keeps counting,
+    because it is the always-on, zero-cost answer to "is the probe silent?" —
+    an operator reading a frozen counter knows there is nothing to enable the
+    tap for, without having enabled it first.
+
+    The topic's own absence is covered by
+    ``test_serial_tap_topic_advertised_only_when_enabled``.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        node._raw_pub = MagicMock()
+        node._pub = MagicMock()
+        chunks = [b'1500.123\r\r\n', b'\x00' * 16]
+        _drive_serial_loop(node, mock_serial_cls, chunks)
+        # No mock is installed on the tap: the publisher's absence *is* the
+        # disabled state, so assigning one would enable the tap and test
+        # nothing. Nothing can have been published, and nothing errored.
+        assert node._tap_pub is None
+        assert node._tap_error_count == 0
+        # Wire bytes are still counted while disabled.
+        assert node._tap_byte_count == sum(len(c) for c in chunks)
+        # The primary path is untouched by the gate: the parseable sentence
+        # still produced its SoundSpeed and its raw passthrough.
+        assert node._pub.publish.call_count == 1
+        assert node._raw_pub.publish.call_count == 1
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_enabled_by_parameter_publishes(mock_serial_cls):
+    """
+    Enabling the parameter on a node that started disabled turns publishing on.
+
+    Enabling on the fly is the whole point of the parameter, so this drives
+    the real operator path — set_parameters, hence the node's registered
+    set-parameters callback — on a node constructed with the default.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        assert node._serial_tap_enabled is False
+        _set_tap_enabled(node, True)
+        node._tap_pub = MagicMock()
+        chunk = b'1500.123\r\r\n'
+        _drive_serial_loop(node, mock_serial_cls, [chunk])
+        assert node._tap_pub.publish.call_count == 1
+        assert bytes(node._tap_pub.publish.call_args.args[0].data) == chunk
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_runtime_toggle_takes_effect_mid_stream(mock_serial_cls):
+    """
+    An off -> on -> off toggle applies to the very next chunk, with no restart.
+
+    The gate is read per chunk rather than latched at startup, so a set that
+    lands while the reader is mid-stream must change what the *next* chunk
+    does — which is what an operator enabling the tap during a deployment is
+    relying on. The toggles here run through the real set-parameters callback
+    between chunks of one synchronous loop run.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        node._pub = MagicMock()
+        chunks = [b'1500.100\r\r\n', b'1500.200\r\r\n', b'1500.300\r\r\n']
+        published = []
+
+        def _toggle(index):
+            if index == 1:
+                _set_tap_enabled(node, True)
+                # Recorder installed on the publisher the enable just created
+                # — there is none to install it on beforehand.
+                node._tap_pub.publish = (
+                    lambda msg: published.append(bytes(msg.data)))
+            elif index == 2:
+                _set_tap_enabled(node, False)
+
+        _drive_serial_loop(node, mock_serial_cls, chunks, before_chunk=_toggle)
+        assert node._tap_pub is None
+        # Exactly the chunk read while enabled — not the one before, not the
+        # one after: the toggle is neither late by a chunk nor sticky.
+        assert published == [chunks[1]]
+        # Every byte counted, enabled or not.
+        assert node._tap_byte_count == sum(len(c) for c in chunks)
+        # All three sentences still reached the primary path.
+        assert node._pub.publish.call_count == 3
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_enabled_rejects_non_bool(mock_serial_cls):
+    """
+    A non-bool serial_tap_enabled is rejected, and the tap stays as it was.
+
+    Both layers are checked: rclpy's own type check against the declared
+    BOOL type (which rejects the set before the callback is reached — it
+    returns an unsuccessful result, it does not raise), and the callback's
+    own validation, called directly the way rclpy would call it. The second
+    layer is not redundant: it is the contract a caller reaching the callback
+    by any other route relies on.
+    The callback must not coerce — bool('false') is True, so coercion would
+    enable the tap for an operator who asked for the opposite.
+    """
+    node = _make_node(mock_serial_cls, tap_enabled=True)
+    try:
+        results = node.set_parameters(
+            [Parameter('serial_tap_enabled', Parameter.Type.STRING, 'false')])
+        assert [r.successful for r in results] == [False]
+        assert 'BOOL' in results[0].reason
+        assert node._serial_tap_enabled is True
+
+        result = node._on_set_parameters(
+            [Parameter('serial_tap_enabled', Parameter.Type.STRING, 'false')])
+        assert result.successful is False
+        assert 'bool' in result.reason
+        assert node._serial_tap_enabled is True
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_set_parameters_callback_leaves_other_parameters_alone(mock_serial_cls):
+    """
+    The callback accepts unrelated parameters and does not touch the tap flag.
+
+    Recorded as a deliberate decision (#77): every other parameter of this
+    node is read once at startup, and registering this callback does not
+    change that — it neither applies nor rejects them, which is exactly what
+    rclpy did before the callback existed. Rejecting startup parameters (as
+    garmin_sidescan's node does) is a separate, wider change.
+    """
+    node = _make_node(mock_serial_cls, tap_enabled=True)
+    try:
+        results = node.set_parameters(
+            [Parameter('variance', Parameter.Type.DOUBLE, 0.25)])
+        assert all(r.successful for r in results)
+        assert node._serial_tap_enabled is True
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_enabled_surfaces_in_diagnostics(mock_serial_cls):
+    """
+    /diagnostics reports whether the tap is currently publishing.
+
+    Now that the tap defaults to off, an absence of serial_tap messages in a
+    bag is ambiguous between "the probe was silent" and "nobody switched the
+    tap on". tap_byte_count separates silent from corrupt; this key separates
+    both from not-enabled, so an RCA can tell them apart from the bag alone.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        node._diag_pub = MagicMock()
+        node._publish_diagnostics()
+        values = {
+            kv.key: kv.value
+            for kv in node._diag_pub.publish.call_args.args[0].status[0].values
+        }
+        assert values['serial_tap_enabled'] == 'false'
+
+        _set_tap_enabled(node, True)
+        node._publish_diagnostics()
+        values = {
+            kv.key: kv.value
+            for kv in node._diag_pub.publish.call_args.args[0].status[0].values
+        }
+        assert values['serial_tap_enabled'] == 'true'
+    finally:
+        node.destroy_node()
+
+
+def _advertised_topics(node, topic, present, timeout_sec=5.0):
+    """
+    Wait for ``topic`` to appear/disappear from the node's advertised topics.
+
+    This is the ``ros2 topic list`` view — the node's own publishers as the
+    ROS graph reports them — rather than an internal attribute, because the
+    operator decision behind the gate is about what the graph shows. Graph
+    updates are asynchronous, so this polls with a bounded deadline instead
+    of asserting once; the ``/raw`` cross-check in the caller keeps an empty
+    or broken graph query from passing a ``present=False`` assertion
+    vacuously.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        names = [
+            name for name, _ in node.get_publisher_names_and_types_by_node(
+                node.get_name(), node.get_namespace())
+        ]
+        if (topic in names) == present:
+            return names
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f'{topic} {"missing from" if present else "still in"} '
+                f'{names} after {timeout_sec}s')
+        rclpy.spin_once(node, timeout_sec=0.05)
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_tap_topic_advertised_only_when_enabled(mock_serial_cls):
+    """
+    The serial_tap topic exists exactly while the tap is enabled.
+
+    The operator decision for #77 is "I would rather it only publish if we
+    enable it": while disabled the topic must not be advertised at all, so
+    `ros2 topic list` on an ordinary deployment shows no serial_tap and an
+    operator sees the tap appear when, and only when, they switch it on.
+    Asserted against the ROS graph, with /raw as the control — it is always
+    advertised, so its presence proves the query is answering.
+    """
+    node = _make_node(mock_serial_cls)
+    try:
+        names = _advertised_topics(node, '/serial_tap', present=False)
+        assert '/raw' in names
+
+        _set_tap_enabled(node, True)
+        names = _advertised_topics(node, '/serial_tap', present=True)
+        assert '/raw' in names
+
+        _set_tap_enabled(node, False)
+        names = _advertised_topics(node, '/serial_tap', present=False)
+        assert '/raw' in names
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_enabling_twice_keeps_the_same_publisher(mock_serial_cls):
+    """
+    A repeated enable (or disable) does not churn the publisher.
+
+    An operator re-issuing `ros2 param set ... true` to confirm the state, or
+    a launch file that sets what is already set, must not tear down and
+    re-advertise a live topic underneath a subscriber that is recording it.
+    """
+    node = _make_node(mock_serial_cls, tap_enabled=True)
+    try:
+        first = node._tap_pub
+        _set_tap_enabled(node, True)
+        assert node._tap_pub is first
+
+        _set_tap_enabled(node, False)
+        assert node._tap_pub is None
+        # A second disable is a no-op rather than an error.
+        _set_tap_enabled(node, False)
+        assert node._tap_pub is None
     finally:
         node.destroy_node()
