@@ -110,8 +110,10 @@ dynamically: the node publishes a `RadarControlSet` on `state` and accepts
 - Transmit-off is also sent on node shutdown — **after** the driver's worker
   threads have been stopped and joined, so it is the last command on the wire
   and the startup thread cannot put a `transmit_on_startup` ON behind it. The
-  joins are bounded (3 s for the whole set), so a wedged socket read delays
-  that OFF but can never block it.
+  joins are bounded (5 s for the whole set, the startup thread first because
+  it holds the command lock the OFF needs), so a wedged socket read delays
+  that OFF but can never block it; the OFF can additionally wait out one
+  in-flight startup command (up to 4 s) if that thread outlived the budget.
 - **No external sound-speed interlock.** The GCV stops pinging on its own when
   out of the water, so a dry transducer cannot overheat — the driver relies on
   that rather than a watchdog. This rests on a field observation (the unit stops

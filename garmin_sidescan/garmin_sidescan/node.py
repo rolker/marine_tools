@@ -60,13 +60,19 @@ CONFIG_GROUP, CONFIG_PORT = '239.254.2.11', 51000   # chartplotter CDP config (d
 GEN_VOTE_MIN = 5                # packets to vote before latching the generation
 
 # Total budget for joining the driver's daemon threads in destroy_node().
-# The longest blocking call any worker can be inside is _send's 2.0 s TCP
-# socket timeout (the startup thread); the two receive loops block at most on
+# The longest a worker can block is one _send() in the startup thread: the
+# 2.0 s socket timeout is per operation, so connect() and sendall() can each
+# spend it -- 4.0 s worst case. The two receive loops block at most on
 # _open_mcast's 1.0 s socket timeout, and every reconnect / repeat back-off is
-# an interruptible wait on _stop_event rather than time.sleep. 3.0 s is that
+# an interruptible wait on _stop_event rather than time.sleep. 5.0 s is that
 # worst case plus a second of scheduling slack. It is a budget for the whole
-# set, not per thread, so several wedged sockets cannot multiply it.
-SHUTDOWN_JOIN_TIMEOUT_S = 3.0
+# set, not per thread, so several wedged sockets cannot multiply it -- and
+# the startup thread is joined FIRST, because it is the one holding
+# _send_lock: if a wedged receive loop ate the budget ahead of it, the
+# transmit-OFF that destroy_node() sends next would block on that lock past
+# the budget. A thread that still misses the budget is a daemon and dies
+# with the process.
+SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 
 
 def imagery_diag_level(transmitting, ping_age, stale_after=3.0):
@@ -1135,7 +1141,9 @@ class GarminSidescanNode(Node):
         named in a WARN.
         """
         deadline = time.monotonic() + SHUTDOWN_JOIN_TIMEOUT_S
-        for thread in [self._rx_thread, *self._aux_threads, self._startup_thread]:
+        # Startup thread first: it is the only worker that takes _send_lock,
+        # which destroy_node()'s transmit-OFF needs right after this returns.
+        for thread in [self._startup_thread, self._rx_thread, *self._aux_threads]:
             if thread is None or not thread.is_alive():
                 continue
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -1167,8 +1175,12 @@ class GarminSidescanNode(Node):
         ``destroy_node`` consults neither.
 
         The joins are bounded (:data:`SHUTDOWN_JOIN_TIMEOUT_S`), so a wedged
-        socket read delays the OFF by a bounded interval rather than blocking
-        it: the threads are daemons and the process can still exit.
+        socket read delays the OFF by that budget rather than blocking it:
+        the threads are daemons and the process can still exit. The one
+        residual wait beyond the budget is ``_send_lock``: the startup thread
+        holds it while inside ``_send``, which is why it is joined first --
+        if it still outlives the budget, the OFF below waits for its current
+        ``_send`` (at most one connect + one sendall, 4 s) before going out.
         """
         self._stop_event.set()
         self._join_workers()
