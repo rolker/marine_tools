@@ -276,6 +276,22 @@ class SoundSpeedBridgeNode(Node):
         tap error, never a crashed reader thread.
         """
         if enabled:
+            # Check-then-act on _tap_pub without holding _tap_lock. That is
+            # safe only because this method has a single caller thread:
+            # __init__ (before anything spins) and the set-parameters
+            # callback, which main() runs on the one thread of a
+            # single-threaded rclpy.spin(). Two concurrent enables — what a
+            # MultiThreadedExecutor would allow — could both pass this check
+            # and each create a publisher, silently leaking the loser, and no
+            # single-threaded test could see it. Taking _tap_lock here
+            # instead was considered and rejected: it would put an RMW
+            # publisher create/destroy on the serial reader's critical path
+            # (_publish_serial_tap takes the same lock), which is exactly the
+            # coupling this lock was split off from self._lock to avoid. So
+            # the invariant, not the lock, is what holds: if this node ever
+            # moves to a multi-threaded executor, serialise the mutation
+            # here (a dedicated mutation lock, or a callback group that
+            # keeps the callback mutually exclusive).
             if self._tap_pub is not None:
                 return
             # Created outside the lock: create_publisher touches the node's
