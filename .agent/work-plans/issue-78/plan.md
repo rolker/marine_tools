@@ -7,6 +7,10 @@ https://github.com/rolker/marine_tools/issues/78
 > Revision 2 (2026-09-15) resolves all 5 must-fix and 7 should-fix findings
 > of the Plan Review entry in `progress.md`. Each resolution is marked
 > **[PR-F*n*]** against the finding it answers, with the rationale inline.
+>
+> Revision 3 (2026-09-15) syncs the plan with the fixes made for the
+> round-1 Local Review (Pre-Push); those are marked **[PR-R1-MF*n*]** /
+> **[PR-R1-S*n*]** against that entry's must-fix and suggestion numbering.
 
 ## Context
 
@@ -75,7 +79,7 @@ ABC state:
 | `_buffer` | unframed bytes (moved up from the concrete classes) |
 | `_max_buffer_bytes` | cap on **unframed residue** (see step 2) |
 | `_discarding` | True when the residue was trimmed and the remainder of that sentence must be thrown away |
-| `buffer_dropped_bytes` | total bytes discarded by trims (public, polled) |
+| `buffer_dropped_bytes` | total bytes that never became a reading — trimmed off the residue **plus** the head fragment `_resync()` discards through the next terminator (public, polled) |
 | `buffer_trim_count` | number of trim events (public, polled) |
 
 `AMLParser` gains `self._terminator = self._TERMINATOR` so the shared
@@ -181,7 +185,9 @@ chunk, so `buffer_trim_count` is really a proxy for elapsed stall time.
 **Decision: publish both, and lead with bytes.**
 
 - `buffer_dropped_bytes` is the actionable magnitude — how much of the
-  stream was lost — and is what the WARN text quotes.
+  stream was lost — and is what the WARN text quotes. It counts the
+  resync discard as well as the trim, so it matches that contract
+  **[PR-R1-MF1]**.
 - `buffer_trim_count` is kept because it is the cheap **edge detector**
   the node's back-off needs ("has any new trim happened since the last
   tick?"), and because it distinguishes one large overflow from a
@@ -189,8 +195,11 @@ chunk, so `buffer_trim_count` is really a proxy for elapsed stall time.
 
 Both are plain public attributes polled by `_publish_diagnostics`, matching
 how it already polls `self._rate_hz` and `self._parse_error_count` rather
-than being pushed updates. Cross-thread reads of a Python int are atomic
-under the GIL — the same assumption the existing counters already make.
+than being pushed updates. Each individual cross-thread read of a Python
+int is atomic under the GIL — the same assumption the existing counters
+already make — but the two are a *correlated pair*, so
+`_publish_diagnostics` reads both **once** per tick and uses that one
+snapshot for the WARN text and the KeyValues alike **[PR-R1-S5]**.
 
 ### 7. WARN: first trim immediately, then exponential back-off **[PR-F8]**
 
@@ -202,9 +211,11 @@ timer (no new timer):
 - the **first** trim WARNs immediately (interval starts at 0 s);
 - after each WARN the minimum interval doubles: 1, 2, 4, … s, **capped at
   300 s**;
-- if a tick sees no new trims and the last WARN is older than the 300 s
-  cap, the interval resets to 0 so a *later, separate* stall warns
-  promptly again.
+- if a tick sees no new trims and the **last trim observed** is older
+  than the 300 s cap, the interval resets to 0 so a *later, separate*
+  stall warns promptly again. The anchor is the last trim, not the last
+  WARN: a stall still trimming inside the back-off must never look quiet
+  **[PR-R1-S4]**.
 
 Volume over a 5 h stall: ~9 lines in the first ~9 minutes, then one per
 5 minutes — ≈70 lines total instead of ~18,000. The WARN text names the
@@ -318,8 +329,9 @@ Rationale and the conflict surface:
 
 | File | Change |
 |------|--------|
+| `sound_speed_bridge/launch/aml_svs.launch.py` | Add the `parser_max_buffer_bytes` launch argument at its default **[PR-R1-S8]** |
 | `sound_speed_bridge/sound_speed_bridge/parsers.py` | Move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
-| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` + floor validation; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
+| `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s |
 | `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap |
 | `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case |
 | `sound_speed_bridge/test/test_node.py` | Parameter validation; counters in `/diagnostics`; WARN once then backed off |
@@ -351,7 +363,7 @@ Rationale and the conflict surface:
 | `_publish_diagnostics` `KeyValue` list | PR #89, which edits the same list and `test_node.py` | Yes — Branch sequencing; textual, resolved by whoever merges second |
 | `parsers.py` docstrings | Cap/resync behaviour documented beside the framing quirks | Yes — step 9 |
 | A new node parameter | Package README parameter table | Deferred to #88 (no README exists yet) — step 9 |
-| A new node parameter | `launch/aml_svs.launch.py` | No change needed — the example launch sets only `device`/`baud`/`parser`/`frame_id` and leaves everything else at the node defaults, which now include the 4096-byte cap |
+| A new node parameter | `launch/aml_svs.launch.py` | Yes — the example launch surfaces the operator-tunable parameters, so `parser_max_buffer_bytes` is added as a launch argument at its 4096 default **[PR-R1-S8]** |
 
 ## Documentation & Instruction Impact
 
