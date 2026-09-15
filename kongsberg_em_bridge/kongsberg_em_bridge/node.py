@@ -35,6 +35,7 @@ from kongsberg_em_bridge import em_datagrams as em
 from marine_acoustic_msgs.msg import DetectionFlag, PingInfo, SonarDetections
 from marine_interfaces.msg import SonarInfo
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, qos_profile_sensor_data, QoSProfile,
                        ReliabilityPolicy)
@@ -700,16 +701,28 @@ class KongsbergEmBridge(Node):
 
 
 def main(args=None):
+    """
+    Entry point: spin the node until it is stopped.
+
+    A deliberate stop (Ctrl-C, ``ros2 launch`` shutdown, systemd
+    ``SIGINT``) must exit 0. rclpy's own signal handler shuts the context
+    down before this function sees anything, so ``spin()`` raises
+    ``ExternalShutdownException`` -- uncaught, that is exit 1 with a
+    traceback -- and ``rclpy.shutdown()`` in the ``finally`` then raises
+    ``RCLError: rcl_shutdown already called``. Catching the shutdown
+    exception and using the idempotent ``try_shutdown()`` keeps a
+    deliberate stop distinguishable from a real failure under
+    ``Restart=on-failure``.
+    """
     rclpy.init(args=args)
     node = KongsbergEmBridge()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

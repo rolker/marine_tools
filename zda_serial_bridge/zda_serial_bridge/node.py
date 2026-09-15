@@ -12,6 +12,7 @@ from typing import Optional
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sbg_driver.msg import SbgUtcTime
@@ -478,16 +479,28 @@ class ZdaSerialBridgeNode(Node):
 
 
 def main(args=None) -> None:
-    """Entry point: spin the bridge node until interrupted."""
+    """
+    Entry point: spin the node until it is stopped.
+
+    A deliberate stop (Ctrl-C, ``ros2 launch`` shutdown, systemd
+    ``SIGINT``) must exit 0. rclpy's own signal handler shuts the context
+    down before this function sees anything, so ``spin()`` raises
+    ``ExternalShutdownException`` -- uncaught, that is exit 1 with a
+    traceback -- and ``rclpy.shutdown()`` in the ``finally`` then raises
+    ``RCLError: rcl_shutdown already called``. Catching the shutdown
+    exception and using the idempotent ``try_shutdown()`` keeps a
+    deliberate stop distinguishable from a real failure under
+    ``Restart=on-failure``.
+    """
     rclpy.init(args=args)
     node = ZdaSerialBridgeNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

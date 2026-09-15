@@ -16,6 +16,7 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_interfaces.msg import SoundSpeed
 from rcl_interfaces.msg import ParameterDescriptor
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import FluidPressure, Temperature
@@ -448,6 +449,15 @@ def main(args=None) -> None:
     not a clean shutdown. The node still refuses to start; that is
     deliberate. A ValueError raised later, from a callback during spin,
     is not a start failure and is left to propagate as before.
+
+    A deliberate stop is exit 0. rclpy installs its own SIGINT
+    handler, which shuts the context down *before* the handler here runs:
+    ``spin()`` then raises ``ExternalShutdownException`` (uncaught, exit 1)
+    and a plain ``rclpy.shutdown()`` in the ``finally`` raises ``RCLError:
+    rcl_shutdown already called``. ``try_shutdown()`` is the idempotent
+    form, and it still shuts down when the process ends any other way.
+    Under ``Restart=on-failure`` the difference decides whether an operator
+    stopping a node gets it restarted under them.
     """
     rclpy.init(args=args)
     node = None
@@ -459,12 +469,12 @@ def main(args=None) -> None:
                 f'sound_speed_bridge failed to start: {exc}')
             raise SystemExit(1) from exc
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if node is not None:
             node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

@@ -13,11 +13,14 @@ I/O, following the ``zda_serial_bridge/test/test_node.py`` pattern.
 """
 
 import math
+import subprocess
+import sys
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.parameter import Parameter
 from sound_speed_bridge.node import main, SoundSpeedBridgeNode
 from sound_speed_bridge.parsers import SoundSpeedReading
@@ -441,3 +444,118 @@ def test_serial_thread_survives_a_non_finite_sentence(mock_serial_cls):
         assert node._parse_error_count == 3
     finally:
         node.destroy_node()
+
+
+# --- Shutdown: a deliberate stop is exit 0 ----------------------------------
+
+_SIGINT_HARNESS = """
+import os
+import signal
+import sys
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import sound_speed_bridge.node as node_mod
+
+port = MagicMock()
+
+
+def _read(*args, **kwargs):
+    time.sleep(0.02)
+    return b''
+
+
+port.read.side_effect = _read
+
+
+def _interrupt():
+    time.sleep(2.0)
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+threading.Thread(target=_interrupt, daemon=True).start()
+with patch.object(node_mod.serial, 'Serial') as serial_cls:
+    serial_cls.return_value.__enter__.return_value = port
+    sys.exit(node_mod.main())
+"""
+
+
+def test_sigint_exits_zero_without_a_traceback(tmp_path):
+    """
+    A real SIGINT to the console entry point exits 0 and prints no traceback.
+
+    rclpy's own signal handler shuts the context down before main()'s
+    finally runs, so rclpy.shutdown() raised RCLError ("rcl_shutdown
+    already called") and spin() raised an uncaught
+    ExternalShutdownException: Ctrl-C exited **1** with two tracebacks.
+    Under systemd Restart=on-failure or a launch file's on-exit handler,
+    an operator stopping the node deliberately was indistinguishable from
+    a crash -- and this package now exits 1 for a genuinely refused
+    parameter, which that noise would hide.
+
+    This runs the real entry point in a subprocess with the serial port
+    mocked out, because the behaviour under test *is* signal delivery.
+    """
+    script = tmp_path / 'sigint_main.py'
+    script.write_text(_SIGINT_HARNESS)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, timeout=120)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f'exit {proc.returncode}\n{combined}'
+    assert 'Traceback' not in combined, combined
+    assert 'rcl_shutdown already called' not in combined, combined
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_main_returns_cleanly_on_an_external_shutdown(mock_serial_cls):
+    """
+    An externally shut-down context ends main() quietly, not with a raise.
+
+    The in-process twin of the SIGINT test: it pins both halves of the fix
+    (catching ExternalShutdownException, and try_shutdown() over shutdown())
+    deterministically, without depending on signal delivery.
+    """
+    port = _serial_port_replaying([])
+    mock_serial_cls.return_value.__enter__.return_value = port
+
+    def _spin(_node):
+        rclpy.utilities.get_default_context().shutdown()
+        raise ExternalShutdownException()
+
+    rclpy.shutdown()  # main() does its own init
+    try:
+        with patch('sound_speed_bridge.node.rclpy.spin', side_effect=_spin):
+            main()  # must not raise
+        assert not rclpy.ok()
+    finally:
+        rclpy.init()  # restore the context the autouse fixture shuts down
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_a_valueerror_from_spin_is_not_reported_as_a_start_failure(mock_serial_cls):
+    """
+    The construction `except ValueError` must not span spin().
+
+    A ValueError raised later, from a callback during spin, is not a start
+    failure: logging it as one ("sound_speed_bridge failed to start") sends
+    an operator hunting a parameter problem that does not exist, and would
+    convert a mid-run fault into the refusal exit code. Widening the except
+    back over spin() must fail this test.
+    """
+    port = _serial_port_replaying([])
+    mock_serial_cls.return_value.__enter__.return_value = port
+    logger = MagicMock()
+    rclpy.shutdown()  # main() does its own init
+    try:
+        with patch('sound_speed_bridge.node.rclpy.logging.get_logger',
+                   return_value=logger):
+            with patch('sound_speed_bridge.node.rclpy.spin',
+                       side_effect=ValueError('mid-run fault')):
+                with pytest.raises(ValueError, match='mid-run fault'):
+                    main()
+        assert logger.fatal.call_count == 0
+        assert not rclpy.ok()
+    finally:
+        rclpy.init()  # restore the context the autouse fixture shuts down
