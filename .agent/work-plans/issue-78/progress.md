@@ -436,3 +436,46 @@ ament flake8 + pep257 are inside that count and clean.
   operator has not been asked for, so it was not done — it is the operator's
   one-line yes/no, recorded in the plan's Consequences table.
 - Nothing pushed; no PR opened; no issues filed (per host instruction).
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 11:58 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-78 at `05f6df5`
+**Mode**: pre-push
+**Depth**: Deep (reason: ~930 lines across 13 files and 4 packages; concurrency + lifecycle + shutdown paths), scoped to the commits since round 3 — `5937b6e`, `e6e1888`, `ac7803a` and the plan commits `23c5267` / `6e797d4`
+**Must-fix**: 1 | **Suggestions**: 4
+**Round**: 4 | **Ship**: recommended — the single must-fix is one sentence of plan prose; every code finding this round is pre-existing, narrow, and outside the contract the three commits set out to restore.
+
+Specialists: Static Analysis (each package's own `ament_flake8` + `ament_pep257` tests — inside the passing counts below, all clean); Governance; Plan Drift; two fresh-context Claude Adversarial passes (Lens A on the finiteness change, Lens B on the `quiet_on_shutdown` decorator and the four `main()`s), both `model: sonnet`. Copilot and local-model passes off (not opted in).
+
+**Tests** — `./sensors_ws/build.sh` clean (`Summary: 4 packages finished`), then `./sensors_ws/test.sh sound_speed_bridge zda_serial_bridge kongsberg_em_bridge garmin_sidescan`:
+
+- layer-wide: `Summary: 289 tests, 0 errors, 0 failures, 0 skipped`
+- sound_speed_bridge: `Summary: 103 tests, 0 errors, 0 failures, 0 skipped`
+- zda_serial_bridge: `Summary: 44 tests, 0 errors, 0 failures, 0 skipped`
+- kongsberg_em_bridge: `Summary: 56 tests, 0 errors, 0 failures, 0 skipped`
+- garmin_sidescan: `Summary: 86 tests, 0 errors, 0 failures, 0 skipped`
+
+Every per-package count matches the `## Implementation` entries' claims exactly.
+
+Verified by execution (this review, not taken on trust):
+
+- **The node-level thread-survival test is real.** An out-of-tree copy with `AMLParser._parse` reverted to the exact pre-fix form (`git show 5937b6e^`) fails `test_serial_thread_survives_a_non_finite_sentence` with `ValueError: cannot convert NaN to integer` out of the daemon thread, caught by the `is_alive()` assertion. The mutation is killed by *that* test, not incidentally by others.
+- **The finiteness change has no bad downstream interaction.** `format_valeport` and `format_template` both already skipped NaN before this branch (`sinks.py` is untouched), so no NaN reaches `round()` or a UDP datagram. `raw_mm_s` is consumed *only* in `sinks.py`; `None` is already a supported value there and `format_valeport`'s existing `mm_s > 9999999` bound rejects a finite-but-enormous one. Nothing in the path is a fixed-width field: `SoundSpeed.sound_speed`, `Temperature.temperature` and `FluidPressure.fluid_pressure` are all `float64` and accept NaN and `1e300` without raising, so `_optional_float` returning `None` changes no published field's type — it only suppresses that optional publish, which is the node's pre-existing `is not None` pattern. `_publish_diagnostics` tests `math.isnan` *before* its range comparisons, so a NaN reading does not read as OK.
+- **The Decimal/float edge set behaves as the code assumes**: `Decimal('snan')` → `float()` raises `ValueError` (in the widened except), `float(Decimal('1e999'))` returns `inf` rather than raising, `nan`/`inf`/`-inf`/`Infinity` all convert to non-finite floats and are caught by `math.isfinite`.
+- **Import paths are correct on Jazzy**: `rclpy.executors.ExternalShutdownException` exists and subclasses `Exception`; `rclpy.try_shutdown` exists; `RCLError` is *not* in `rclpy.exceptions` (the `rclpy.impl.implementation_singleton` route the code uses is the right one) and both it and `InvalidHandle` are `RuntimeError` subclasses.
+- **Test order-independence**: all four packages pass with their test files in reversed order, and `garmin_sidescan/test/test_main_shutdown.py` passes when collected twice in one process. No context leaks between tests; the new per-`Context` tests never touch the default context, and the `main()` tests restore it in a `finally`.
+- **The decorator does cover the SIGINT thread window.** Running the `garmin_sidescan` console entry point under a real SIGINT with a spy on `destroy_node` shows `rclpy.ok()=False` and `context.ok()=False` on entry to `destroy_node()`, exit 0 — so on the path SW3 targets, an in-flight thread publish hits the swallow branch, not the re-raise branch. This is what downgraded an adversarial must-fix to suggestion 1 below.
+- The service path is unaffected: `_on_set_transmit` is undecorated and its `success`/`message` come from `self._transmitting`, set by the *undecorated* `_send()`, so swallowing a mirror publish cannot hand an operator a false success. The safety-critical shutdown transmit-OFF in `destroy_node()` goes over the raw socket, not a publisher, so it is outside the decorator entirely.
+
+Governance: no parameter, topic, service, message or launch change in these three commits, so no README consequence (`sound_speed_bridge` has no README — deferred to rolker/marine_tools#88; `garmin_sidescan`'s README documents behaviour these commits do not alter). No `.agents/README.md` exists in this repo. All commits carry the agent identity; nothing pushed; no issues filed.
+
+### Findings
+- [ ] (must-fix) The plan asserts an operator action that the record does not show: "[SW3] ... was carried back to the operator, **who applied the same standing decision to it**". The only recorded operator statement is the round-3 publish-gate quote, given about [SW1]/[SW2]; the `## Implementation` entry of 11:35 says SW3 was "surfaced to the operator rather than fixed", and the 11:49 entry re-quotes that same earlier sentence rather than a new go-ahead. AGENTS.md § Documentation Accuracy forbids attributing a decision to someone who did not state it, and the workspace rule that a go-ahead answers only the question asked is the reason it matters here. Fix is one sentence: either quote the operator's actual SW3 approval, or say plainly that the agent applied the standing decision and the confirmation is owed — `.agent/work-plans/issue-78/plan.md` (Scope widening intro, and the same wording in the Revision 5 note)
+- [ ] (suggestion) `garmin_sidescan`'s `destroy_node()` sets `self._running = False` and calls `super().destroy_node()` without joining `_rx_thread` or the two `_aux_loop` threads, so a thread already past its `while self._running` check can publish into a publisher being torn down. On the SIGINT path this is covered (verified above: the context is already down, so the decorator swallows), but on a **non-signal** teardown the context is still live and `quiet_on_shutdown` re-raises — a traceback on stderr, though a daemon thread cannot change the exit code. Pre-existing (predates this branch) and `sound_speed_bridge` already has the pattern to copy (`node.py:430-437`, `join(timeout=2.0)`). Fixing it is a **fourth** scope widening, so it is the operator's one-line yes/no — it belongs in the plan's Consequences residual row beside the existing one, not silently done — `garmin_sidescan/garmin_sidescan/node.py:1085`
+- [ ] (suggestion) `quiet_on_shutdown` decides "shutdown in flight" vs "genuine fault" from `rclpy.ok()` *after* the fact, not from what raised, so an unrelated real `RCLError` that happens to coincide with a shutdown is swallowed. That is the right trade, but the docstring states it more strongly than it holds ("a failure on a live context is re-raised unchanged, so a genuine fault is still loud") — a one-line caveat would keep the doc honest — `garmin_sidescan/garmin_sidescan/node.py:79`
+- [ ] (suggestion) `sound_speed_bridge` and `zda_serial_bridge` each got a real-SIGINT subprocess guard, but `kongsberg_em_bridge` and `garmin_sidescan` have only the in-process `ExternalShutdownException` test — and `garmin_sidescan` is the node where the shutdown race was actually observed. The SIGINT run does not discriminate the SW3 fix (stated in the implementation entry, correctly), but it would pin the SW2 exit-code contract against future regression in those two packages for ~10 lines — `kongsberg_em_bridge/test/test_main_shutdown.py`, `garmin_sidescan/test/test_main_shutdown.py`
+- [ ] (suggestion) `e6e1888` bundles two logical changes: the four-package SW2 shutdown fix and the round-3 suggestion-2 regression test `test_a_valueerror_from_spin_is_not_reported_as_a_start_failure`, which pins the *round-2* except-scope fix and has nothing to do with the shutdown contract. Cosmetic against AGENTS.md's atomic-commit rule; not worth a rewrite this late — noted so it is not repeated
