@@ -185,7 +185,36 @@ killed by the new tests. Plan drift: none; commit `a6d3803`'s plan sync is hones
 - [x] (suggestion) `parser_max_buffer_bytes` is declared without `read_only=True` while the code comment calls it static, so a field `ros2 param set` reports success and silently does nothing — `sound_speed_bridge/sound_speed_bridge/node.py:78`
 - [x] (suggestion) Back-off quiet-period reset is anchored to the last WARN, not the last trim, so the docstring's "a full ceiling passes with no further trims" overstates it; impact is bounded by the 300 s ceiling — `sound_speed_bridge/sound_speed_bridge/node.py:188`
 - [x] (suggestion) The two counters are a correlated pair read non-atomically across threads, and `_publish_diagnostics` re-reads them after `_warn_on_buffer_trim`, so the WARN text and the published KeyValues can disagree by one chunk; the "same GIL-atomic pattern" comment overstates the guarantee for a pair — `sound_speed_bridge/sound_speed_bridge/node.py:128`
-- [ ] (suggestion) Reachable serial-thread death (pre-existing, untouched): `int(decimal_value * 1000)` sits outside the try, so a sentence of `nan`/`inf`/`snan` raises `ValueError`/`OverflowError` past `_serial_loop`'s `(SerialException, OSError)` catch, killing the daemon thread with `_serial_connected` left True; eager `feed()` widens the loss to the whole chunk. Verified by execution — file a follow-up beside #90 — `sound_speed_bridge/sound_speed_bridge/parsers.py:253`
+- [x] (suggestion) (deferred: pre-existing, out of #78's scope; host is filing a follow-up beside #90) Reachable serial-thread death (pre-existing, untouched): `int(decimal_value * 1000)` sits outside the try, so a sentence of `nan`/`inf`/`snan` raises `ValueError`/`OverflowError` past `_serial_loop`'s `(SerialException, OSError)` catch, killing the daemon thread with `_serial_connected` left True; eager `feed()` widens the loss to the whole chunk. Verified by execution — file a follow-up beside #90 — `sound_speed_bridge/sound_speed_bridge/parsers.py:253`
 - [x] (suggestion) `main()` constructs the node outside its `try/finally`, so the new parameter `ValueError` exits with a raw traceback and no `rclpy.shutdown()`; the fail-loud intent is right but is documented nowhere an operator sees — `sound_speed_bridge/sound_speed_bridge/node.py:415`
 - [x] (suggestion) The package's only example launch file does not surface the new operator-tunable parameter, unlike `device`/`baud`/`frame_id` — `sound_speed_bridge/launch/aml_svs.launch.py:15`
 - [x] (suggestion) Plan's Files-to-Change names the node attribute `_last_buffer_dropped_bytes`; the code calls it `_last_warned_dropped_bytes` — cosmetic — `sound_speed_bridge/sound_speed_bridge/node.py:133`
+
+## Implementation
+**Status**: complete
+**When**: 2026-09-15 10:44 -04:00
+**By**: Claude Code Agent (Claude Opus)
+
+**Branch**: feature/issue-78 at `f236df3`
+**Addressed**: `## Local Review (Pre-Push)` (2026-09-15 10:35 -04:00, branch at `a6d3803`) — 2 must-fix, 7 suggestions
+**Commits**: `b8c011d`, `b26e8af`, `2aeb718`, `51e38a0`, `f2712d1`, `1e678bc`, `2fc4ff5`, `f236df3`
+**Tests**: `Summary: 80 tests, 0 errors, 0 failures, 0 skipped` (was 76; ament flake8 + pep257 clean)
+
+### Actions
+- [x] (must-fix) `buffer_dropped_bytes` now counts the resync discard as well as the trim, so it matches the ABC docstring's "how much of the stream was lost" and the node's WARN text — `parsers.py:_resync`; pinned by `test_aml_dropped_bytes_counts_the_resync_discard_too` (1000 garbage bytes then `99\r\r\n` at a 256 B cap: 1003 B, of which 1002 payload + the CR that ended the damaged sentence) — `b8c011d`
+- [x] (must-fix) The README deferral now points at a list that carries the items: rolker/marine_tools#88's ask list names `parser_max_buffer_bytes`, `buffer_dropped_bytes` and `buffer_trim_count` (host-filed comment, linked from the plan) — `.agent/work-plans/issue-78/plan.md:228` — `b26e8af`
+- [x] (suggestion) `parser_max_buffer_bytes` declared with a `read_only=True` `ParameterDescriptor` (plus a description naming the floor), so a field `ros2 param set` is rejected instead of silently ignored; `rcl_interfaces` added to `package.xml`; test `test_parser_max_buffer_bytes_is_read_only` — `node.py:78` — `2aeb718`
+- [x] (suggestion) WARN back-off quiet-period reset re-anchored to the last **trim** observed (`_last_trim_seen_ns`), not the last WARN, matching the docstring; the reset test now asserts that a long gap since the last WARN alone does *not* reset — `node.py:_warn_on_buffer_trim` — `f2712d1`
+- [x] (suggestion) `_publish_diagnostics` snapshots the correlated counter pair once and uses that snapshot for both the WARN text and the KeyValues; the "GIL-atomic" comment corrected to say each *individual* read is atomic, not the pair; test `test_trim_counters_are_snapshotted_once_per_tick` proves exactly one read of each per tick — `node.py:128` — `f2712d1`
+- [x] (suggestion) (deferred: pre-existing defect, untouched by this change and out of #78's scope; the host is filing a follow-up beside rolker/marine_tools#90) Serial-thread death on a `nan`/`inf`/`snan` sentence: `int(decimal_value * 1000)` sits outside the `try` in `AMLParser._parse` — `sound_speed_bridge/sound_speed_bridge/parsers.py:253` (now `:262` after this round) — so the `ValueError`/`OverflowError` escapes `_serial_loop`'s `(SerialException, OSError)` catch and kills the daemon thread with `_serial_connected` still True
+- [x] (suggestion) `main()` now constructs the node inside the `try`, catching a parameter `ValueError` into one FATAL line naming the parameter and still calling `rclpy.shutdown()`; the fail-loud intent is documented on the parameter declaration; test `test_main_reports_a_rejected_parameter_and_shuts_down` — `node.py:415` — `1e678bc`
+- [x] (suggestion) `launch/aml_svs.launch.py` gains a `parser_max_buffer_bytes` launch argument at its 4096 default (typed `int` via `ParameterValue`) with a one-line comment — `2fc4ff5`
+- [x] (suggestion) Plan's Files-to-Change attribute name corrected to `_last_warned_dropped_bytes` — `.agent/work-plans/issue-78/plan.md` — `b26e8af`
+
+### Notes
+- `plan.md` synced with all five code-affecting fixes under a revision-3 note
+  and `[PR-R1-*]` markers (`f236df3`).
+- One extra commit, `51e38a0`, fixes an `ament_pep257` D301 on the new test
+  docstring; the `rcl_interfaces` import order (flake8 I100) is folded into
+  `f2712d1`. Both linters are clean.
+- Nothing pushed; no PR opened; no issues filed (per host instruction).
