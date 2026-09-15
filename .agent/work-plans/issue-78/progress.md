@@ -889,3 +889,114 @@ flake8 and pep257 run inside each of the four suites and are clean.
 ### Next step
 
 Lifecycle: **Implementation** → **review-code** (fresh-context re-review of these fixes).
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-09-15 13:59 -04:00
+**By**: Claude Code Agent (Claude Opus)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-78 at `7ed6c1f`
+**Mode**: pre-push (bounded re-check of the 13 commits since the pushed head `6d5d84b`)
+**Depth**: Standard-equivalent, scoped (concurrency/lifecycle lens on [SW5]; one sonnet
+adversarial pass, `model: sonnet` explicit; no --copilot, no --local)
+**Must-fix**: 1 | **Suggestions**: 3
+**Round**: 6 | **Ship**: recommended — the single must-fix is a comment/docstring/README
+wording correction (plus a one-line join-order strengthener); nothing behavioural is
+unsafe, and the count is down from round 5 rather than rising.
+
+### Scope re-checked
+[SW5] garmin `destroy_node()` thread joins (`382ddb1`, `ddf24fd`, `298b5d1`, `89d64e3`);
+the [SW4] extension and round-4 fixes (`9b4316e`, `2279c45`, `e5b618f`, `e841a54`,
+`60dd149`, `565b738`).
+
+### Verification performed this round
+- All four packages built and tested from the worktree's `sensors_ws`
+  (`./sensors_ws/build.sh` then `./sensors_ws/test.sh`, never `colcon` inside the project
+  repo). `colcon test-result --test-result-base sensors_ws/build/<pkg>`:
+  `sound_speed_bridge` `Summary: 141 tests, 0 errors, 0 failures, 0 skipped`;
+  `zda_serial_bridge` `Summary: 47 tests, 0 errors, 0 failures, 0 skipped`;
+  `kongsberg_em_bridge` `Summary: 60 tests, 0 errors, 0 failures, 0 skipped`;
+  `garmin_sidescan` `Summary: 93 tests, 0 errors, 0 failures, 0 skipped`. ament flake8 and
+  pep257 run inside each suite and are clean, so static analysis is covered.
+- Independent mutation checks, out-of-tree copies under the session scratchpad (the
+  worktree was never mutated, no `git checkout --`/`restore` on tracked files):
+  restoring the pre-fix `main()` (`except KeyboardInterrupt` + `rclpy.shutdown()`) fails
+  the new `test_sigint_exits_zero_without_a_traceback` in **both** `garmin_sidescan` and
+  `kongsberg_em_bridge`; removing `self._join_workers()` from `destroy_node()` fails 4 of
+  the 6 tests in `test_shutdown_joins.py`. The new tests are load-bearing, not decorative.
+- Flakiness probe: `test_shutdown_joins.py` + `test_main_shutdown.py` run 3x under 8
+  concurrent CPU-burner processes — 12 passed each time, ~9.5 s per run. Neither new test
+  binds a real port or touches the network.
+- Startup-thread early return (`node.py:543`) is unreachable on a healthy start:
+  `_stop_event` is set in exactly one place, `destroy_node()`. Nothing is skipped when not
+  shutting down.
+- `destroy_node()` is idempotent once construction completed: `_stop_event.set()` is
+  idempotent, `_join_workers()` skips dead threads, `super().destroy_node()` is guarded by
+  rclpy. Both receive loops close their socket on the way out (`node.py:753`, `node.py:800`).
+- Both new SIGINT harnesses fake `socket.socket` wholesale, so the driver's real loops run
+  with no network and nothing binds :50050/:51000/:20002.
+
+### Findings
+- [ ] (must-fix) The 3.0 s join budget is derived from a worst case that is short by ~2x,
+  and three places state a shutdown bound the code does not guarantee. `sock.settimeout(2.0)`
+  is **per blocking operation**, so one `_send()` can spend up to 2 s in `connect()` and a
+  further 2 s in `sendall()` — ~4 s, not the "2.0 s TCP socket timeout" the constant's
+  comment calls "the longest blocking call any worker can be inside". Because
+  `_join_workers()` joins `_startup_thread` **last**, a wedged receive thread can consume
+  the whole budget first; the startup thread is then abandoned with `join(0.0)` while still
+  holding `_send_lock`, and `destroy_node()`'s own `_send(TRANSMIT_OFF)` blocks on that
+  plain, timeout-less `with self._send_lock:` until it clears. The OFF still goes out and
+  the process still exits (daemons + per-op socket timeouts bound it), and safety is not
+  breached — the startup thread's early return means it can never put an ON behind the OFF
+  — but an operator told "3 s for the whole set" can wait meaningfully longer. Fix the
+  claim in all three places, and consider the one-line strengthener of joining
+  `_startup_thread` **first**: it is the only worker that takes a lock `destroy_node()`
+  needs, so giving it the full budget makes the stated guarantee nearly true —
+  `garmin_sidescan/garmin_sidescan/node.py:62-69`, `node.py:1168-1171`,
+  `garmin_sidescan/README.md:110-114`
+- [ ] (suggestion) No test covers that lock-contention path: `test_a_wedged_thread_does_not_hang_destroy_node`
+  wedges only `_open_mcast`/`recvfrom`, and its startup thread uses the fixture's instant
+  `_send`, so it never holds `_send_lock` past the deadline — `garmin_sidescan/test/test_shutdown_joins.py:104`
+- [ ] (suggestion) `test_a_wedged_thread_does_not_hang_destroy_node` brackets elapsed time
+  to `[budget-0.5, budget+2.0]`. It survived 3 runs under 8x CPU load here (~3.0 s), so
+  this is precautionary, not observed: widening the upper bound costs nothing and removes
+  the only wall-clock assertion in the suite that a loaded runner could trip —
+  `garmin_sidescan/test/test_shutdown_joins.py:123`
+- [ ] (suggestion, latent / out of this branch's scope) `_join_workers()` dereferences
+  `_rx_thread` / `_aux_threads` / `_startup_thread` unguarded, and those are created ~90
+  raise-capable lines after `_stop_event`. Unreachable today because `main()` constructs the
+  node **outside** its `try`, so a constructor failure never reaches `destroy_node()` — but
+  that is also why a garmin construction failure is a raw traceback rather than the one
+  FATAL line + exit 1 that `sound_speed_bridge` got as [PR-R1-S7]. Fixing it would be a
+  sixth scope widening; recording it here rather than doing it —
+  `garmin_sidescan/garmin_sidescan/node.py:1138`, `node.py:1201`
+
+### Cleared this round
+- **[SW4] extension** — the guard wraps `_publish_reading()` as a single call; the UDP
+  path's `sendto` still raises `OSError` caught locally, and the UDP error path's
+  `get_logger().warning` is now covered by the same guard (an improvement, not a
+  regression). The live-context re-raise is preserved (bare `raise` after
+  `rclpy.ok(context=...)`), non-RCL exceptions are deliberately not caught, and
+  `_serial_loop`'s own `except (SerialException, OSError)` is unchanged (comment-only edit
+  at `node.py:462`). The `_ReadingProxy` tests re-enter the unbound methods, so the guard
+  really consults the proxy's dead context.
+- **Wording (d)** — the over-absolute "a line longer than the cap can never frame" is gone
+  from all three sites (`parsers.py:137`, `node.py:105`, `plan.md:420`); a repo-wide grep
+  finds no surviving instance, and the remaining "never frames" hits are the unrelated and
+  correct wrong-baud/wrong-terminator claims.
+- **Plan drift (f)** — plan is in sync: [SW5] has its own section, Scope-widening entry
+  quoting the operator's instruction, Consequences row and two Files-to-Change rows; the
+  [SW4] extension is recorded as an extension rather than a new number; `sinks.py` /
+  `test_sinks.py` rows are present; the §6 counters paragraph now describes the `trim_stats`
+  tuple; the verification bullet now names all four packages and says the SIGINT execution
+  is committed as tests. The round-5 residual list is genuinely empty.
+- **Attribution** — [SW5] rests on the operator's direct instruction ("fix the garmin's
+  destroy_node issue"), quoted verbatim in the plan; no standing decision is stretched to
+  cover it. The `sound_speed_bridge` README finding stays recorded as a false positive by
+  explicit operator decision at the #77 publish gate (README is rolker/marine_tools#88).
+- **Governance** — no parameter, topic, service, message or launch change. The one
+  operator-visible text change (`parser_max_buffer_bytes`'s description) is already carried
+  by #88. `garmin_sidescan/README.md`'s Transmit safety section was updated with the change
+  (modulo the must-fix wording above). All 13 commits carry the agent identity; nothing
+  pushed.
