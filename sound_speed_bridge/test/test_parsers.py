@@ -136,6 +136,26 @@ def test_aml_resyncs_to_the_next_good_sentence():
     assert p.buffer_trim_count == 1
 
 
+def test_aml_dropped_bytes_counts_the_resync_discard_too():
+    """
+    Every byte that never becomes a reading is counted, not just the trim.
+
+    ``buffer_dropped_bytes`` reports how much of the stream was lost, so it
+    has to include the head fragment the resync throws away as well as the
+    bytes trimmed off the front. 1000 bytes of garbage at a 256-byte cap
+    trims 744; the following ``99\r\r\n`` flushes the 256-byte survivor
+    plus its ``99`` and the CR that ends the damaged sentence (259 more).
+    Counting only the trim would report 744 for 1002 lost payload bytes.
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    assert p.buffer_dropped_bytes == 1000 - CAP
+    assert _readings(p, b'99\r\r\n') == []
+    assert p.buffer_dropped_bytes == 1003
+    # The trim count still counts trims only -- one overflow, one event.
+    assert p.buffer_trim_count == 1
+
+
 def test_aml_trim_preserves_the_padding_boundary():
     r"""
     A trim ending mid-CRCRLF resyncs on the CR and keeps the '\n' as padding.

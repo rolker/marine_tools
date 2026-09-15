@@ -180,7 +180,7 @@ param not plumbed, back-off removed, reset rule removed, KeyValues removed) — 
 killed by the new tests. Plan drift: none; commit `a6d3803`'s plan sync is honest.
 
 ### Findings
-- [ ] (must-fix) `buffer_dropped_bytes` undercounts real stream loss: `_resync` discards the head fragment through the terminator without adding it to the counter, contradicting the ABC docstring's "how much of the stream was lost" contract and the node's WARN text — `sound_speed_bridge/sound_speed_bridge/parsers.py:162`
+- [x] (must-fix) `buffer_dropped_bytes` undercounts real stream loss: `_resync` discards the head fragment through the terminator without adding it to the counter, contradicting the ABC docstring's "how much of the stream was lost" contract and the node's WARN text — `sound_speed_bridge/sound_speed_bridge/parsers.py:162`
 - [ ] (must-fix) The README consequence is deferred to rolker/marine_tools#88, but #88's filed ask list does not mention `parser_max_buffer_bytes`, `buffer_dropped_bytes` or `buffer_trim_count` — the deferral points at a list that will silently omit them — `.agent/work-plans/issue-78/plan.md:228`
 - [ ] (suggestion) `parser_max_buffer_bytes` is declared without `read_only=True` while the code comment calls it static, so a field `ros2 param set` reports success and silently does nothing — `sound_speed_bridge/sound_speed_bridge/node.py:78`
 - [ ] (suggestion) Back-off quiet-period reset is anchored to the last WARN, not the last trim, so the docstring's "a full ceiling passes with no further trims" overstates it; impact is bounded by the 300 s ceiling — `sound_speed_bridge/sound_speed_bridge/node.py:188`

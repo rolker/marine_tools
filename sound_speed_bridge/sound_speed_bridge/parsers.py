@@ -89,10 +89,12 @@ class SoundSpeedParser(ABC):
 
     Trim accounting is exposed as two plain attributes, polled by the
     node's diagnostics timer: ``buffer_dropped_bytes`` (the actionable
-    magnitude -- how much of the stream was lost) and
-    ``buffer_trim_count`` (the event count, which distinguishes one
-    overflow from a sustained stall and is the node's edge trigger for
-    its backed-off WARN).
+    magnitude -- how much of the stream was lost, counting both the bytes
+    trimmed off the front of the residue and the head fragment
+    :meth:`_resync` then discards through the next terminator) and
+    ``buffer_trim_count`` (the event count, which counts *trims* only, so
+    it distinguishes one overflow from a sustained stall and is the
+    node's edge trigger for its backed-off WARN).
     """
 
     DEFAULT_MAX_BUFFER_BYTES = 4096
@@ -153,13 +155,22 @@ class SoundSpeedParser(ABC):
         The residue left by a trim never contains a terminator (framing
         runs first), so this discards exactly the tail of the one damaged
         sentence and never a complete one.
+
+        Every byte discarded here is added to ``buffer_dropped_bytes``:
+        those bytes arrived on the wire and never became a reading, which
+        is exactly what that counter reports. Only the head fragment
+        through (and including) the terminator is counted -- bytes still
+        waiting for a terminator stay in the buffer and are counted if and
+        when they are trimmed or discarded.
         """
         if not self._discarding:
             return True
         idx = self._buffer.find(self._terminator)
         if idx < 0:
             return False
-        self._buffer = self._buffer[idx + len(self._terminator):]
+        discarded = idx + len(self._terminator)
+        self._buffer = self._buffer[discarded:]
+        self.buffer_dropped_bytes += discarded
         self._discarding = False
         return True
 
