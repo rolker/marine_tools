@@ -25,10 +25,19 @@ fragment as if it were a whole sentence -- which for RegexParser can
 re.search out a plausible but wrong sound speed. Dropped bytes are not
 recoverable here; rolker/marine_tools#77's serial tap is the byte-exact
 capture path.
+
+A framed sentence that does not yield a *finite* number -- ``nan``,
+``inf``, ``-inf``, ``snan``, or an exponent that overflows a float
+(``1e999``) -- is treated as a parse failure (NaN reading, raw bytes
+preserved) rather than converted. Converting one raises past the node's
+``(SerialException, OSError)`` catch and kills the serial reader thread,
+and an infinite value reaching the Valeport/template UDP formatters
+raises there instead: one corrupt sentence would end the sensor feed.
 """
 
 from abc import ABC, abstractmethod
 from decimal import Decimal, InvalidOperation
+import math
 import re
 from typing import Iterable, List, NamedTuple, Optional
 
@@ -250,18 +259,34 @@ class AMLParser(SoundSpeedParser):
 
     @staticmethod
     def _parse(stripped: bytes, raw: bytes, receive_time_ns: int) -> SoundSpeedReading:
+        """
+        Parse one framed sentence, returning a NaN reading on any failure.
+
+        ``nan``, ``inf``, ``-inf`` and ``snan`` are all valid Decimal
+        literals, and an overflowing exponent (``1e999``) is a *finite*
+        Decimal that converts to an infinite float. Every numeric
+        conversion therefore happens inside the guarded region and the
+        result is checked for finiteness: ``int()`` of a non-finite value
+        raises ``OverflowError``/``ValueError``/``InvalidOperation``, which
+        escapes ``_serial_loop``'s ``(SerialException, OSError)`` catch and
+        kills the reader thread outright -- one corrupt sentence silently
+        ending the sensor feed. A sentence that cannot yield a finite
+        number is a parse failure like any other: NaN, raw bytes preserved,
+        counted by the node's parse-error path.
+        """
+        value = float('nan')
+        raw_mm_s: Optional[int] = None
         try:
             decimal_value = Decimal(stripped.decode('ascii'))
-        except (UnicodeDecodeError, InvalidOperation):
-            return SoundSpeedReading(
-                sound_speed_m_s=float('nan'),
-                raw_mm_s=None,
-                raw_bytes=raw,
-                receive_time_ns=receive_time_ns,
-            )
+            parsed = float(decimal_value)
+            if math.isfinite(parsed):
+                value = parsed
+                raw_mm_s = int(decimal_value * 1000)
+        except (UnicodeDecodeError, InvalidOperation, ValueError, OverflowError):
+            pass
         return SoundSpeedReading(
-            sound_speed_m_s=float(decimal_value),
-            raw_mm_s=int(decimal_value * 1000),
+            sound_speed_m_s=value,
+            raw_mm_s=raw_mm_s,
             raw_bytes=raw,
             receive_time_ns=receive_time_ns,
         )
@@ -361,6 +386,16 @@ class RegexParser(SoundSpeedParser):
             value = float(match.group('sound_speed')) * self._scale
         except (TypeError, ValueError):
             value = float('nan')
+        if not math.isfinite(value):
+            # float() accepts 'nan'/'inf'/'-inf' and overflows a huge
+            # exponent ('1e999') to inf, and a pattern as loose as
+            # (?P<sound_speed>\S+) will hand them straight through. An
+            # infinite sound_speed is not merely wrong downstream, it is
+            # fatal: format_valeport/format_template round() it on the
+            # serial thread, raising OverflowError past _serial_loop's
+            # (SerialException, OSError) catch and killing the reader.
+            # Non-finite is a parse failure, same as no match at all.
+            value = float('nan')
         temperature = self._optional_float(match, 'temperature')
         pressure = self._optional_float(match, 'pressure')
         return SoundSpeedReading(
@@ -380,9 +415,12 @@ class RegexParser(SoundSpeedParser):
         if captured is None:
             return None
         try:
-            return float(captured)
+            value = float(captured)
         except (TypeError, ValueError):
             return None
+        # Same non-finite rule as sound_speed: an unreported optional field
+        # is better than inf in a Temperature/FluidPressure message.
+        return value if math.isfinite(value) else None
 
 
 # Mapping of parser name -> factory(node) -> SoundSpeedParser. Factories take

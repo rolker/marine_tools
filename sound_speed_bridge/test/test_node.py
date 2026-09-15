@@ -12,6 +12,8 @@ These tests exercise
 I/O, following the ``zda_serial_bridge/test/test_node.py`` pattern.
 """
 
+import math
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -386,4 +388,56 @@ def test_buffer_trim_warn_backoff_resets_after_a_quiet_period(mock_serial_cls):
         assert logger.warning.call_count == 2
     finally:
         del node.get_logger
+        node.destroy_node()
+
+
+# --- Serial-thread survival (non-finite sentences) --------------------------
+
+
+def _serial_port_replaying(chunks):
+    """Build a mocked serial port that replays chunks, then idles on empty reads."""
+    remaining = list(chunks)
+
+    def _read(*args, **kwargs):
+        if remaining:
+            return remaining.pop(0)
+        time.sleep(0.01)  # idle without burning a core on b'' reads
+        return b''
+
+    port = MagicMock()
+    port.read.side_effect = _read
+    return port
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_serial_thread_survives_a_non_finite_sentence(mock_serial_cls):
+    """
+    A nan/inf sentence must not kill the reader thread.
+
+    This is the whole point of the parser's finiteness guard: the loop
+    catches only (SerialException, OSError), so a conversion raising
+    ValueError/OverflowError out of feed() ends the daemon thread with
+    _serial_connected still True -- the node reports a live serial link
+    and never publishes another reading, for the rest of the deployment.
+    """
+    port = _serial_port_replaying(
+        [b'nan\r\r\n', b'inf\r\r\n', b'1e999\r\r\n', b'1500.500\r\r\n'])
+    mock_serial_cls.return_value.__enter__.return_value = port
+    node = SoundSpeedBridgeNode()
+    try:
+        last = None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with node._lock:
+                last = node._last_reading
+            if last is not None and not math.isnan(last.sound_speed_m_s):
+                break
+            time.sleep(0.01)
+        assert node._serial_thread.is_alive()
+        assert node._serial_connected
+        assert last is not None, 'no reading published; the thread died'
+        assert last.sound_speed_m_s == 1500.5
+        assert last.raw_mm_s == 1500500
+        assert node._parse_error_count == 3
+    finally:
         node.destroy_node()

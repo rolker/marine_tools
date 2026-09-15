@@ -209,3 +209,37 @@ def test_aml_rejects_non_integer_max_buffer_bytes(bad):
     """A non-integer cap is rejected at construction, not silently coerced."""
     with pytest.raises(ValueError, match='max_buffer_bytes'):
         AMLParser(max_buffer_bytes=bad)
+
+
+# --- Non-finite sentences must not kill the serial thread -------------------
+
+NON_FINITE = ['nan', 'NaN', 'inf', '-inf', 'Infinity', 'snan', '1e999', '-1e999']
+
+
+@pytest.mark.parametrize('text', NON_FINITE)
+def test_aml_non_finite_sentence_is_a_parse_failure(text):
+    """
+    A sentence that cannot yield a finite number parses to NaN, not a raise.
+
+    ``nan``/``inf``/``snan`` are valid Decimal literals and ``1e999`` is a
+    finite Decimal that overflows to an infinite float; converting any of
+    them to int raises out of feed(), past the node's
+    (SerialException, OSError) catch, killing the serial reader thread.
+    """
+    p = AMLParser()
+    readings = _readings(p, text.encode('ascii') + b'\r\r\n')
+    assert len(readings) == 1
+    r = readings[0]
+    assert math.isnan(r.sound_speed_m_s)
+    assert r.raw_mm_s is None
+    assert r.raw_bytes == text.encode('ascii') + b'\r'
+
+
+def test_aml_keeps_framing_after_a_non_finite_sentence():
+    """The stream recovers: the next good sentence parses normally."""
+    p = AMLParser()
+    readings = _readings(p, b'inf\r\r\n1500.250\r\r\n')
+    assert len(readings) == 2
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[1].sound_speed_m_s == 1500.25
+    assert readings[1].raw_mm_s == 1500250

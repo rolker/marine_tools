@@ -193,3 +193,55 @@ def test_regex_rejects_non_integer_max_buffer_bytes(bad):
     """A non-integer cap is rejected at construction, not silently coerced."""
     with pytest.raises(ValueError, match='max_buffer_bytes'):
         RegexParser(_NUMBER, line_terminator='lf', max_buffer_bytes=bad)
+
+
+# --- Non-finite captures must not kill the serial thread --------------------
+
+NON_FINITE = ['nan', 'inf', '-inf', 'Infinity', 'snan', '1e999', '-1e999']
+
+
+@pytest.mark.parametrize('text', NON_FINITE)
+def test_regex_non_finite_capture_is_a_parse_failure(text):
+    r"""
+    A non-finite capture becomes NaN rather than an infinite reading.
+
+    float() accepts 'nan'/'inf' and overflows '1e999' to inf, and a loose
+    pattern hands them straight through. An infinite sound speed reaches
+    format_valeport/format_template, whose round() raises OverflowError on
+    the serial thread -- past the node's (SerialException, OSError) catch.
+    """
+    p = RegexParser(r'(?P<sound_speed>\S+)', line_terminator='lf')
+    readings = _readings(p, text.encode('ascii') + b'\n')
+    assert len(readings) == 1
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[0].raw_bytes == text.encode('ascii') + b'\n'
+
+
+def test_regex_non_finite_scale_product_is_a_parse_failure():
+    """A finite capture scaled to infinity is still a parse failure."""
+    p = RegexParser(
+        r'(?P<sound_speed>\S+)', sound_speed_scale=1e300, line_terminator='lf')
+    readings = _readings(p, b'1e300\n')
+    assert len(readings) == 1
+    assert math.isnan(readings[0].sound_speed_m_s)
+
+
+def test_regex_non_finite_optional_fields_are_not_reported():
+    r"""An infinite temperature/pressure is dropped, not published as inf."""
+    p = RegexParser(
+        r'(?P<sound_speed>[0-9.]+),(?P<temperature>\S+),(?P<pressure>\S+)',
+        line_terminator='lf')
+    readings = _readings(p, b'1500.0,inf,nan\n')
+    assert len(readings) == 1
+    assert readings[0].sound_speed_m_s == 1500.0
+    assert readings[0].temperature_c is None
+    assert readings[0].pressure_pa is None
+
+
+def test_regex_keeps_framing_after_a_non_finite_sentence():
+    """The stream recovers: the next good sentence parses normally."""
+    p = RegexParser(r'(?P<sound_speed>\S+)', line_terminator='lf')
+    readings = _readings(p, b'inf\n1500.250\n')
+    assert len(readings) == 2
+    assert math.isnan(readings[0].sound_speed_m_s)
+    assert readings[1].sound_speed_m_s == 1500.25
