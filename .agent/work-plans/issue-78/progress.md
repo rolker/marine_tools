@@ -497,3 +497,22 @@ Governance: no parameter, topic, service, message or launch change in these thre
 
 ### False positives
 - none.
+
+## Integrated Review
+**Status**: complete
+**When**: 2026-09-15 12:43 -04:00
+**By**: Claude Code Agent (Claude Fable 5.1)
+
+**PR**: #91 at `8f4bd88` (jazzy with PR #89 merged in)
+**Sources**: 2 (Copilot R2 @ `8f4bd88` — 1 inline + 2 suppressed; CI rollup)
+**Cross-source confirmations**: 0
+**CI**: all-pass
+
+### Findings
+- [x] (low, Copilot) `parser_max_buffer_bytes` description still called 256 B "the longest legitimate sentence" — reworded as the read-size floor with sizing guidance — `node.py:103`
+- [x] (must-fix, Copilot suppressed) `format_template` no longer skipped a NaN reading when `raw_mm_s` was present — unconditional NaN check restored, regression test with `raw_mm_s` populated — `sinks.py:104`
+- [x] (low, Copilot suppressed) plan floor rationale repeated the overstated claim — `plan.md:258`
+- [x] (low, host-found from Copilot's "generated-log cleanup") a colcon `log/` tree had been committed by an in-repo test run — removed, `log/` ignored
+
+### False positives
+- none.
