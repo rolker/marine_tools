@@ -262,7 +262,7 @@ Flagged as a documentation candidate below, decision left to the operator.
    preserved as-is — its mocked `read` returns `b''` instantly, so a live
    thread would busy-spin at 100% CPU for the node's lifetime; that is why
    it is killed, not an accident. So add a second helper alongside it,
-   `_drive_serial_loop(node, mock_serial_cls, chunks, stop_before_read=None)`,
+   `_drive_serial_loop(node, mock_serial_cls, chunks, stop_before_index=None)`,
    which:
    - installs a fake serial port whose `read` side-effect pops the next
      chunk from `chunks`, and on exhaustion sets `_stop_event` and returns
@@ -273,18 +273,22 @@ Flagged as a documentation candidate below, decision left to the operator.
      the test thread**, so assertions run after the loop has provably
      finished;
    - optionally sets `_stop_event` *before* returning a given chunk
-     (`stop_before_read`), which is how the shutdown-guard test reaches the
-     new publish path with the event already set.
+     (`stop_before_index`), which is how the shutdown-guard test reaches the
+     new publish path with the event already set;
+   - asserts on exit that every chunk was consumed, so a loop that bailed
+     early cannot pass a test by publishing nothing.
 
    The real parser is left in place (not mocked) so the "garbage yields no
    readings" assertions exercise the actual framing code.
 
 5. **Tests** in `sound_speed_bridge/test/test_node.py`:
-   - `test_serial_tap_publishes_raw_chunk`: drive `_serial_loop` with one
+   - `test_serial_tap_publishes_read_chunk`: drive `_serial_loop` with one
      chunk; assert `serial_tap` receives exactly that chunk's bytes,
      unmodified.
-   - `test_serial_tap_captures_unframeable_garbage`: drive the loop with the
-     **field bytes** from the issue —
+   - `test_serial_tap_captures_unframeable_field_garbage` and
+     `test_serial_tap_captures_all_nul_chunk` (split in implementation: two
+     distinct field signatures, so a failure names which one): drive the loop
+     with the **field bytes** from the issue —
      `b'$AML,SVM,1515.217,SN,200937*05\r\x00$AML,SVM,1515.180,SN,20 937*08\r\x00'`
      (the observed `\r\x00` corruption of `\r\n`) against a `regex`
      parser configured as the field launch configures it
@@ -301,10 +305,17 @@ Flagged as a documentation candidate below, decision left to the operator.
      publish order equals the concatenation of the input chunks — i.e. no
      byte loss, duplication, or reordering across chunk boundaries.
    - `test_serial_tap_noop_after_stop`: set `_stop_event` before the tap
-     publish call executes (patch `ser.read` to return data, set the event
-     inside a `side_effect` before returning) and assert `serial_tap`
+     publish call executes (`stop_before_index=0`) and assert `serial_tap`
      receives no publish — exercising the new shutdown guard from step 2.
-   - `test_serial_tap_counts_bytes_in_diagnostics`: after driving the loop
+   - `test_serial_tap_publish_failure_is_counted_not_fatal` (added during
+     implementation, covering the second half of finding 1): make the tap
+     publish raise and assert the loop still consumes every chunk, the
+     primary `sound_speed` path still publishes every reading,
+     `tap_error_count` counts each failure, and `tap_byte_count` stays 0
+     because nothing reached the wire. Without the `try/except` this test
+     fails, as does the shutdown-guard test without its guard — both were
+     verified by removing the code under test.
+   - `test_tap_counters_surface_in_diagnostics`: after driving the loop
      with known chunks, assert `_tap_byte_count` equals the total input
      length and that `_publish_diagnostics` emits a `tap_byte_count`
      (and `tap_error_count`) `KeyValue` carrying it — the operator-visible
