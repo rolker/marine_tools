@@ -349,15 +349,19 @@ chunk, so `buffer_trim_count` is really a proxy for elapsed stall time.
 - `buffer_trim_count` is kept because it is the cheap **edge detector**
   the node's back-off needs ("has any new trim happened since the last
   tick?"), and because it distinguishes one large overflow from a
-  sustained stall at the same byte total. Two ints; no further state.
+  sustained stall at the same byte total.
 
-Both are plain public attributes polled by `_publish_diagnostics`, matching
-how it already polls `self._rate_hz` and `self._parse_error_count` rather
-than being pushed updates. Each individual cross-thread read of a Python
-int is atomic under the GIL — the same assumption the existing counters
-already make — but the two are a *correlated pair*, so
-`_publish_diagnostics` reads both **once** per tick and uses that one
-snapshot for the WARN text and the KeyValues alike **[PR-R1-S5]**.
+The two are a *correlated pair* written on the serial thread and read on
+the diagnostics timer, so they are **one tuple**, rebound in a single
+GIL-atomic assignment per trim event and exposed as the `trim_stats`
+snapshot; `buffer_dropped_bytes` / `buffer_trim_count` remain as
+read-only views over it **[PR-R3 should-fix, `36989be`]**.
+`_publish_diagnostics` reads the tuple **once** per tick and uses that
+snapshot for the WARN text and the KeyValues alike **[PR-R1-S5]**, so
+the WARN can never quote a trim count without the bytes that went with
+it. (Rev 2 had two plain ints read separately; Copilot round 3 showed the
+timer could observe a torn pair — a count without its bytes — because
+`_trim_residue()` updated them in two statements.)
 
 ### 7. WARN: first trim immediately, then exponential back-off **[PR-F8]**
 
@@ -488,13 +492,15 @@ Rationale and the conflict surface:
 | File | Change |
 |------|--------|
 | `sound_speed_bridge/launch/aml_svs.launch.py` | Add the `parser_max_buffer_bytes` launch argument at its default **[PR-R1-S8]** |
-| `sound_speed_bridge/sound_speed_bridge/parsers.py` | **[SW1]** Non-finite guard: both `_parse`s treat `nan`/`inf`/`-inf`/`snan`/`1e999` as a parse failure (NaN reading, `raw_mm_s=None`), every numeric conversion inside the guarded region; `RegexParser._optional_float` drops a non-finite temperature/pressure; module docstring says so. Plus: move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings |
+| `sound_speed_bridge/sound_speed_bridge/parsers.py` | **[SW1]** Non-finite guard: both `_parse`s treat `nan`/`inf`/`-inf`/`snan`/`1e999` as a parse failure (NaN reading, `raw_mm_s=None`), every numeric conversion inside the guarded region; `RegexParser._optional_float` drops a non-finite temperature/pressure; module docstring says so. Plus: move `_buffer` into the `SoundSpeedParser` ABC with `_max_buffer_bytes`, `_discarding`, `buffer_dropped_bytes`, `buffer_trim_count`; add `_resync()` + `_trim_residue()` helpers and floor validation; both `feed()`s become eager, trim residue at the end, and resync after a trim; `max_buffer_bytes` on both constructors; `PARSERS` factories pass it; module + ABC docstrings; since round 3 the guard is on the **mm/s product** (`value * 1000.0`), not the m/s value alone, in both parsers; trim counters are one atomic tuple (`trim_stats`) |
 | `sound_speed_bridge/test/test_shutdown_guard.py` | **[SW4]** new: `test_diagnostics_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard`, each against a real shut-down `Context` |
 | `sound_speed_bridge/sound_speed_bridge/node.py` | `declare_parameter('parser_max_buffer_bytes', 4096)` with a `read_only=True` descriptor **[PR-R1-S3]** + floor validation; node construction moved inside `main()`'s `try` so the refusal is one FATAL line **[PR-R1-S7]**, exiting **1** via `SystemExit` so `ros2 launch`/systemd see a failure, with the `except` scoped to construction only, not `spin()` **[PR-R2-MF1, PR-R2-S1]**; `_last_buffer_trim_count`, `_last_warned_dropped_bytes`, back-off state; backed-off WARN in `_publish_diagnostics`; two new `KeyValue`s; **[SW2]** `main()` catches `ExternalShutdownException` and shuts down via `rclpy.try_shutdown()`; **[SW4]** shutdown guard around the `_publish_diagnostics` publish |
 | `sound_speed_bridge/test/test_parsers.py` | AML cap tests: bound, drop-oldest + no-fragment, resync, `\n`-padding boundary, no spurious trim on an oversize healthy chunk, invalid cap; **[SW1]** `test_aml_non_finite_sentence_is_a_parse_failure` (parametrized over `nan`/`NaN`/`inf`/`-inf`/`Infinity`/`snan`/`1e999`/`-1e999`) and `test_aml_keeps_framing_after_a_non_finite_sentence` |
 | `sound_speed_bridge/test/test_regex_parser.py` | Same set for `RegexParser`, plus the CRLF straddle and the `search`-matches-a-fragment case; **[SW1]** `test_regex_non_finite_capture_is_a_parse_failure`, `test_regex_non_finite_scale_product_is_a_parse_failure`, `test_regex_non_finite_optional_fields_are_not_reported`, `test_regex_keeps_framing_after_a_non_finite_sentence` |
 | `sound_speed_bridge/test/test_node.py` | Parameter validation (`test_parser_max_buffer_bytes_reaches_the_parser`, `test_parser_max_buffer_bytes_below_floor_is_rejected`, `test_parser_max_buffer_bytes_is_read_only` **[PR-R1-S3]**, `test_main_reports_a_rejected_parameter_and_shuts_down` **[PR-R1-S7, PR-R2-MF1]**); counters in `/diagnostics` (`test_buffer_counters_surface_in_diagnostics`, `test_trim_counters_are_snapshotted_once_per_tick` **[PR-R1-S5]**); WARN once then backed off (`test_buffer_trim_warns_once_then_backs_off`, `test_buffer_trim_warn_backoff_resets_after_a_quiet_period` **[PR-R1-S4]**); **[SW1]** `test_serial_thread_survives_a_non_finite_sentence` (drives the real `_serial_loop`); **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) and `test_main_returns_cleanly_on_an_external_shutdown`; **[PR-R3-S2]** `test_a_valueerror_from_spin_is_not_reported_as_a_start_failure` pins the narrowed `except` scope |
 | `sound_speed_bridge/package.xml` | `<depend>rcl_interfaces</depend>` for `ParameterDescriptor` **[PR-R2-S3]** |
+| `sound_speed_bridge/sound_speed_bridge/sinks.py` | **[PR-R2/R3 must-fix]** both formatters compute the mm/s product and validate finiteness **unconditionally, before** choosing the raw-integer path — a finite 1e306 m/s is inf mm/s; `round(inf)` raised on the serial thread and `{value_mm_s}` could interpolate inf; NaN is skipped whether or not `raw_mm_s` is present |
+| `sound_speed_bridge/test/test_sinks.py` | overflow-skip tests for both formatters, NaN-with-`raw_mm_s` skip, finite-but-huge-with-`raw_mm_s` skip |
 | `zda_serial_bridge/zda_serial_bridge/node.py` | **[SW2]** same `main()` fix; **[SW4]** shutdown guard around the `_publish_diagnostics` publish |
 | `zda_serial_bridge/test/test_node.py` | **[SW2]** `test_sigint_exits_zero_without_a_traceback` (real SIGINT, subprocess) |
 | `zda_serial_bridge/test/test_shutdown_guard.py` | **[SW4]** new: `test_diagnostics_is_quiet_once_the_context_is_shut_down`, `test_a_publish_failure_on_a_live_context_is_still_raised`, `test_a_non_rcl_error_is_not_swallowed_by_the_shutdown_guard`, each against a real shut-down `Context` |
@@ -546,6 +552,12 @@ Rationale and the conflict surface:
   periodic timer" pattern is a candidate for
   `.agent/knowledge/ros2_development_patterns.md` if it recurs; one
   instance does not warrant promoting it.
+
+## Residuals after pre-push round 5 (recorded, not done — each is a further widening or a polish item for the operator's call)
+
+- `garmin_sidescan` `destroy_node()` does not join its three daemon threads on a non-signal teardown (SIGINT path is covered by [SW3]); `sound_speed_bridge` has the join pattern to copy.
+- `quiet_on_shutdown`'s docstring says a genuine fault stays loud; a real `RCLError` that coincides with a shutdown is swallowed — caveat owed in the docstring.
+- `kongsberg_em_bridge` and `garmin_sidescan` have no committed real-SIGINT subprocess test (verified by execution in rounds 4/5: all four entry points exit 0 with no traceback).
 
 ## Open Questions
 
