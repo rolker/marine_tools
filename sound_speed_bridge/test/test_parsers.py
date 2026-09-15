@@ -2,6 +2,8 @@
 
 import math
 
+import pytest
+
 from sound_speed_bridge.parsers import AMLParser, SoundSpeedReading
 
 
@@ -87,3 +89,103 @@ def test_aml_skips_empty_lines():
     readings = _readings(p, b'\r\r\n\r\r\n1500.000\r\r\n')
     values = [r.sound_speed_m_s for r in readings]
     assert values == [1500.0]
+
+
+# --- Accumulation-buffer cap (rolker/marine_tools#78) -----------------------
+#
+# The cap bounds the *unframed residue* after framing, so a serial read
+# larger than the cap still frames every complete sentence it carried. When
+# the residue does overflow, the oldest bytes go and the parser discards
+# through the next terminator: the survivor starts mid-sentence, and framing
+# it would publish a head-truncated fragment as a whole sentence.
+
+CAP = 256  # AMLParser.MIN_MAX_BUFFER_BYTES: the smallest legal cap
+
+
+def test_aml_buffer_is_capped():
+    """Terminator-free bytes past the cap are bounded, and the drop is counted."""
+    p = AMLParser(max_buffer_bytes=CAP)
+    assert _readings(p, b'9' * 5000) == []
+    assert len(p._buffer) <= CAP
+    assert p.buffer_dropped_bytes == 5000 - CAP
+    assert p.buffer_trim_count > 0
+
+
+def test_aml_trim_discards_through_next_terminator():
+    """
+    The fragment left by a trim is never framed as a sentence.
+
+    Feeding garbage past the cap and then a terminator flushes the suspect
+    residue and must yield nothing at all -- publishing the truncated head
+    as a sentence would put a garbage (or, for a numeric stream, a
+    plausible-but-wrong) value on the reliable topics.
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    assert p.buffer_trim_count > 0
+    assert _readings(p, b'\r\r\n') == []
+
+
+def test_aml_resyncs_to_the_next_good_sentence():
+    """After a trim, every following complete sentence frames normally."""
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    readings = _readings(p, b'99\r\r\n1500.000\r\r\n1501.000\r\r\n')
+    # The broken sentence (trimmed head + '99') is discarded, not framed.
+    assert [r.sound_speed_m_s for r in readings] == [1500.0, 1501.0]
+    assert p.buffer_trim_count == 1
+
+
+def test_aml_trim_preserves_the_padding_boundary():
+    r"""
+    A trim ending mid-CRCRLF resyncs on the CR and keeps the '\n' as padding.
+
+    The AML terminator is a single CR, so the resync consumes it and leaves
+    the padding '\n' at the head of the buffer -- which the framing loop's
+    lstrip must absorb rather than framing an empty sentence out of it.
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    _readings(p, b'9' * 1000)
+    readings = _readings(p, b'\r\n1500.000\r\r\n')
+    assert len(readings) == 1
+    assert readings[0].sound_speed_m_s == 1500.0
+    assert readings[0].raw_bytes == b'1500.000\r'
+
+
+def test_aml_no_trim_when_an_oversize_chunk_frames_completely():
+    """
+    A read chunk far larger than the cap loses nothing if it frames.
+
+    Regression test for trimming on append: trimming before the framing loop
+    ran would silently drop complete sentences out of any chunk bigger than
+    the cap (node.py reads 256 bytes at a time).
+    """
+    p = AMLParser(max_buffer_bytes=CAP)
+    chunk = b'1500.000\r\r\n' * 100
+    assert len(chunk) > CAP
+    readings = _readings(p, chunk)
+    assert len(readings) == 100
+    assert p.buffer_trim_count == 0
+    assert p.buffer_dropped_bytes == 0
+
+
+def test_aml_no_trim_at_exactly_the_cap():
+    """A residue of exactly max_buffer_bytes is not a trim."""
+    p = AMLParser(max_buffer_bytes=CAP)
+    assert _readings(p, b'9' * CAP) == []
+    assert p.buffer_trim_count == 0
+    assert len(p._buffer) == CAP
+
+
+@pytest.mark.parametrize('bad', [0, -1, 1, 255])
+def test_aml_rejects_max_buffer_bytes_below_the_floor(bad):
+    """A cap below the serial read size would shred healthy traffic."""
+    with pytest.raises(ValueError, match='max_buffer_bytes'):
+        AMLParser(max_buffer_bytes=bad)
+
+
+@pytest.mark.parametrize('bad', [4096.0, '4096', None, True])
+def test_aml_rejects_non_integer_max_buffer_bytes(bad):
+    """A non-integer cap is rejected at construction, not silently coerced."""
+    with pytest.raises(ValueError, match='max_buffer_bytes'):
+        AMLParser(max_buffer_bytes=bad)

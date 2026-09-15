@@ -135,3 +135,144 @@ def test_handle_reading_noop_after_stop(mock_serial_cls):
     finally:
         node._stop_event.clear()
         node.destroy_node()
+
+
+# --- Accumulation-buffer cap (rolker/marine_tools#78) -----------------------
+
+
+def _reinit_with_overrides(*overrides: str) -> None:
+    """
+    Restart the ROS context with global parameter overrides.
+
+    The node takes no constructor arguments, so a parameter override has to
+    come from the context's ``--ros-args``. The autouse fixture's shutdown
+    still applies to the context created here.
+    """
+    rclpy.shutdown()
+    args = ['--ros-args']
+    for override in overrides:
+        args += ['-p', override]
+    rclpy.init(args=args)
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_parser_max_buffer_bytes_reaches_the_parser(mock_serial_cls):
+    """A configured cap is validated and handed to the parser instance."""
+    _reinit_with_overrides('parser_max_buffer_bytes:=512')
+    node = _make_node(mock_serial_cls)
+    try:
+        assert node._parser_max_buffer_bytes == 512
+        assert node._parser._max_buffer_bytes == 512
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_parser_max_buffer_bytes_below_floor_is_rejected(mock_serial_cls):
+    """
+    A cap below the serial read size fails at startup, naming the parameter.
+
+    Validated in the node as well as in the parser so the operator sees the
+    parameter they set, not a constructor argument they never wrote.
+    """
+    _reinit_with_overrides('parser_max_buffer_bytes:=128')
+    port = MagicMock()
+    port.read.return_value = b''
+    mock_serial_cls.return_value.__enter__.return_value = port
+    with pytest.raises(ValueError, match='parser_max_buffer_bytes'):
+        SoundSpeedBridgeNode()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_buffer_counters_surface_in_diagnostics(mock_serial_cls):
+    """Both trim counters are published as /diagnostics KeyValues."""
+    node = _make_node(mock_serial_cls)
+    try:
+        node._diag_pub = MagicMock()
+        node._parser.buffer_dropped_bytes = 4321
+        node._parser.buffer_trim_count = 7
+        node._publish_diagnostics()
+        status = node._diag_pub.publish.call_args.args[0].status[0]
+        values = {kv.key: kv.value for kv in status.values}
+        assert values['buffer_dropped_bytes'] == '4321'
+        assert values['buffer_trim_count'] == '7'
+    finally:
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_buffer_trim_warns_once_then_backs_off(mock_serial_cls):
+    """
+    The first trim warns immediately; the next ones are held back.
+
+    A framing stall trims once per serial read for as long as it lasts
+    (1-5 h in the field), so warning on every diagnostics tick would be
+    ~18k lines on top of the stale-reading ERROR this method already emits.
+    """
+    node = _make_node(mock_serial_cls)
+    logger = MagicMock()
+    try:
+        node._diag_pub = MagicMock()
+        node.get_logger = MagicMock(return_value=logger)
+
+        node._parser.buffer_trim_count = 1
+        node._parser.buffer_dropped_bytes = 100
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+        assert '100 B since' in logger.warning.call_args.args[0]
+
+        # A further trim on the very next tick is inside the back-off.
+        node._parser.buffer_trim_count = 2
+        node._parser.buffer_dropped_bytes = 200
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+
+        # No new trim at all: also silent.
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+
+        # Once the interval has elapsed a new trim warns again, reporting
+        # only what was dropped since the previous warning.
+        node._last_trim_warn_ns -= 10 * 1_000_000_000
+        node._parser.buffer_trim_count = 3
+        node._parser.buffer_dropped_bytes = 350
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 2
+        assert '250 B since' in logger.warning.call_args.args[0]
+    finally:
+        del node.get_logger
+        node.destroy_node()
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_buffer_trim_warn_backoff_resets_after_a_quiet_period(mock_serial_cls):
+    """A later, separate stall is loud again once the ceiling has passed."""
+    node = _make_node(mock_serial_cls)
+    logger = MagicMock()
+    try:
+        node._diag_pub = MagicMock()
+        node.get_logger = MagicMock(return_value=logger)
+
+        node._parser.buffer_trim_count = 1
+        node._parser.buffer_dropped_bytes = 100
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+        node._parser.buffer_trim_count = 2
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+
+        # Quiet for longer than the back-off ceiling, with no new trims.
+        quiet_ns = int((node._TRIM_WARN_MAX_INTERVAL_S + 1.0) * 1_000_000_000)
+        node._last_trim_warn_ns -= quiet_ns
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 1
+        assert node._trim_warn_interval_s == 0.0
+
+        # The next stall warns on its first trim.
+        node._parser.buffer_trim_count = 3
+        node._parser.buffer_dropped_bytes = 500
+        node._publish_diagnostics()
+        assert logger.warning.call_count == 2
+    finally:
+        del node.get_logger
+        node.destroy_node()
