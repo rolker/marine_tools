@@ -14,8 +14,8 @@ from typing import List, Optional
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_interfaces.msg import SoundSpeed
-import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
+import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import FluidPressure, Temperature
@@ -139,13 +139,17 @@ class SoundSpeedBridgeNode(Node):
         self._parse_error_count = 0
         self._udp_send_error_count = 0
         # Buffer-trim reporting. The parser owns the counters (plain ints,
-        # bumped on the serial thread, read here on the timer thread -- the
-        # same GIL-atomic pattern the other counters use); the node owns the
-        # WARN back-off state so a multi-hour framing stall cannot flood the
-        # log at the diagnostics rate.
+        # bumped on the serial thread, read here on the timer thread).
+        # Each individual read is atomic under the GIL, but the two are a
+        # correlated pair: read separately, the WARN text and the published
+        # KeyValues can describe different instants. _publish_diagnostics
+        # therefore snapshots both once and uses that snapshot throughout.
+        # The node owns the WARN back-off state so a multi-hour framing
+        # stall cannot flood the log at the diagnostics rate.
         self._last_buffer_trim_count = 0
         self._last_warned_dropped_bytes = 0
         self._last_trim_warn_ns: Optional[int] = None
+        self._last_trim_seen_ns: Optional[int] = None
         self._trim_warn_interval_s = 0.0
         self._serial_reconnect_count = 0
         self._readings_in_window = 0
@@ -184,7 +188,7 @@ class SoundSpeedBridgeNode(Node):
                 f'sentence); got {value!r}')
         return value
 
-    def _warn_on_buffer_trim(self, now_ns: int) -> None:
+    def _warn_on_buffer_trim(self, now_ns: int, trim_count: int, dropped: int) -> None:
         """
         Log a backed-off WARN while the parser is trimming its buffer.
 
@@ -194,19 +198,23 @@ class SoundSpeedBridgeNode(Node):
         of the stale-reading ERROR this same method already emits. The first
         trim warns immediately; the minimum interval then doubles after each
         WARN up to a 5-minute ceiling, and resets once a full ceiling passes
-        with no further trims so a later, separate stall is loud again.
-        """
-        trim_count = self._parser.buffer_trim_count
-        dropped = self._parser.buffer_dropped_bytes
+        with **no further trims** -- the quiet period is measured from the
+        last trim observed, not from the last WARN, so a stall that is still
+        trimming inside the back-off never looks quiet.
 
+        The counters are passed in rather than re-read: the caller snapshots
+        the pair once so this WARN and the published KeyValues describe the
+        same instant.
+        """
         if trim_count == self._last_buffer_trim_count:
-            if (self._last_trim_warn_ns is not None
-                    and (now_ns - self._last_trim_warn_ns) / 1e9
+            if (self._last_trim_seen_ns is not None
+                    and (now_ns - self._last_trim_seen_ns) / 1e9
                     >= self._TRIM_WARN_MAX_INTERVAL_S):
                 self._trim_warn_interval_s = 0.0
             return
 
         self._last_buffer_trim_count = trim_count
+        self._last_trim_seen_ns = now_ns
         if self._last_trim_warn_ns is not None:
             elapsed = (now_ns - self._last_trim_warn_ns) / 1e9
             if elapsed < self._trim_warn_interval_s:
@@ -382,7 +390,11 @@ class SoundSpeedBridgeNode(Node):
             msg_text = (f'Reading {last_value:.3f} m/s outside '
                         f'[{self._valid_min:.1f}, {self._valid_max:.1f}]')
 
-        self._warn_on_buffer_trim(now_ns)
+        # One snapshot of the correlated counter pair, used for both the
+        # WARN below and the KeyValues published from it.
+        dropped_bytes = self._parser.buffer_dropped_bytes
+        trim_count = self._parser.buffer_trim_count
+        self._warn_on_buffer_trim(now_ns, trim_count, dropped_bytes)
 
         status = DiagnosticStatus()
         status.level = level
@@ -396,10 +408,8 @@ class SoundSpeedBridgeNode(Node):
             KeyValue(key='last_age_s', value=f'{last_age:.2f}'),
             KeyValue(key='parser_rate_hz', value=f'{self._rate_hz:.2f}'),
             KeyValue(key='parse_error_count', value=str(self._parse_error_count)),
-            KeyValue(key='buffer_dropped_bytes',
-                     value=str(self._parser.buffer_dropped_bytes)),
-            KeyValue(key='buffer_trim_count',
-                     value=str(self._parser.buffer_trim_count)),
+            KeyValue(key='buffer_dropped_bytes', value=str(dropped_bytes)),
+            KeyValue(key='buffer_trim_count', value=str(trim_count)),
             KeyValue(key='udp_send_error_count',
                      value=str(self._udp_send_error_count)),
             KeyValue(key='serial_reconnect_count',

@@ -220,6 +220,61 @@ def test_buffer_counters_surface_in_diagnostics(mock_serial_cls):
         node.destroy_node()
 
 
+class _CountingCounters:
+    """Parser stand-in that records how often each trim counter is read."""
+
+    def __init__(self, dropped, trims):
+        self._dropped = dropped
+        self._trims = trims
+        self.reads = 0
+
+    @property
+    def buffer_dropped_bytes(self):
+        self.reads += 1
+        # Simulate the serial thread bumping the counter between reads: a
+        # second read in the same tick would see a different value.
+        self._dropped += 1000
+        return self._dropped
+
+    @property
+    def buffer_trim_count(self):
+        self.reads += 1
+        self._trims += 1
+        return self._trims
+
+
+@patch('sound_speed_bridge.node.serial.Serial')
+def test_trim_counters_are_snapshotted_once_per_tick(mock_serial_cls):
+    """
+    The WARN text and the published KeyValues come from one snapshot.
+
+    The two counters are a correlated pair bumped on the serial thread. Read
+    separately -- once for the WARN, again for the KeyValues -- they can
+    describe instants a chunk apart, so an operator correlating the log with
+    /diagnostics sees numbers that do not add up. Each is read exactly once.
+    """
+    node = _make_node(mock_serial_cls)
+    logger = MagicMock()
+    try:
+        node._diag_pub = MagicMock()
+        node.get_logger = MagicMock(return_value=logger)
+        node._parser = _CountingCounters(dropped=0, trims=0)
+
+        node._publish_diagnostics()
+
+        assert node._parser.reads == 2  # one read of each counter
+        status = node._diag_pub.publish.call_args.args[0].status[0]
+        values = {kv.key: kv.value for kv in status.values}
+        assert values['buffer_dropped_bytes'] == '1000'
+        assert values['buffer_trim_count'] == '1'
+        warn = logger.warning.call_args.args[0]
+        assert '1000 B since' in warn
+        assert '1000 B over 1 trims' in warn
+    finally:
+        del node.get_logger
+        node.destroy_node()
+
+
 @patch('sound_speed_bridge.node.serial.Serial')
 def test_buffer_trim_warns_once_then_backs_off(mock_serial_cls):
     """
@@ -281,9 +336,16 @@ def test_buffer_trim_warn_backoff_resets_after_a_quiet_period(mock_serial_cls):
         node._publish_diagnostics()
         assert logger.warning.call_count == 1
 
-        # Quiet for longer than the back-off ceiling, with no new trims.
+        # A long gap since the last WARN is not a quiet period: the stall
+        # is still trimming, it is just inside the back-off. The reset is
+        # anchored to the last trim observed, not the last WARN.
         quiet_ns = int((node._TRIM_WARN_MAX_INTERVAL_S + 1.0) * 1_000_000_000)
         node._last_trim_warn_ns -= quiet_ns
+        node._publish_diagnostics()
+        assert node._trim_warn_interval_s != 0.0
+
+        # Quiet for longer than the back-off ceiling, with no new trims.
+        node._last_trim_seen_ns -= quiet_ns
         node._publish_diagnostics()
         assert logger.warning.call_count == 1
         assert node._trim_warn_interval_s == 0.0
