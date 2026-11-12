@@ -114,8 +114,7 @@ class _FakeNode:
         self._static = set(static_params)
         self._range_min = 1.0
         self._range_max = 60.0
-        self._controls = {}
-        self.publishes = 0
+        self._commanded_range_m = 0.0
         # transmit-control adoption
         self._tx_sync = False
         self._transmitting = False
@@ -132,9 +131,6 @@ class _FakeNode:
 
     def has_parameter(self, name):
         return name in self._static
-
-    def _publish_control_set(self):
-        self.publishes += 1
 
     def _request_transmit(self, on):
         self.transmit_requests.append(on)
@@ -160,7 +156,7 @@ def test_valid_range_alone_sends_and_succeeds():
     result = _on_param_set(node, [_param('range_m', 30.0)])
     assert result.successful is True
     assert len(node.sends) == 1
-    assert node._controls['range'] == '30.0'
+    assert node._commanded_range_m == 30.0
 
 
 def test_batch_rejects_static_param_without_sending_range():
@@ -173,7 +169,7 @@ def test_batch_rejects_static_param_without_sending_range():
         node, [_param('range_m', 30.0), _param('freq_port_hz', 800000.0)])
     assert result.successful is False
     assert node.sends == []
-    assert 'range' not in node._controls
+    assert node._commanded_range_m == 0.0   # mirror untouched on atomic reject
 
 
 def test_batch_rejection_independent_of_param_order():
@@ -191,7 +187,7 @@ def test_range_send_failure_rejects_without_mirroring():
     result = _on_param_set(node, [_param('range_m', 30.0)])
     assert result.successful is False
     assert len(node.sends) == 1          # attempted
-    assert 'range' not in node._controls  # but not mirrored on failure
+    assert node._commanded_range_m == 0.0  # but not mirrored on failure
 
 
 # ----- transmit-control adoption (marine_control) ------------------------
@@ -380,19 +376,6 @@ def test_classify_beam_silent_when_consistent():
     assert log.warns == []
 
 
-def test_status_heartbeat_republishes_control_set():
-    # Regression for #30: ~/state is volatile (not latched), so the control set
-    # must be re-published on the periodic status heartbeat -- not only on change
-    # -- or a late / udp-bridged rqt subscriber never populates the control panel.
-    node = _FakeNode()
-    node._transmitting = False
-    node._sound_speed = 1500.0
-    node._ping_count = {'port': 0, 'stbd': 0, 'down': 0}
-    node._pub_status = types.SimpleNamespace(publish=lambda msg: None)
-    GarminSidescanNode._publish_status(node)
-    assert node.publishes == 1
-
-
 # ----- nadir bottom range (sub-header v1 -> sensor_msgs/Range, issue #16) --
 
 def test_build_nadir_range_maps_bottom_range_to_downward_range():
@@ -422,7 +405,7 @@ def test_make_sonar_msg_down_never_takes_commanded_range_fallback():
         return types.SimpleNamespace(
             _frame_id='gs', _freq={side: 0.0}, _device='auto', _detected_gen=None,
             _sound_speed=1500.0,
-            _controls={'range': '50.0'}, _sample_rate=0.0,
+            _commanded_range_m=50.0, _sample_rate=0.0,
             _make_sonar_msg=GarminSidescanNode._make_sonar_msg)
     samples = bytes(4096)                       # 2048 uint16 bins
     stamp = types.SimpleNamespace(to_msg=lambda: Time())
@@ -452,7 +435,7 @@ def test_make_sonar_msg_encodes_near_field_gate():
     node = types.SimpleNamespace(
         _frame_id='gs', _freq={'down': 0.0}, _device='auto', _detected_gen=None,
         _sound_speed=1500.0,
-        _controls={'range': '0.0'}, _sample_rate=0.0,
+        _commanded_range_m=0.0, _sample_rate=0.0,
         get_logger=lambda: _FakeLogger())
     samples = bytes(2 * 1943)                    # 1943 uint16 bins
     stamp = types.SimpleNamespace(to_msg=lambda: Time())
@@ -481,7 +464,7 @@ def test_make_sonar_msg_bits_sets_dtype_and_stride():
     node = types.SimpleNamespace(
         _frame_id='gs', _freq={'port': 0.0}, _device='auto', _detected_gen=None,
         _sound_speed=1500.0,
-        _controls={'range': '0.0'}, _sample_rate=1000.0,
+        _commanded_range_m=0.0, _sample_rate=1000.0,
         get_logger=lambda: _FakeLogger())
     stamp = types.SimpleNamespace(to_msg=lambda: Time())
     m8 = GarminSidescanNode._make_sonar_msg(node, 'port', bytes(300), stamp, bits=8)

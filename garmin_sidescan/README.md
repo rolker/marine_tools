@@ -62,14 +62,15 @@ Published (relative to the node namespace):
 | `debug/raw` | `std_msgs/UInt8MultiArray` | raw UDP payloads — only when `debug_raw:=true`, for offline re-decode |
 | `transmitting` | `std_msgs/Bool` | latched transmit state |
 | `status` | `std_msgs/String` | latched one-line status |
-
-| `state` | `marine_radar_control_msgs/RadarControlSet` | latched operator-control set (CAMP renders it) |
+| `control/state` | `marine_control_interfaces/ControlSet` | operator-control set (range + transmit), published by the marine_control `ControlServer` on a 1 Hz heartbeat (RELIABLE + VOLATILE for the udp_bridge); rendered by `rqt_marine_control` |
 
 Subscribed:
 - the sound-speed topic (default `sound_speed`, `marine_interfaces/SoundSpeed`;
   a platform launch sets the absolute path).
-- `change_state` (`marine_radar_control_msgs/RadarControlValue`) — operator
-  control changes (`key`/`value`), same contract as the radar driver.
+- `control/change` (`marine_control_interfaces/ControlValue`) — operator control
+  changes applied by the marine_control `ControlServer`: it sets the bound
+  `range_m` / `transmit` parameter (the node's own on-set validation runs), then
+  echoes `control/state`.
 
 Each channel publishes its own `frame_id` (`<frame_id>_port` / `_starboard` /
 `_down`); the URDF/TF tree orients each transducer (side and downward tilt), so
@@ -79,20 +80,24 @@ skip, draping over terrain or a nadir-depth plane) is a separate effort.
 
 Service: `set_transmit` (`std_srvs/SetBool`) — turn transmit on/off.
 
-## Operator controls (radar-style)
+## Operator controls (marine_control)
 
-Mirrors the `unh_marine_radar` pattern so CAMP can render the controls
-dynamically: the node publishes a `RadarControlSet` on `state` and accepts
-`RadarControlValue` (`key`, `value`) on `change_state`.
+Range and transmit are exposed through the `marine_control` device-control
+library (ADR-0003): the node declares them as parameters with descriptors and
+binds them to a `ControlServer`, which publishes a `ControlSet` on
+`control/state` and applies inbound `ControlValue` changes on `control/change`.
+`rqt_marine_control` renders the panel; the udp_bridge carries it to the operator
+station. (Changing a control is just a parameter set, so `ros2 param set` and a
+launch override reach the same controls.)
 
-| Control | Type | Values | Notes |
-|---------|------|--------|-------|
-| `status` | enum | `standby` / `transmit` | reflects actual transmit state |
-| `range` | float | `range_min_m`..`range_max_m` (m) | verified on GCV-20 |
-| `tvg` | enum | `off`/`low`/`medium`/`high` | GCV-10-derived; **unverified on GCV-20** (TVG is display-side there) |
-| `interference` | enum | `off`/`low`/`medium`/`high` | GCV-10-derived; **unverified on GCV-20** |
+| Control | Parameter | Type | Range | Notes |
+|---------|-----------|------|-------|-------|
+| transmit | `transmit` | bool | — | holds the **actual** transmit state, reconciled from the device by a 0.5 s timer so the panel never lies |
+| range | `range_m` | float (m) | `range_min_m`..`range_max_m` | display range; `0` leaves the device default at startup |
 
-`tvg` / `interference` are gated by `expose_gcv10_controls` (default true).
+The TCP command protocol also supports TVG / interference frames (see
+`commands.py`), but these are GCV-10-derived and unverified on the GCV-20 (TVG is
+display-side there), so they are **not** exposed as operator controls.
 
 ## Transmit safety
 
@@ -206,9 +211,8 @@ correction must match this parameter, or it double-corrects the range.
 | `nadir_beam_width_rad` | `0.0` | `Range.field_of_view` for `nadir_depth` |
 | `transmit_on_startup` | `false` | safe default; only enable with the transducer **submerged** — startup transmit is unguarded (see Transmit safety) |
 | `sound_speed` | `1500.0` | device's assumed sound speed (m/s) used to build the `sample_rate` scale and stamped into `ping_info.sound_speed`; see Protocol notes |
-| `range_m` | `0.0` | >0 commands range (settable at runtime) |
+| `range_m` | `0.0` | >0 commands range (settable at runtime; exposed via marine_control) |
 | `range_min_m` / `range_max_m` | `1.0` / `60.0` | bounds of the range control |
-| `expose_gcv10_controls` | `true` | include TVG / interference controls |
 | `device` | `auto` | `auto` detects GCV-10 vs GCV-20 structurally from the render-layer count (picks the echo extractor); `gcv20`/`gcv10` force it |
 | `debug_raw` | `false` | publish raw UDP payloads on `debug/raw` for offline re-decode; settable at runtime |
 

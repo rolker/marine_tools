@@ -26,7 +26,6 @@ import time
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from marine_acoustic_msgs.msg import RawSonarImage, SonarImageData
 from marine_control_py import ControlServer
-from marine_radar_control_msgs.msg import RadarControlItem, RadarControlSet, RadarControlValue
 from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
 import rclpy
 from rclpy.node import Node
@@ -37,10 +36,7 @@ from std_msgs.msg import Bool, String, UInt8MultiArray
 from std_srvs.srv import SetBool
 
 from .commands import (
-    build_interference_cmd,
     build_range_cmd,
-    build_tvg_cmd,
-    LOW_MED_HIGH,
     TRANSMIT_OFF,
     TRANSMIT_ON,
 )
@@ -266,9 +262,9 @@ class GarminSidescanNode(Node):
         self.declare_parameter('transmit_on_startup', False)
         self.declare_parameter('startup_off_repeats', 3)
 
-        # operator control set (radar-style; rendered by CAMP). Declare the range
-        # bounds first so range_m can carry a FloatingPointRange descriptor built
-        # from them for the marine_control panel.
+        # Operator controls (range + transmit) exposed through marine_control.
+        # Declare the range bounds first so range_m can carry a FloatingPointRange
+        # descriptor built from them for the marine_control panel.
         self.declare_parameter('range_min_m', 1.0)
         self.declare_parameter('range_max_m', 60.0)
         # range_m default 0.0 = "do not command a range at startup". The
@@ -288,9 +284,6 @@ class GarminSidescanNode(Node):
         self.declare_parameter(
             'transmit', False,
             ParameterDescriptor(description='Sonar transmit on/off.'))
-        # TVG / interference frames are GCV-10-derived and unverified on the
-        # GCV-20 (TVG is display-side there); expose them but allow opting out.
-        self.declare_parameter('expose_gcv10_controls', True)
 
         # Sound speed (m/s) used to convert the device's per-ping display range
         # into the published RawSonarImage scale (sample_rate) and stamped into
@@ -345,15 +338,11 @@ class GarminSidescanNode(Node):
         self._ping_count = {s: 0 for s in SIDES}
         self._range_min = float(self._p('range_min_m'))
         self._range_max = float(self._p('range_max_m'))
-        self._expose_gcv10 = bool(self._p('expose_gcv10_controls'))
-        # current operator-control values (strings, radar-control convention)
-        start_range = float(self._p('range_m'))
-        self._controls = {
-            'status': 'standby',
-            'range': f'{start_range:.1f}',
-            'tvg': 'off',
-            'interference': 'off',
-        }
+        # Last commanded display range (m); 0.0 = none commanded. Feeds the
+        # side-scan sample-rate fallback in _make_sonar_msg, and is updated at
+        # startup and on each accepted range_m change. The operator-facing value
+        # lives in the range_m parameter (exposed via marine_control).
+        self._commanded_range_m = float(self._p('range_m'))
         # The per-packet sample extractor depends on the device generation, so
         # the assembler is built lazily once the generation is known (immediately
         # for an explicit device; after geometry detection for 'auto').
@@ -405,16 +394,8 @@ class GarminSidescanNode(Node):
         self._pub_diag = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
         self._pub_tx = self.create_publisher(Bool, '~/transmitting', latched)
         self._pub_status = self.create_publisher(String, '~/status', latched)
-        # Control set: volatile depth-10, NOT latched -- mirrors simrad_halo_radar
-        # (the rqt control panel + udp_bridge are built around the radar's model).
-        # transient_local does not cross the udp_bridge, and a volatile subscriber
-        # never sees a latched sample; the set is instead re-sent on a heartbeat
-        # (see _publish_status) so a late / bridged subscriber always populates.
-        self._pub_state = self.create_publisher(RadarControlSet, '~/state', 10)
 
         self.create_service(SetBool, '~/set_transmit', self._on_set_transmit)
-        self.create_subscription(RadarControlValue, '~/change_state',
-                                 self._on_control_value, 10)
 
         self.add_on_set_parameters_callback(self._on_param_set)
 
@@ -470,7 +451,7 @@ class GarminSidescanNode(Node):
                 'assuming sonar may be pinging')
         if range_m > 0:
             if self._send(build_range_cmd(range_m)):
-                self._controls['range'] = f'{range_m:.1f}'
+                self._commanded_range_m = range_m
                 self.get_logger().info(f'startup: range set to {range_m} m')
             else:
                 self.get_logger().error(f'startup: range command ({range_m} m) failed to send')
@@ -510,13 +491,14 @@ class GarminSidescanNode(Node):
 
     def _publish_tx_state(self):
         self._pub_tx.publish(Bool(data=bool(self._transmitting)))
-        # keep the operator-control mirror in sync with actual transmit state
-        self._controls['status'] = 'transmit' if self._transmitting else 'standby'
-        self._publish_control_set()
+        # The marine_control panel learns the new transmit state via
+        # _reconcile_transmit_param, which mirrors it into the `transmit`
+        # parameter and republishes the ControlSet on the next reconcile tick.
 
     def _request_transmit(self, on):
         """
-        Guarded transmit request shared by the service and control set.
+        Guarded transmit request shared by the ~/set_transmit service and the
+        transmit parameter.
 
         The return reflects the actual resulting transmit state, not merely
         that a command was attempted: a failed ON send reports failure, and a
@@ -535,72 +517,6 @@ class GarminSidescanNode(Node):
     def _on_set_transmit(self, req, resp):
         resp.success, resp.message = self._request_transmit(bool(req.data))
         return resp
-
-    # ----- operator control set (radar-style) -------------------------------
-    def _publish_control_set(self):
-        rcs = RadarControlSet()
-        status = RadarControlItem()
-        status.name = 'status'
-        status.label = 'Status'
-        status.type = RadarControlItem.CONTROL_TYPE_ENUM
-        status.value = self._controls['status']
-        status.enums = ['standby', 'transmit']
-        rcs.items.append(status)
-
-        rng = RadarControlItem()
-        rng.name = 'range'
-        rng.label = 'Range (m)'
-        rng.type = RadarControlItem.CONTROL_TYPE_FLOAT
-        rng.value = self._controls['range']
-        rng.min_value = self._range_min
-        rng.max_value = self._range_max
-        rcs.items.append(rng)
-
-        if self._expose_gcv10:
-            for name, label in (('tvg', 'TVG'), ('interference', 'Interference')):
-                item = RadarControlItem()
-                item.name = name
-                item.label = label
-                item.type = RadarControlItem.CONTROL_TYPE_ENUM
-                item.value = self._controls[name]
-                item.enums = list(LOW_MED_HIGH)
-                rcs.items.append(item)
-        self._pub_state.publish(rcs)
-
-    def _on_control_value(self, msg):
-        key, value = msg.key, msg.value
-        if key == 'status':
-            self._request_transmit(value == 'transmit')
-            return                       # _request_transmit republishes the set
-        elif key == 'range':
-            try:
-                meters = float(value)
-            except ValueError:
-                self.get_logger().warn(f'bad range control value: {value!r}')
-                return
-            meters = max(self._range_min, min(self._range_max, meters))
-            # Only mirror/log success if the command actually sent; otherwise
-            # CAMP would show a range the GCV never received.
-            if self._send(build_range_cmd(meters)):
-                self._controls['range'] = f'{meters:.1f}'
-                self.get_logger().info(f'range set to {meters} m (control)')
-            else:
-                self.get_logger().error(f'range command ({meters} m) failed to send')
-        elif key in ('tvg', 'interference') and self._expose_gcv10:
-            if value not in LOW_MED_HIGH:
-                self.get_logger().warn(f'bad {key} control value: {value!r}')
-                return
-            level = LOW_MED_HIGH.index(value)
-            builder = build_tvg_cmd if key == 'tvg' else build_interference_cmd
-            if self._send(builder(level)):
-                self._controls[key] = value
-                self.get_logger().info(f'{key} set to {value} (control)')
-            else:
-                self.get_logger().error(f'{key} command ({value}) failed to send')
-        else:
-            self.get_logger().warn(f'unknown control key: {key!r}')
-            return
-        self._publish_control_set()
 
     def _reconcile_transmit_param(self):
         """
@@ -883,8 +799,7 @@ class GarminSidescanNode(Node):
                 f'ping has {bins} bins > GRID_BINS ({GRID_BINS}); fixed-grid '
                 'scale assumption violated, published scale is unreliable',
                 throttle_duration_sec=30.0)
-        commanded = (0.0 if side == 'down'
-                     else float(self._controls.get('range') or 0.0))
+        commanded = 0.0 if side == 'down' else self._commanded_range_m
         msg.sample_rate = derive_sample_rate(
             sub, GRID_BINS, sv, commanded_range_m=commanded,
             fallback_rate=self._sample_rate)
@@ -952,11 +867,6 @@ class GarminSidescanNode(Node):
             f'sound_speed={self._sound_speed:.1f} '
             f'pings(port/stbd/down)={self._ping_count["port"]}/'
             f'{self._ping_count["stbd"]}/{self._ping_count["down"]}')))
-        # Re-publish the control set on the status timer so a late or udp-bridged
-        # subscriber always populates: ~/state is volatile, so it never sees the
-        # on-change publishes. The radar heartbeats this at 1 Hz; here it rides
-        # the existing 2 s status timer.
-        self._publish_control_set()
 
     def _on_param_set(self, params):
         # Validate the whole batch before applying ANY side effect. rclpy
@@ -1011,8 +921,7 @@ class GarminSidescanNode(Node):
                     f'range command ({range_request} m) failed to send')
                 return SetParametersResult(
                     successful=False, reason='range command failed to send')
-            self._controls['range'] = f'{range_request:.1f}'
-            self._publish_control_set()
+            self._commanded_range_m = range_request
             self.get_logger().info(f'range set to {range_request} m')
 
         # Apply transmit last. ControlServer sets exactly one parameter per

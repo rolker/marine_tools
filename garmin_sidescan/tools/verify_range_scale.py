@@ -12,7 +12,9 @@ Decodes a ``debug/raw`` stream with the SAME code the driver uses
     (issue #16);
   * what the bag's recorded ``sonar_image_*`` messages actually carried
     (``sound_speed * bins / (2 * sample_rate)``, NaN when unavailable) and the
-    ``state`` topic's commanded-range mirror -- the before/after comparison.
+    marine_control ``control/state`` ``range_m`` value -- the before/after
+    comparison. (Bags predating the marine_control migration carried this on the
+    radar ``state`` topic instead; that overlay is simply omitted for them.)
 
 Interactive by default (zoom/pan with the matplotlib toolbar; try the Cod Rock
 auto-range transitions); ``--out FILE`` renders headless to a PNG instead.
@@ -50,10 +52,11 @@ def read_bag(bag, start, end):
     Returns ``(decoded, published, commanded)``:
     ``decoded[ch] = [(t, v1, v2, v1_tag)]`` from the raw stream (driver-path
     decode); ``published[side] = [(t, implied_range)]`` from the recorded
-    ``sonar_image_*`` messages; ``commanded = [(t, range_m)]`` from ``state``.
+    ``sonar_image_*`` messages; ``commanded = [(t, range_m)]`` from the
+    marine_control ``control/state`` topic.
     """
     from marine_acoustic_msgs.msg import RawSonarImage
-    from marine_radar_control_msgs.msg import RadarControlSet
+    from marine_control_interfaces.msg import ControlSet
 
     raw_topic = None
     img_topics = {}
@@ -67,15 +70,15 @@ def read_bag(bag, start, end):
             # name-filtered to the driver's own publishers: the same bag may
             # carry other RawSonarImage sources (e.g. the M3 multibeam)
             img_topics[t.name] = t.name.rsplit('_', 1)[-1]
-        elif t.type == 'marine_radar_control_msgs/msg/RadarControlSet':
+        elif t.type == 'marine_control_interfaces/msg/ControlSet':
             state_candidates.append(t.name)
     if raw_topic is None:
         sys.exit('error: no */debug/raw topic in the bag — record with debug_raw:=true')
-    # The commanded-range mirror must be THIS driver's ~/state -- a bag can
-    # carry other RadarControlSet publishers (e.g. the radar). Match by the
-    # raw topic's own namespace.
+    # The commanded-range mirror must be THIS driver's marine_control state
+    # (~/control/state) -- a bag can carry other ControlSet publishers. Match by
+    # the raw topic's own namespace.
     ns = raw_topic[:-len('debug/raw')]
-    state_topic = next((n for n in state_candidates if n == ns + 'state'), None)
+    state_topic = next((n for n in state_candidates if n == ns + 'control/state'), None)
 
     asm = None                    # built once the generation vote resolves
     gen_votes = []
@@ -125,9 +128,9 @@ def read_bag(bag, start, end):
                    if rate > 0 and sv > 0 else float('nan'))
             published.setdefault(img_topics[topic], []).append((rel, rng))
         elif topic == state_topic and start <= rel <= end:
-            m = deserialize_message(data, RadarControlSet)
+            m = deserialize_message(data, ControlSet)
             for item in m.items:
-                if item.name == 'range':
+                if item.name == 'range_m':
                     try:
                         commanded.append((rel, float(item.value)))
                     except ValueError:
@@ -166,7 +169,7 @@ def render(decoded, published, commanded, out):
     if commanded:
         c = np.array(commanded)
         a1.plot(c[:, 0], c[:, 1], drawstyle='steps-post', color='red', lw=1,
-                label='commanded-range mirror (state)')
+                label='range_m (marine_control state)')
     a1.set_ylabel('range (m)')
     a1.legend(loc='upper right', fontsize=8)
     a1.set_title('per-channel display range: driver-path decode vs recorded '

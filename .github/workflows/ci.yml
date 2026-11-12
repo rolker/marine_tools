@@ -43,11 +43,11 @@ jobs:
 
       # marine_tools packages depend on source-sibling packages that are not
       # rosdep/binary packages: marine_interfaces (unh_marine_autonomy),
-      # udp_bridge_interfaces (udp_bridge), marine_radar_control_msgs
-      # (unh_marine_radar), and marine_control_py + marine_control_interfaces
-      # (marine_control — garmin_sidescan's ControlServer, added in #39). Clone
-      # each parent repo and prune to just the package(s) we need so rosdep/colcon
-      # stay light (the parent repos carry heavy nav2/mavros/radar/Qt packages we
+      # udp_bridge_interfaces (udp_bridge), and marine_control_py +
+      # marine_control_interfaces (marine_control — garmin_sidescan's
+      # ControlServer, the sole operator-control surface as of #64). Clone each
+      # parent repo and prune to just the package(s) we need so rosdep/colcon
+      # stay light (the parent repos carry heavy nav2/mavros/Qt packages we
       # don't need). The workspace `make build` is the full integration gate; this
       # per-repo CI is the lighter-weight check.
       - name: Clone source-sibling interface packages
@@ -68,8 +68,6 @@ jobs:
             unh_marine_autonomy marine_interfaces
           clone_prune https://github.com/rolker/udp_bridge.git jazzy \
             udp_bridge udp_bridge_interfaces
-          clone_prune https://github.com/rolker/unh_marine_radar.git jazzy \
-            unh_marine_radar marine_radar_control_msgs
           clone_prune https://github.com/rolker/marine_control.git jazzy \
             marine_control marine_control_py marine_control_interfaces
 
