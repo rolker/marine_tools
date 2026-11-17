@@ -141,9 +141,75 @@ ros2 run bag_analysis bag_to_xtf --bag <bag> --output survey.xtf \
 
 Other options: `--port-topic` / `--starboard-topic` / `--nadir-topic`,
 `--earth-frame` (default `earth`), `--pair-tolerance` (max |Δt| to pair
-port with starboard, default 0.25 s), `--max-tf-age` (drop pings whose
-only TF is older than this, default 1 s), and `--max-pings` (cap output,
-for quick checks; a value below 1 is rejected).
+port with starboard, default 0.25 s), and `--max-pings` (cap output, for
+quick checks; a value below 1 is rejected). The transform options are in
+the next section.
+
+### Where each ping's pose comes from
+
+The pose of a ping is the pose at the ping's own time, from tf2. The
+transform samples just past a ping come later in the bag than the ping, so
+`bag_to_xtf` holds each ping until it has read transforms on both sides of
+the ping's time, then asks tf2 for the pose at exactly that time. There is
+no fallback to the latest transform and no option to turn one on. (Before
+this, 98% of the pings of a real bag were written with the latest
+transform, a pose 0.05 s old on median and up to 0.23 s old; every XTF
+made earlier is affected, so regenerate any you still use.)
+
+A ping is dropped, and counted by reason in the summary, when:
+
+| Counter | Meaning |
+|---|---|
+| `no_tf` | its time is before the first transform sample of a link in the chain, or a frame of the chain never appears |
+| `tf_gap` | the two samples around its time, on any dynamic link of the chain, are further apart than `--max-tf-gap` |
+| `tf_late` | no transform past its time arrived within `--tf-wait`, or the bag ended first |
+| `tf_mismatch` | tf2 refused a lookup that the tool's own record of the samples said would work (should stay 0; if not, please report it) |
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--max-tf-gap <s>` | 1 | Largest allowed interval between the two samples around the ping time, on every dynamic link of the chain (about ten periods of a 10 Hz chain). A sample exactly at the ping time passes whatever its neighbours. Static transforms never count. tf2 itself interpolates across a gap of any length without saying so, which is why the tool checks. |
+| `--tf-wait <s>` | 5 | How long a ping waits for transforms past its time, in seconds of bag time (the time the messages were recorded, not the sonar stamps). Must be larger than `--max-tf-gap`. A chain that is never published costs about this much queued data, not the whole bag. |
+| `--tf-cache <s>` | 600 | tf2 cache length. Must be larger than `--tf-wait` + `--max-tf-gap` + the offset below. |
+| `--stamp-to-transmit-offset <s>` | 0 | See below. |
+
+`--max-tf-age` is gone. It limited how old a fallback "latest" transform
+could be, a thing that no longer exists, and its value would now mean
+something different, so passing it is an error that names `--max-tf-gap`.
+Do not carry an old value over.
+
+The run stops with exit 1 and a message, keeping the parts finished so far,
+if the transform tree is one it does not support: a frame that gets a
+second parent partway through the bag, or a frame published on both `/tf`
+and `/tf_static`. tf2 would silently keep only one of the two, so poses
+would be wrong. Transforms that tf2 itself rejects (NaN, a zero
+quaternion, a frame that is its own parent, an empty frame id, data older
+than the cache) are not used and are listed in the summary. A transform
+that arrives after a transform with a later stamp for the same frame is
+filed in order, but a ping already answered from the wider bracket is not
+revisited.
+
+#### What the sonar stamp means: `--stamp-to-transmit-offset`
+
+The `garmin_sidescan` driver stamps each ping with the host's receive time
+of its first packet, not with the time the ping was transmitted (see
+"Timestamp" in `garmin_sidescan/README.md`). The ping was sent a little
+earlier, and the boat moved in between. The offset says how much earlier,
+in seconds: the pose is looked up at `stamp - offset`. The default is 0, so
+nothing changes unless you set it. Negative values are allowed; only a
+non-finite or absurd (over an hour) value is an error.
+**The offset has not been measured.** This option is the place to put a
+measured value; estimating one is not part of `bag_to_xtf`.
+
+Which time is used where:
+
+| Time | Used for |
+|---|---|
+| the stamp as recorded (`header.stamp`; the bag time if the stamp is zero) | `--start-time` / `--end-time`, port/starboard pairing (`--pair-tolerance`), and the ping header's ComputerClockHour/Minute/Second/Hsec fields (XTF spec: the computer clock time when the ping was received) |
+| `stamp - offset` (the transmit estimate) | the pose lookup, the ping header's Year to HSeconds, the names of split parts, `--split-gap`, `--split-duration`, seconds-per-ping and speed |
+
+With the default offset the two are the same. With an offset, a part can be
+named up to the offset before the first stamp that `--start-time` admitted.
+The ComputerClock fields are written on every ping, offset or not.
 
 ### Splitting the output
 
@@ -238,6 +304,33 @@ disk is skipped on filesystems that cannot do it (`EINVAL`, `ENOSYS`,
 If listing the folder or printing the summary fails after a complete
 conversion, the run still exits 0: the parts are written. It says so and
 says that the check for files of earlier runs could not be done.
+
+## Contacts and log entries → GeoJSON (`contacts_to_geojson`)
+
+```bash
+ros2 run bag_analysis contacts_to_geojson \
+    --bag <operator bag> --log <deployment log>.md --output contacts.geojson
+```
+
+Operator contacts become points from their own `geo_pose`. Deployment-log
+entries (`**<timestamp>** — text`) are placed on the boat track: the pose of
+`--track-frame` (default `bizzy/base_link`) at the entry's time, from tf2,
+with the same rules as `bag_to_xtf` above: transforms on both sides of the
+time, no fallback to the latest transform. The tool reads the whole bag's
+transforms first, so it never waits; an entry after the last transform is
+`tf_late`. Log timestamps have minute precision at best, so an entry is
+located only as well as its time is known.
+
+An entry that cannot be located is still written, with `"geometry": null`,
+and a `geo_status` property: `exact` (located), `no_tf`, `tf_gap`,
+`tf_late` or `tf_mismatch`, with the meanings of the table above. The old
+`approx`, `stale` and `missing` statuses are gone.
+
+`--max-tf-gap` (default 1 s, the same bar as `bag_to_xtf`) replaces
+`--max-tf-age`, which is now an error that names it. Raise it for a
+transform chain slower than about 1 Hz. The same unsupported trees as above
+(a re-parented frame, a frame on both `/tf` and `/tf_static`) stop the run
+with exit 1.
 
 ## Schema
 
