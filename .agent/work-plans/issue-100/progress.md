@@ -162,3 +162,31 @@ Gap of any length is interpolated; lookups past newest/before oldest raise; lead
 - A single duplicated stamp with a different value is surfaced (counted), not corrected; the tracker holds stamps, not values.
 - `--end-time` is still decided on one message's stamp: a single bad future stamp on a sonar message stops admission. Not part of the review; unchanged.
 - tf2's per-frame 1,000,000-sample cap is still not mirrored (as in round 1).
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-11-17 14:06 -05:00
+**By**: Claude Code Agent (Claude Sonnet)
+**Verdict**: approved
+
+**Branch**: feature/issue-100 at `c36b710`
+**Mode**: pre-push
+**Depth**: Deep (reason: round-2 delta of ~680 lines in the survey-georeferencing path, restructured pairing and counters)
+**Must-fix**: 0 | **Suggestions**: 3
+**Round**: 2 | **Ship**: recommended — no must-fix; all nine round-1 items verified closed; the pairing change is order-equivalent to the old logic when nothing is dropped. Specialists: static/tests (288 passed, 2 skipped, flake8 and pep257 included), governance/plan drift read by the lead, lead's own adversarial read of the delta (pairing, counters, time, wait, evicted); Gemini ran and found nothing; Codex hit its usage limit again (not run); no separate Claude subagent passes this round.
+
+### Findings
+- [ ] (suggestion) `tf_evicted` is set whenever any stamp was ever dropped from a link, so a lookup older than the first sample ever fed is also called evicted once the bag outlasts the cache (a `contacts_to_geojson` entry before the recording start, bag longer than 6 h): the label and the "raise --tf-cache" advice are wrong there. Keep the first-ever stamp per link and answer evicted only at or after it — `tf_lookup.py:_check_link, _Stamps.drop_before`
+- [ ] (suggestion) With `--max-pings` the generator's finally counts halves read ahead while the last pair waited as `unpaired`, which the old code left in the queue uncounted; the `_iter_pings` docstring says waiting pings are not counted — `bag_to_xtf.py:_iter_pings` (finally)
+- [ ] (suggestion) The `--tf-cache` bound is wait + gap + |offset| and omits `--pair-tolerance` (the first half of a pair can be that much older than the completing message that starts the wait); at the margin that gives a reported `tf_evicted`, never a wrong pose — `bag_to_xtf.py:_parse_args` (~326)
+
+### Answers to the seven points
+1. Pairing: with no drops the same messages pair, in the same order, with the same `unpaired` count, as the old code (same sequence of pair/replace operations on the same stream, the queue is FIFO, altitude is the completing message's). Duplicate stamps, a channel running ahead, three messages within tolerance (third waits as pending), --max-pings, window and end of bag behave as before. A half cannot be emitted twice or lost uncounted: a pair is consumed once; pending halves are counted at finally. The only difference found is the --max-pings read-ahead count (suggestion 2).
+2. The port half defines pose, time, ComputerClock, speed and sound velocity; the starboard half is looked up for the verdict only (its pose is unused). Consistent for lookup, written time and ComputerClock.
+3. Counters: accurate on each exit path checked; the two report lines read correctly. Only the read-ahead case above.
+4. `_utc_from_ns` floors to microseconds like the writer's hundredths; negative and pre-1970 values floor toward minus infinity and stay inside datetime range; zero stamps fall back to record time before this point; leap seconds not involved.
+5. Wait is tf_wait + max(0, -offset), counted from the completing message's record time; cache bound includes |offset| (not pair tolerance, suggestion 3).
+6. `tf_evicted` is definite in both tools; in bag_to_xtf a held ping settles long before the cache could evict, so it stays 0 in practice; in contacts_to_geojson it can mislabel (suggestion 1).
+7. README matches the code for counters, options, `--end-time`, evicted and the earth-ancestor rule.
+
+Cross-model: Gemini found nothing; Codex failed with a usage limit (recorded).
