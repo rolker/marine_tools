@@ -62,9 +62,9 @@ non-zero.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 import ctypes.util
-from collections import deque
 import datetime as _dt
 import errno
 import math
