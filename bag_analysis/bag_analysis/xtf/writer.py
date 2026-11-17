@@ -193,8 +193,16 @@ class XtfWriter:
         sound_velocity_mps: float,
         port: ChannelPing,
         starboard: ChannelPing,
+        computer_time: _dt.datetime | None = None,
     ) -> None:
-        """Append one two-channel sonar ping packet to the file."""
+        """
+        Append one two-channel sonar ping packet to the file.
+
+        ``time`` is the ping time (header Year..HSeconds). ``computer_time``,
+        if given, is the time the ping was received, written to the header's
+        ComputerClock fields (offsets 236 to 239; the spec says the two may
+        differ when the sonar time-stamps its own data). Both are UTC.
+        """
         # XTF convention: the port channel is stored in reversed sample order
         # (outermost/far range first, nadir last) relative to starboard, so a
         # standard viewer renders port extending left of nadir into a
@@ -219,6 +227,11 @@ class XtfWriter:
         struct.pack_into('<B', header, 19, time.minute)
         struct.pack_into('<B', header, 20, time.second)
         struct.pack_into('<B', header, 21, time.microsecond // 10000)  # hsec
+        if computer_time is not None:
+            struct.pack_into(
+                '<4B', header, 236,           # ComputerClockHour..Hsec
+                computer_time.hour, computer_time.minute,
+                computer_time.second, computer_time.microsecond // 10000)
         struct.pack_into('<I', header, 28, ping_number & 0xFFFFFFFF)
         struct.pack_into('<f', header, 32, float(sound_velocity_mps))
         struct.pack_into('<f', header, 120, float(speed_mps))   # ShipSpeed
