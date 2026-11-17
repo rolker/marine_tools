@@ -124,12 +124,41 @@ Gap of any length is interpolated; lookups past newest/before oldest raise; lead
 **Round**: 1 | **Ship**: recommended — no must-fix; tf2 bookkeeping verified by 144k-query differential fuzz and by 2 independent reads; suggestions are optional. Specialists: static (tests incl. flake8: 258 pass, 2 skipped), governance/plan, 2 Claude adversarial lenses, Gemini; Codex unavailable (usage limit).
 
 ### Findings
-- [ ] (suggestion) Port/starboard pairing across a dropped mate: a ping dropped for tf can leave its mate pending, which then pairs with the next opposite-channel ping (0.1 s later, inside the 0.25 s tolerance) using that ping's pose and time; also each tf drop adds an `unpaired` — `bag_to_xtf.py:505-524`
-- [ ] (suggestion) Negative offset not checked against `--tf-wait`: lookup time is stamp+|offset| but wait runs from record time; offset -6 with default wait makes every ping `tf_late` (loud, opaque cause). Require wait > gap + max(0,-offset) or document — `bag_to_xtf.py:301`
-- [ ] (suggestion) Cycle check in `TfChain.check` runs after a DEFINITE verdict returns, so a cyclic tree gives no_tf/tf_gap rather than TfChainError (counted drop, never a wrong pose) — `tf_lookup.py:198-215`
-- [ ] (suggestion) `cache_ns` uses round() while `Duration(seconds=)` truncates; build the Buffer with `Duration(nanoseconds=self.cache_ns)` — `tf_lookup.py:130`
-- [ ] (suggestion) Duplicate stamp with a different value: tf2 replaces the value silently (probed); tracker cannot see it. Count a re-fed identical stamp in `rejected` — `tf_lookup.py:_Stamps.add`
-- [ ] (suggestion) Cache eviction reported as `no_tf` ("before the first sample"); `contacts_to_geojson` also never prints `chain.rejected` and its 6 h cache gives misleading no_tf for older log entries in a long bag — `tf_lookup.py:_check_link`, `contacts_to_geojson.py:main`
-- [ ] (suggestion) Option edge cases: `--tf-cache 1e30` gives an uncaught OverflowError; `--max-tf-gap` below 0.5 ns rounds to 0; past `--end-time` non-TF messages skip the wait check so held pings only settle at bag end (scan cost, result unchanged) — `bag_to_xtf.py:_parse_args, _iter_pings`
-- [ ] (suggestion) Test truth for hundredths/ComputerClock repeats the production formula; add integer-ns boundary cases (x.009999999, x.999999999) — `test_xtf_pose_time.py` offset test
-- [ ] (suggestion) README: the "98% ... 0.05 s median, 0.23 s" figure has no cited source (RESULT.txt gives 524684/535122 written pings); note `unpaired`/`malformed` in the drop table, that TF is no longer consumed after `--end-time` once the queue empties, and that `earth` must be an ancestor of the frame — `README.md:~158, ~207`
+- [x] (suggestion) Port/starboard pairing across a dropped mate: a ping dropped for tf can leave its mate pending, which then pairs with the next opposite-channel ping (0.1 s later, inside the 0.25 s tolerance) using that ping's pose and time; also each tf drop adds an `unpaired` — `bag_to_xtf.py:505-524`
+- [x] (suggestion) Negative offset not checked against `--tf-wait`: lookup time is stamp+|offset| but wait runs from record time; offset -6 with default wait makes every ping `tf_late` (loud, opaque cause). Require wait > gap + max(0,-offset) or document — `bag_to_xtf.py:301`
+- [x] (suggestion) Cycle check in `TfChain.check` runs after a DEFINITE verdict returns, so a cyclic tree gives no_tf/tf_gap rather than TfChainError (counted drop, never a wrong pose) — `tf_lookup.py:198-215`
+- [x] (suggestion) `cache_ns` uses round() while `Duration(seconds=)` truncates; build the Buffer with `Duration(nanoseconds=self.cache_ns)` — `tf_lookup.py:130`
+- [x] (suggestion) Duplicate stamp with a different value: tf2 replaces the value silently (probed); tracker cannot see it. Count a re-fed identical stamp in `rejected` — `tf_lookup.py:_Stamps.add`
+- [x] (suggestion) Cache eviction reported as `no_tf` ("before the first sample"); `contacts_to_geojson` also never prints `chain.rejected` and its 6 h cache gives misleading no_tf for older log entries in a long bag — `tf_lookup.py:_check_link`, `contacts_to_geojson.py:main`
+- [x] (suggestion) Option edge cases: `--tf-cache 1e30` gives an uncaught OverflowError; `--max-tf-gap` below 0.5 ns rounds to 0; past `--end-time` non-TF messages skip the wait check so held pings only settle at bag end (scan cost, result unchanged) — `bag_to_xtf.py:_parse_args, _iter_pings`
+- [x] (suggestion) Test truth for hundredths/ComputerClock repeats the production formula; add integer-ns boundary cases (x.009999999, x.999999999) — `test_xtf_pose_time.py` offset test
+- [x] (suggestion) README: the "98% ... 0.05 s median, 0.23 s" figure has no cited source (RESULT.txt gives 524684/535122 written pings); note `unpaired`/`malformed` in the drop table, that TF is no longer consumed after `--end-time` once the queue empties, and that `earth` must be an ancestor of the frame — `README.md:~158, ~207`
+
+## Implementation
+**Status**: complete
+**When**: 2026-11-17 14:10 -05:00
+**By**: Claude Sonnet
+
+**Branch**: feature/issue-100 at `0c5d5ca`
+**Addressed**: Local Review (Pre-Push), round 1, 2026-11-17 14:40 -05:00 (at `fdfd886`): all 9 suggestions, none deferred
+**Commits**: `8016a3d` `79a7cb9` `ccc92c3` `f78df0c` `0c5d5ca`
+
+### Actions
+- [x] Suggestion 1, mispairing across a dropped mate (treated as must-fix) — `bag_to_xtf.py:_pair_by_stamp, _HeldPing, _ping_verdict, _resolve` (`8016a3d`). Reproduced first: `test_a_ping_with_one_unresolvable_half_is_dropped_whole` wrote 3 pings instead of 2 on the old code (the surviving port half of ping A paired with the starboard half of ping B, 0.14 s later). Pairing is now decided on the stamps alone, before any lookup; a pair whose pose cannot be found is dropped whole and counted once under its reason; its halves are never left pending and are not also `unpaired`. Golden and split-join tests pass unchanged. Counters: `no_tf`, `tf_gap`, `tf_late`, `tf_evicted`, `tf_mismatch`, `paired` count pings; `port/starboard msgs`, `malformed`, `unpaired`, `out_of_window` count messages; the report prints two lines that say so; plan step 4 states it.
+- [x] Suggestion 2, negative offset vs `--tf-wait` — `bag_to_xtf.py:_iter_pings`, `--tf-wait` help (`ccc92c3`). The wait is `--tf-wait + max(0, -offset)`; tests: offset -6 writes all 60 pings with the pose at stamp + 6 s; with no transforms it is still `tf_late`.
+- [x] Suggestion 3, loop before verdict — `tf_lookup.py:TfChain.check` (`79a7cb9`). The chain is walked to its end before a verdict is returned; a loop raises whatever the earlier links say. A link with no samples yet is now `wait_chain` (it was ignored before).
+- [x] Suggestion 4, one cache length — `tf_lookup.py:TfChain.__init__` (`79a7cb9`): `Buffer(cache_time=Duration(nanoseconds=cache_ns))`; test with 10.0000000006 s agrees with bare tf2. `--tf-cache` above 1e7 s (the OverflowError case) and a `--max-tf-gap` that rounds to 0 ns are usage errors in both tools; also unparsable `--start-time`/`--end-time` (nan, inf, text).
+- [x] Suggestion 5, re-fed stamp — `tf_lookup.py:_Stamps.add, _feed_one` (`79a7cb9`): counted as `duplicate_stamp` in `rejected` (still handed to tf2, which keeps the last value); the note now reads "transforms rejected or re-fed" and `contacts_to_geojson` prints it too.
+- [x] Suggestion 6, eviction — new verdict `tf_evicted` (own counter, `geo_status`, README row); `contacts_to_geojson` also reports a loop as an error (exit 1) and warns naming `--tf-cache` (`79a7cb9`).
+- [x] Suggestion 7, options edges and `--end-time` — option edges as in 4; after `--end-time` every message advances the clock so held pings settle on the wait limit and the bag is not read to its end (`ccc92c3`); test counts messages consumed.
+- [x] Suggestion 8, integer-nanosecond boundaries — `test_hundredths_are_cut_from_the_integer_nanoseconds` (six cases, expected bytes worked out by hand from 1_750_000_000 s = 2025-06-15 15:06:40 UTC) (`f78df0c`). **This found a real defect**: 5 of the 6 cases failed. Times were made with `fromtimestamp(ns / 1e9)`, a float with about 240 ns of error that rounds to microseconds, so x.009999999 and x.999999999 landed on the wrong hundredth or second. Fixed with `_utc_from_ns` (integer arithmetic, truncated). On the real bag 17 of 267561 pings change, in the HSeconds byte of the time and of ComputerClock only.
+- [x] Suggestion 9, README — before-fix figures cited to issue #100, `unpaired`/`malformed` and `tf_evicted` in the drop tables, per-ping vs per-message wording, the whole-bag TF sentence corrected for `--end-time`, `earth` must be an ancestor of the ping's frame (`0c5d5ca`).
+
+### Result
+- `build.sh` + `test.sh bag_analysis`: 288 tests, 0 failures, 2 skipped (the same two pyxtf skips); flake8 and pep257 included; no rule disabled.
+- Real bag 2026-08-25T13-59-09, whole bag (RESULT.txt, "Round 2"): 267561 pings written (same as round 1); dropped pings no_tf=0 tf_gap=0 tf_late=0 tf_evicted=0 tf_mismatch=0; messages malformed=0 unpaired=31 (round 1 per message: tf_late=1 unpaired=30; the lone half is now just unpaired, as the old code counted it). Residual against interpolated truth unchanged: heading max 0.010 deg, pitch max 0.031, roll max 0.025, position max 3 mm. Default split: 5 parts of 58663, 58812, 58704, 58708, 32674 pings; ping bytes of the parts joined are byte for byte the --no-split file. Large outputs deleted.
+
+### Not done / not verified
+- A single duplicated stamp with a different value is surfaced (counted), not corrected; the tracker holds stamps, not values.
+- `--end-time` is still decided on one message's stamp: a single bad future stamp on a sonar message stops admission. Not part of the review; unchanged.
+- tf2's per-frame 1,000,000-sample cap is still not mirrored (as in round 1).
