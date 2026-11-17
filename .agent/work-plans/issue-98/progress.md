@@ -216,3 +216,27 @@ All seven closed as claimed (refuse unless `--overwrite`, exclusive `.partial`, 
 ### Notes
 - Tests: 169 run in bag_analysis, 0 failures, 2 skipped (pyxtf not installed).
 - Not verified on a real SMB/FAT share; the real `renameat2` EEXIST path is exercised only where the test filesystem supports it, otherwise the check-then-rename path answers the same test.
+
+## Local Review (Pre-Push)
+**When**: 2026-11-17 11:45 -05:00
+**By**: Claude Sonnet
+**Verdict**: approved
+
+**Branch**: feature/issue-98 at `88ac56f`
+**Mode**: pre-push (round 3, delta `41150e4..HEAD`)
+**Depth**: Light (reason: narrow check of round-2 fixes; no new risk found)
+**Specialists**: manual static/adversarial read of the delta, probe of the real `renameat2` path; cross-model not run (light depth). Tests 169 passed, 2 skipped.
+**Must-fix**: 0 | **Suggestions**: 0
+**Round**: 3 | **Ship**: ready to publish
+
+### Round 2 findings
+All closed. Must-fix (`--overwrite` writing through a `.partial` symlink/hard link): the name is now unlinked and recorded in `replaced`, then created with `xb`; tests cover symlink and hard link. Suggestions: no-hard-link fallback now uses atomic `renameat2(RENAME_NOREPLACE)` before check-then-rename, README states per-path guarantees; file fsync tolerates EINVAL/ENOSYS/ENOTSUP/EOPNOTSUPP and keeps EIO fatal; success-path summary and old-file check are guarded; a finished part whose name was taken is kept as `.partial`, reported, and exit is non-zero. README notes done.
+
+### ctypes `renameat2` wrapper
+Read carefully, no defect: `use_errno=True` with `get_errno()` read straight after the call; argtypes/restype set; only a 0 return is success (errno 0 on -1 still raises); EEXIST becomes FileExistsError; unsupported errnos return False for the next fallback, anything else raises. Missing libc symbol or non-Linux gives AttributeError/OSError and None, so the fallback is used. `os.fsencode` passes non-ASCII and surrogate-escaped names as bytes. Probed the real syscall: success, source gone, EEXIST leaves the destination untouched, with a non-ASCII/surrogate source name. Constants (AT_FDCWD -100, NOREPLACE 1) are the Linux values.
+
+### Kept `.partial`
+Reported accurately (count, name, pings, time span, size, "rename them yourself"), excluded from the old-files warning so it is not double-reported, and the next run's preflight sees it because the `.partial` suffix is in the part-name pattern.
+
+### Notes (not findings)
+- Residual: a non-Linux or non-renameat2 filesystem without hard links still has the documented microsecond check-then-rename window.
