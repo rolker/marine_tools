@@ -31,3 +31,17 @@ issue: 100
 ### Recommendations
 - Offset option belongs here: it is one subtraction with default 0, it is the only place the receive-vs-transmit finding can be acted on without another code change, and it shares the lookup-time change and the held-ping wait. Keep it minimal: no estimation, no per-sample motion. Risk is only a sign-convention mistake; one test pins it. Do not apply it to the XTF time field.
 - Do not add a latest-transform escape hatch for any reason.
+
+## Plan Authored
+**Status**: complete
+**When**: 2026-11-17 12:57 -05:00
+**By**: Claude Code Agent (Claude Sonnet)
+
+**Plan**: `.agent/work-plans/issue-100/plan.md` at `39dccb9`
+**Branch**: feature/issue-100 at `39dccb9`
+**Phases**: single
+
+### Open questions
+- [ ] XTF ping-header time when offset is non-zero: raw stamp (recommended) or stamp - offset
+- [ ] Negative offsets rejected (usage error) - confirm
+- [ ] Chain that stops mid-bag reports stale_tf after the hold limit; end-of-bag after-last reports no_tf - confirm
