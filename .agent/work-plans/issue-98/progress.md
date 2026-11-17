@@ -62,3 +62,36 @@ Code read: `bag_analysis/cli/bag_to_xtf.py` (`_convert`, `main`, `_report`), `xt
 - [ ] Is deleting stale generated parts from an earlier run on success acceptable (alternative: refuse to run)?
 - [ ] Option names (--max-part-size-mb, --max-part-duration-min, --gap-split-s, --no-split) and MB = 10^6 bytes.
 - [ ] Confirm the 60 s gap default against real bags during implementation.
+
+## Plan Review
+**Status**: complete
+**When**: 2026-11-17 09:07 -05:00
+**By**: Claude Sonnet
+
+**Plan**: `.agent/work-plans/issue-98/plan.md` at `7bc6f49`
+**PR**: PR-less
+**Verdict**: changes-requested
+
+Read cold as a dispatched sub-agent (handoff header present); independent of the plan author.
+
+### Findings
+- [ ] (must-fix) Stale-part deletion on success removes files this run did not write, matched by name only. A quick `--max-pings` or `--start-time` test run to the same `--output` would delete a full multi-GB export (step 9 itself does this kind of run), and a single-part run deletes earlier parts too. Replace with: list stale parts and plain-name file in a loud end-of-run warning, exit 0, delete nothing; offer an explicit opt-in flag (e.g. `--remove-stale-parts`) if wanted. If deletion stays, use `re.escape(stem)` and `fullmatch`, and test a stem with regex metacharacters. Update the Open Question and the stale-part test accordingly — `plan.md:24`, `plan.md:45`, `plan.md:87`
+- [ ] (suggestion) Generator refactor pitfall: the original clears `pending` after `emit`, then checks `--max-pings`. If the generator yields before clearing `pending`, an early `close()` counts the just-yielded pair as `unpaired` and the report counts differ from today. Clear `pending` before the yield, and keep the `paired`/`no_altitude` counting on one side only. Capture the "byte-identical" golden output from current main before refactoring (commit the characterization test first) — `plan.md:15`
+- [ ] (suggestion) Report omits the per-part time span the issue asks for ("file, ping count, time span, size"); add first/last ping UTC — `plan.md:30`
+- [ ] (suggestion) Option names differ from the issue's `--split-size` / `--split-duration`; the plan flags them as its choice. Either use the issue names or register them as aliases, and say so in the PR — `plan.md:26`
+- [ ] (suggestion) Acceptance says each part opens in pyxtf on its own; neither the tests nor step 9 check it. Add a `pytest.importorskip('pyxtf')` read of every part in the split tests (the writer test already does this for one file) and a pyxtf read in step 9 — `plan.md:36`, `plan.md:32`
+- [ ] (suggestion) Naming: opening every part's `.partial` lazily under its own first-ping time name, and renaming to the plain name only at the end of a one-part run, removes the special case where part 1 streams to `<output>.partial` and is renamed at rollover. Either way, leftover `.partial` files from a killed run no longer get overwritten by the next run (names now vary) — mention them in the stale warning — `plan.md:22`
+- [ ] (suggestion) Tests for carry-over are vacuous on a stationary or evenly zero-speed synthetic track. Specify moving positions and ping spacing under `_MAX_SECONDS_PER_PING` (e.g. 0.1–0.5 s), with a split falling mid-run, and confirm the test fails if `prev_emitted` is reset at a boundary — `plan.md:38`
+- [ ] (suggestion) Option interplay and validation are unspecified: `--no-split` together with an explicit limit, negative values, a size limit smaller than header plus one ping (every ping its own part). Also warn when the size limit exceeds 2^31 bytes, since the issue's motivation is the 32-bit offset — `plan.md:25-29`
+- [ ] (suggestion) Compute `ping_size` from `np.asarray(samples).size * 2` rather than building the byte arrays twice per ping; keep the shared constant arithmetic so it cannot drift from `write_ping` — `plan.md:16`
+- [ ] (suggestion) Compare gap/duration in integer `t_ns` rather than the microsecond-truncated datetimes, and state that "previous ping" is the previous emitted ping across parts — `plan.md:17`
+- [ ] (suggestion) After a gap split, the first ping of the new part carries a speed averaged over the gap (distance over a 60+ s sonar-off interval), which is junk, though identical to today's unsplit file. Keeping it satisfies "same content"; note it in the README or decide deliberately — `plan.md:17`
+
+### Answers to the four review points
+1. Deleting unwritten files: not safe enough (see must-fix). Name-only provenance cannot tell this bag's stale parts from another export. Warn plus opt-in removal is better than both deleting and refusing to run.
+2. Part 1 rename: no failure window of consequence. Rollover happens with a next ping in hand and part 1 already closed, so the renamed file is complete. Surprises are only leftover `.partial` names (above) and a failed open of part 2 after part 1 was renamed (acceptable: part 1 is finished).
+3. Size guarantee: holds in both layouts. Total bytes are layout-independent (256 + 2x64 + 2 bytes per sample on both channels, 1024 header), the writer is the single place that writes, and the only exception (a lone oversized ping) is specified. Needs the writer-length test already planned, plus the option validation above.
+4. Global state: testable, and the byte comparison is the right test (file header carries no count or time, so part[1024:] concatenated equals single[1024:]). It is only meaningful with the moving-track data described above.
+
+### Dimension verdicts
+Scope Good (one PR, 5 files). Issue alignment Needs work (time span, option names, pyxtf). File targeting Good (`contacts_to_geojson` imports `_lookup_pose`/`_stamp_ns`, untouched). Consequences Good. Docs impact Good. Principle alignment Needs work (stale deletion, error handling). ADR none triggered. ROS conventions N/A.
