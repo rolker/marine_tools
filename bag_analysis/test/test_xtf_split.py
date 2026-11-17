@@ -551,13 +551,16 @@ def test_file_appearing_as_final_name_mid_run_is_not_replaced(
         base_args(tmp_path / 'bag', folder / 'out.xtf', *_SMALL))
     assert rc == 1
     assert foreign.read_bytes() == b'foreign'
-    assert not list(folder.glob('*.partial'))
     captured = capsys.readouterr()
     assert 'was NOT replaced' in captured.err
-    # The discarded part says how many pings it held.
-    assert re.search(r'discarded unfinished part .*: \d+ pings', captured.out)
-    assert int(re.search(
-        r': (\d+) pings were in it', captured.out).group(1)) > 0
+    # The finished part is complete data: kept under its .partial name,
+    # named in the report, not deleted.
+    kept = list(folder.glob('*.partial'))
+    assert len(kept) == 1
+    assert kept[0].name == name + '.partial'
+    assert kept[0].stat().st_size > _HEADER
+    assert 'left under their .partial name' in captured.out
+    assert kept[0].name in captured.out
 
 
 def test_plain_name_appearing_before_the_final_rename_is_not_replaced(
@@ -697,3 +700,212 @@ def test_parts_are_synced_before_they_are_renamed(
     rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
     assert rc == 0
     assert len(synced) >= len(_parts(tmp_path))
+
+
+# --- --overwrite never writes through a link -------------------------------
+
+def test_overwrite_unlinks_a_symlinked_partial_not_its_target(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    target = tmp_path / 'precious.bin'
+    target.write_bytes(b'precious')
+    link = tmp_path / (name + '.partial')
+    link.symlink_to(target)
+    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL, '--overwrite')
+    assert rc == 0
+    assert target.read_bytes() == b'precious'
+    assert not link.is_symlink() and not link.exists()
+    assert link.name in capsys.readouterr().out      # listed as replaced
+
+
+def test_overwrite_unlinks_a_hard_linked_partial_not_the_other_link(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    other = tmp_path / 'other_name.bin'
+    other.write_bytes(b'precious')
+    linked = tmp_path / (name + '.partial')
+    os.link(other, linked)
+    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL, '--overwrite')
+    assert rc == 0
+    assert other.read_bytes() == b'precious'
+    assert other.stat().st_nlink == 1
+    assert linked.name in capsys.readouterr().out
+
+
+def test_overwrite_final_move_replaces_a_symlink_not_its_target(
+        tmp_path, monkeypatch):
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    target = tmp_path / 'precious.bin'
+    target.write_bytes(b'precious')
+    link = tmp_path / name
+    link.symlink_to(target)
+    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL, '--overwrite')
+    assert rc == 0
+    assert target.read_bytes() == b'precious'
+    assert not link.is_symlink()
+    assert link.stat().st_size > _HEADER
+
+
+# --- no-replace move and its fallbacks --------------------------------------
+
+def _sink(tmp_path):
+    return bag_to_xtf._PartSink(tmp_path / 'out.xtf', 'x', 'standard')
+
+
+def _no_links(monkeypatch):
+    def link(*a, **k):
+        raise PermissionError(1, 'links not supported')
+    monkeypatch.setattr(os, 'link', link)
+
+
+def test_place_by_hard_link_refuses_an_existing_name(tmp_path):
+    src, dst = tmp_path / 's', tmp_path / 'd'
+    src.write_bytes(b'new')
+    dst.write_bytes(b'foreign')
+    with pytest.raises(FileExistsError):
+        _sink(tmp_path)._place(src, dst)
+    assert dst.read_bytes() == b'foreign' and src.exists()
+
+
+def test_place_without_links_uses_atomic_noreplace_rename(
+        tmp_path, monkeypatch):
+    _no_links(monkeypatch)
+    src, dst = tmp_path / 's', tmp_path / 'd'
+    src.write_bytes(b'new')
+    calls = []
+
+    def renameat2(fd1, a, fd2, b, flags):
+        calls.append(flags)
+        os.rename(a, b)
+        return 0
+    monkeypatch.setattr(bag_to_xtf, '_get_renameat2', lambda: renameat2)
+
+    def no_check(*a, **k):
+        raise AssertionError('check-then-rename must not be used')
+    monkeypatch.setattr(bag_to_xtf.os, 'replace', no_check)
+    _sink(tmp_path)._place(src, dst)
+    assert calls == [1]
+    assert dst.read_bytes() == b'new' and not src.exists()
+
+
+def test_place_without_links_noreplace_reports_existing_name(
+        tmp_path, monkeypatch):
+    # Real renameat2 where the kernel has it; otherwise the check does it.
+    _no_links(monkeypatch)
+    src, dst = tmp_path / 's', tmp_path / 'd'
+    src.write_bytes(b'new')
+    dst.write_bytes(b'foreign')
+    with pytest.raises(FileExistsError):
+        _sink(tmp_path)._place(src, dst)
+    assert dst.read_bytes() == b'foreign' and src.exists()
+
+
+def test_place_noreplace_rejected_by_the_filesystem_falls_back(
+        tmp_path, monkeypatch):
+    import ctypes
+    _no_links(monkeypatch)
+    src, dst = tmp_path / 's', tmp_path / 'd'
+    src.write_bytes(b'new')
+
+    def renameat2(*a):
+        ctypes.set_errno(22)    # EINVAL: filesystem lacks the flag
+        return -1
+    monkeypatch.setattr(bag_to_xtf, '_get_renameat2', lambda: renameat2)
+    _sink(tmp_path)._place(src, dst)
+    assert dst.read_bytes() == b'new' and not src.exists()
+
+
+def test_place_with_no_renameat2_checks_then_renames(tmp_path, monkeypatch):
+    _no_links(monkeypatch)
+    monkeypatch.setattr(bag_to_xtf, '_get_renameat2', lambda: None)
+    src, dst = tmp_path / 's', tmp_path / 'd'
+    src.write_bytes(b'new')
+    _sink(tmp_path)._place(src, dst)
+    assert dst.read_bytes() == b'new' and not src.exists()
+    src.write_bytes(b'newer')
+    with pytest.raises(FileExistsError):
+        _sink(tmp_path)._place(src, dst)
+    assert dst.read_bytes() == b'new'
+
+
+def test_place_noreplace_real_failure_is_not_swallowed(
+        tmp_path, monkeypatch):
+    import ctypes
+    _no_links(monkeypatch)
+    src, dst = tmp_path / 's', tmp_path / 'd'
+    src.write_bytes(b'new')
+
+    def renameat2(*a):
+        ctypes.set_errno(5)     # EIO
+        return -1
+    monkeypatch.setattr(bag_to_xtf, '_get_renameat2', lambda: renameat2)
+    with pytest.raises(OSError) as info:
+        _sink(tmp_path)._place(src, dst)
+    assert info.value.errno == 5 and src.exists()
+
+
+def test_full_run_on_a_filesystem_without_links(tmp_path, monkeypatch):
+    _no_links(monkeypatch)
+    rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
+    assert rc == 0
+    assert len(_parts(tmp_path)) > 1
+    assert not list(tmp_path.glob('*.partial'))
+
+
+# --- file fsync tolerance ---------------------------------------------------
+
+@pytest.mark.parametrize('code', [22, 38, 95])   # EINVAL, ENOSYS, ENOTSUP
+def test_unsupported_file_fsync_is_tolerated(tmp_path, monkeypatch, code):
+    real = os.fsync
+    refused = []
+
+    def fsync(fd):
+        if os.path.isfile(f'/proc/self/fd/{fd}'):
+            refused.append(fd)
+            raise OSError(code, 'not supported')
+        return real(fd)    # directories
+    monkeypatch.setattr(os, 'fsync', fsync)
+    rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
+    assert rc == 0
+    assert refused
+    assert _parts(tmp_path)
+
+
+def test_eio_on_file_fsync_stays_fatal(tmp_path, monkeypatch, capsys):
+    def fsync(fd):
+        raise OSError(5, 'Input/output error')
+    monkeypatch.setattr(os, 'fsync', fsync)
+    rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
+    assert rc == 1
+    assert 'Input/output error' in capsys.readouterr().err
+    assert not _parts(tmp_path)
+
+
+# --- success path reporting is guarded -------------------------------------
+
+def test_old_file_check_failure_after_success_is_not_a_traceback(
+        tmp_path, monkeypatch, capsys):
+    def warn(*a, **k):
+        raise OSError('listing failed')
+    monkeypatch.setattr(bag_to_xtf, '_warn_old_files', warn)
+    rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
+    assert rc == 0
+    assert _parts(tmp_path)
+    err = capsys.readouterr().err
+    assert 'listing failed' in err
+    assert 'check for files of earlier runs could not be done' in err
+
+
+def test_summary_failure_after_success_still_names_the_parts(
+        tmp_path, monkeypatch, capsys):
+    def report(*a, **k):
+        raise OSError('stdout gone')
+    monkeypatch.setattr(bag_to_xtf, '_report', report)
+    rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert 'stdout gone' in captured.err
+    assert _parts(tmp_path)[0].name in captured.out

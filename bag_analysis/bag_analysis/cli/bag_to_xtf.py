@@ -36,9 +36,13 @@ The run refuses to start (exit 2, nothing written) if the output folder
 already holds the plain ``--output`` file or any file of this output's
 part-name pattern (parts and ``.partial`` leftovers), unless
 ``--overwrite`` is given. With ``--overwrite`` the run replaces the files
-whose names it produces and lists them; files of the pattern that it did
-not regenerate are never deleted, only warned about. Without
-``--overwrite`` a file that appears mid-run is never replaced either.
+whose names it produces and lists them (an old ``.partial`` is unlinked,
+never written through); files of the pattern that it did not regenerate
+are never deleted, only warned about. Without ``--overwrite`` a file that
+appears mid-run is not replaced: parts move into place by hard link, else
+by an atomic no-replace rename (Linux), and only where neither exists by a
+check followed by a rename. A finished part that cannot take its name is
+kept under its ``.partial`` name and reported.
 A run that writes zero pings (wrong topics, no nav, all-malformed) exits
 non-zero.
 """
@@ -46,6 +50,8 @@ non-zero.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import datetime as _dt
 import errno
 import math
@@ -559,6 +565,65 @@ def _settled(src: Path, dst: Path) -> bool:
     return False
 
 
+# fsync results that mean "this filesystem cannot do it" (some FUSE and
+# SMB mounts), as opposed to EIO and friends, which mean data may be lost.
+_FSYNC_UNSUPPORTED = frozenset(
+    {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP})
+# Errors of a no-replace rename that mean "not available here": try the
+# next way. Anything else (EEXIST aside) is a real failure.
+_NOREPLACE_UNSUPPORTED = frozenset(
+    {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP,
+     errno.EPERM, errno.EXDEV, errno.ENOTTY})
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def _fsync_file(stream) -> None:
+    """Sync a file; tolerate filesystems that cannot, keep EIO fatal."""
+    try:
+        os.fsync(stream.fileno())
+    except OSError as exc:
+        if exc.errno not in _FSYNC_UNSUPPORTED:
+            raise
+
+
+def _get_renameat2():
+    """Return libc ``renameat2`` (Linux), or None if it is not there."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c') or None,
+                           use_errno=True)
+        func = libc.renameat2
+    except (OSError, AttributeError):
+        return None
+    func.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                     ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    func.restype = ctypes.c_int
+    return func
+
+
+def _rename_noreplace(src: Path, dst: Path) -> bool:
+    """
+    Rename ``src`` to ``dst`` atomically, failing if ``dst`` exists.
+
+    Returns True when done. Raises ``FileExistsError`` if ``dst`` exists.
+    Returns False if the kernel, libc or filesystem cannot do an atomic
+    no-replace rename, so the caller must try something else.
+    """
+    func = _get_renameat2()
+    if func is None:
+        return False
+    result = func(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst),
+                  _RENAME_NOREPLACE)
+    if result == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(errno.EEXIST, 'File exists', str(dst))
+    if err in _NOREPLACE_UNSUPPORTED:
+        return False
+    raise OSError(err, os.strerror(err), str(dst))
+
+
 class _PartSink:
     """
     Write pings into a series of part files.
@@ -570,11 +635,18 @@ class _PartSink:
     removes the unfinished ``.partial`` and leaves the finished parts
     alone.
 
-    Without ``overwrite`` no file this run did not create is ever
-    replaced: ``.partial`` files are opened exclusively and a part is
-    moved into place with a hard link, which fails if the name exists.
-    With ``overwrite`` same-named files are replaced and listed in
-    ``replaced``.
+    Without ``overwrite`` ``.partial`` files are opened exclusively and a
+    part is moved into place without replacing: by hard link (atomic),
+    else by an atomic no-replace rename (Linux ``renameat2``), else, only
+    if neither exists on this filesystem, by a check followed by a
+    rename, which leaves a window of microseconds. With ``overwrite`` an
+    existing ``.partial`` is unlinked (never opened, so a symlink or hard
+    link is never written through) and recorded in ``replaced``; a final
+    move replaces by rename, which swaps the name and never writes
+    through it.
+
+    A finished part whose final name was taken meanwhile stays under its
+    ``.partial`` name and is listed in ``kept``.
     """
 
     def __init__(
@@ -587,6 +659,7 @@ class _PartSink:
         self._overwrite = overwrite
         self.parts: list[_PartInfo] = []
         self.replaced: list[Path] = []
+        self.kept: list[tuple[Path, _PartInfo]] = []
         self.discarded: tuple[Path, int] | None = None
         self.cleanup_errors: list[str] = []
         self._names: set[str] = set()
@@ -624,13 +697,13 @@ class _PartSink:
         """Open the next part, named after its first ping at ``when``."""
         final = self._final_path(when)
         partial = final.with_name(final.name + '.partial')
-        if self._overwrite:
-            existed = os.path.lexists(partial)
-            stream = open(partial, 'wb')
-            if existed:
-                self.replaced.append(partial)
-        else:
-            stream = open(partial, 'xb')    # never truncate a foreign file
+        if self._overwrite and os.path.lexists(partial):
+            # Never open an existing name for writing: that would follow
+            # a symlink or truncate a hard-linked inode. Remove the name
+            # (the link, not its target), then create it afresh.
+            partial.unlink()
+            self.replaced.append(partial)
+        stream = open(partial, 'xb')        # never truncate a foreign file
         # Only now is the .partial ours; abort() must not touch it before.
         self._final, self._partial, self._stream = final, partial, stream
         self._pings = 0
@@ -650,7 +723,7 @@ class _PartSink:
         """Move ``src`` to ``dst``; replace an existing ``dst`` only if allowed."""
         if self._overwrite:
             existed = os.path.lexists(dst)
-            os.replace(src, dst)
+            os.replace(src, dst)    # swaps the name; never writes through it
             if existed:
                 self.replaced.append(dst)
             return
@@ -659,7 +732,11 @@ class _PartSink:
         except FileExistsError:
             raise
         except OSError:
-            # No hard links here: check, then rename (a small race remains).
+            # No hard links here. Next best: an atomic no-replace rename.
+            if _rename_noreplace(src, dst):
+                return
+            # Last resort: check, then rename. A file created in between
+            # is replaced (a window of microseconds).
             if os.path.lexists(dst):
                 raise FileExistsError(
                     errno.EEXIST, 'File exists', str(dst)) from None
@@ -673,7 +750,7 @@ class _PartSink:
         self.writer = self._stream = None
         try:
             stream.flush()
-            os.fsync(stream.fileno())
+            _fsync_file(stream)
         finally:
             stream.close()
         partial, final = self._partial, self._final
@@ -683,7 +760,7 @@ class _PartSink:
         try:
             self.parts.append(info)
             self._place(partial, final)
-        except BaseException:
+        except BaseException as exc:
             # An interrupt can land on either side of the move: let the
             # disk decide whether this part is finished.
             done = _settled(partial, final)
@@ -692,6 +769,11 @@ class _PartSink:
             elif not done and info in self.parts:
                 self.parts.remove(info)
             if done:
+                self._partial = None
+            elif isinstance(exc, FileExistsError):
+                # The part is complete and synced; only its name was
+                # taken. Keep the data under its .partial name.
+                self.kept.append((partial, info))
                 self._partial = None
             raise
         self._partial = None
@@ -901,8 +983,9 @@ def main(argv: list[str] | None = None) -> int:
         for note in sink.cleanup_errors:
             print(f'warning: {note}', file=sys.stderr)
         _best_effort(_report_parts, sink.parts, header='finished parts kept')
+        _best_effort(_report_kept, sink)
         _best_effort(_report_replaced, sink)
-        _best_effort(_warn_old_files, args.output, sink.parts)
+        _check_old_files(args.output, sink)
         if isinstance(exc, OSError):
             return 1
         raise
@@ -910,13 +993,33 @@ def main(argv: list[str] | None = None) -> int:
     if ping_count == 0:
         print('error: no pings written (check topics, nav/TF, sample_rate)',
               file=sys.stderr)
-        _report(sink, ping_count, counts, args)
-        _warn_old_files(args.output, sink.parts)
+        _summarize(sink, ping_count, counts, args)
+        _check_old_files(args.output, sink)
         return 1
 
-    _report(sink, ping_count, counts, args)
-    _warn_old_files(args.output, sink.parts)
+    _summarize(sink, ping_count, counts, args)
+    _check_old_files(args.output, sink)
     return 0
+
+
+def _summarize(sink, ping_count, counts, args) -> None:
+    """Print the summary; if that fails, still say the parts are written."""
+    try:
+        _report(sink, ping_count, counts, args)
+    except Exception as exc:    # noqa: BLE001 - the data is already safe
+        print(f'warning: the summary could not be printed ({exc!r}); the '
+              f'{len(sink.parts)} part(s) were written:', file=sys.stderr)
+        _best_effort(_report_parts, sink.parts)
+
+
+def _check_old_files(output: Path, sink) -> None:
+    """Warn about old files; a listing error is reported, never raised."""
+    try:
+        _warn_old_files(output, sink.parts, [p for p, _ in sink.kept])
+    except Exception as exc:    # noqa: BLE001 - must not undo a finished run
+        print(f'warning: the check for files of earlier runs could not be '
+              f'done ({exc!r}); the output folder may hold old files that '
+              'mix with the parts just written', file=sys.stderr)
 
 
 def _mb(size: int) -> str:
@@ -954,9 +1057,9 @@ def _old_files(output: Path, written) -> list[Path]:
     return found
 
 
-def _warn_old_files(output: Path, parts) -> None:
+def _warn_old_files(output: Path, parts, kept=()) -> None:
     """Warn about earlier runs' files next to the output; delete nothing."""
-    old = _old_files(output, [p.path for p in parts])
+    old = _old_files(output, [p.path for p in parts] + list(kept))
     if not old:
         return
     print(f'WARNING: {output.parent} now mixes files from two runs. These '
@@ -966,6 +1069,20 @@ def _warn_old_files(output: Path, parts) -> None:
     print(_list_names(old), file=sys.stderr)
     print('  Remove them yourself if they are out of date, so they are not '
           'mixed up with the parts just written.', file=sys.stderr)
+
+
+def _report_kept(sink) -> None:
+    """List complete parts left under their .partial name."""
+    if not sink.kept:
+        return
+    print(f'{len(sink.kept)} finished part(s) could not take their final '
+          'name (another file appeared there during the run, and was not '
+          'replaced). They are complete data and were left under their '
+          '.partial name; rename them yourself:')
+    for path, info in sink.kept:
+        print(f'  {path.name}  pings={info.pings}  '
+              f'{_utc_iso(info.first)} to {_utc_iso(info.last)}  '
+              f'{_mb(info.size)}')
 
 
 def _report_replaced(sink) -> None:
