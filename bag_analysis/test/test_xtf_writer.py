@@ -279,3 +279,32 @@ def test_ping_size_and_bytes_written_match_the_file(layout):
             sound_velocity_mps=1500.0, port=port, starboard=stbd)
         assert writer.bytes_written - before == expected
         assert writer.bytes_written == len(stream.getvalue())
+
+
+def _one_ping(computer_time):
+    stream = io.BytesIO()
+    writer = XtfWriter(stream)
+    t = _dt.datetime(2026, 6, 15, 15, 3, 45, 120000, tzinfo=_dt.timezone.utc)
+    writer.write_ping(
+        time=t, ping_number=0, latitude_deg=0.0, longitude_deg=0.0,
+        sensor_depth_m=0.0, altitude_m=0.0, heading_deg=0.0, pitch_deg=0.0,
+        roll_deg=0.0, speed_mps=0.0, sound_velocity_mps=1500.0,
+        port=_chan([1, 2]), starboard=_chan([3, 4]),
+        computer_time=computer_time)
+    return stream.getvalue()[_FILE_HEADER_LEN:]
+
+
+def test_computer_clock_fields_hold_the_receive_time():
+    """ComputerClockHour..Hsec sit at 236..239 of the ping header (rev 42)."""
+    received = _dt.datetime(
+        2026, 6, 15, 15, 3, 45, 170000, tzinfo=_dt.timezone.utc)
+    ping = _one_ping(received)
+    assert struct.unpack_from('<4B', ping, 236) == (15, 3, 45, 17)
+    # The ping time proper (Hour 18, Minute 19, Second 20, HSeconds 21)
+    # is untouched.
+    assert struct.unpack_from('<4B', ping, 18) == (15, 3, 45, 12)
+
+
+def test_computer_clock_fields_stay_zero_without_a_receive_time():
+    ping = _one_ping(None)
+    assert struct.unpack_from('<4B', ping, 236) == (0, 0, 0, 0)

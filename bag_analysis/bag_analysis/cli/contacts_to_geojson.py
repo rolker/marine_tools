@@ -16,9 +16,18 @@ same map (QGIS, web, CAMP):
   (``earth`` → ``--track-frame``) — the same offline-TF approach
   ``bag_to_xtf`` uses. Operators often write a log entry right when they mark a
   waterfall contact, so placing both on the track makes them directly
-  comparable. An entry that can't be georeferenced (outside the bag's TF span,
-  or no transform) is still emitted, with ``"geometry": null`` and a
-  ``geo_status`` property, so nothing is silently dropped.
+  comparable. The position is the pose at the entry's time, from tf2 with
+  transforms on both sides of it; there is no fallback to the latest
+  transform. An entry that can't be georeferenced is still emitted, with
+  ``"geometry": null`` and a ``geo_status`` property, so nothing is silently
+  dropped. ``geo_status`` is ``exact`` (located), ``no_tf`` (before the first
+  transform, or the frame is not in the tree), ``tf_gap`` (the transforms
+  around the time are further apart than ``--max-tf-gap``), ``tf_late``
+  (after the last transform), ``tf_evicted`` (older than the transforms the
+  ``--tf-cache`` length still held at the end of the bag; raise it) or
+  ``tf_mismatch`` (tf2 refused a lookup the tool had expected to work). Log
+  entries carry minute precision at best; that uncertainty is the entry's own
+  and is not changed by any of this.
 
 GeoJSON has no native time type, so timestamps live in ``properties`` as
 ISO-8601 (``time``) plus epoch seconds (``t_epoch``). Coordinates are
@@ -39,22 +48,21 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 from pathlib import Path
 import re
 import sys
 
-from rclpy.duration import Duration
-import rclpy.time
-from tf2_ros import Buffer
 
-from .bag_to_xtf import _lookup_pose, _stamp_ns
 from ..reader import iter_messages
+from ..tf_lookup import (
+    MAX_CACHE_S, NO_TF, READY, stamp_ns as _stamp_ns, TF_EVICTED, TF_GAP,
+    TF_LATE, TfChain, TfChainError, TfMismatch)
 from ..xtf.geo import ecef_pose_to_geo
 
 _DEFAULT_CONTACTS = '/operator/sonar_waterfall/contacts'
 _DEFAULT_TRACK_FRAME = 'bizzy/base_link'
 _DEFAULT_EARTH_FRAME = 'earth'
-_NS_PER_S = 1_000_000_000
 
 # A deployment-log entry written by dlog.sh:  **2026-06-29 10:30 -04:00** — text
 # Seconds are optional (dlog writes minute precision); the offset may carry a
@@ -69,6 +77,7 @@ _LOG_ENTRY_RE = re.compile(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         description='Export operator sonar contacts (+ georeferenced log '
                     'entries) from a rosbag2 to GeoJSON.')
     p.add_argument('--bag', required=True, type=Path,
@@ -83,13 +92,44 @@ def _build_parser() -> argparse.ArgumentParser:
                         'log entries (default: %(default)s)')
     p.add_argument('--earth-frame', default=_DEFAULT_EARTH_FRAME,
                    help='ECEF root frame (default: %(default)s)')
-    p.add_argument('--max-tf-age', type=float, default=5.0,
-                   help='Max age (s) of a fallback "latest" TF for a log '
-                        'entry before it is marked stale (default: %(default)s)')
+    p.add_argument('--max-tf-gap', type=float, default=1.0,
+                   help='Largest allowed interval (s) between the two '
+                        'transform samples around a log entry, on every '
+                        'dynamic link; an entry in a longer gap is marked '
+                        'tf_gap. Same bar as bag_to_xtf: a bracket of ten '
+                        'periods of a 10 Hz chain; raise it for a slower '
+                        'chain (default: %(default)s)')
+    p.add_argument('--max-tf-age', default=None, help=argparse.SUPPRESS)
     p.add_argument('--tf-cache', type=float, default=6.0 * 3600.0,
                    help='TF buffer cache length (s); must span the bag so log '
                         'entries anywhere in it resolve (default: %(default)s)')
     return p
+
+
+def _parse_args(argv):
+    """Parse ``argv`` and reject the options that no longer exist."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.max_tf_age is not None:
+        parser.error(
+            '--max-tf-age is gone: it bounded the age of a fallback to the '
+            'latest transform, which no longer exists. Use --max-tf-gap '
+            '(the largest allowed interval between the two transform '
+            'samples around a log entry) instead; its meaning is '
+            'different, so do not carry the old value over')
+    for flag, value in (('--max-tf-gap', args.max_tf_gap),
+                        ('--tf-cache', args.tf_cache)):
+        if not math.isfinite(value) or value <= 0.0:
+            parser.error(f'{flag} must be a finite number above 0')
+    if round(args.max_tf_gap * 1e9) < 1:
+        parser.error(
+            f'--max-tf-gap {args.max_tf_gap:g} rounds to 0 ns; it must be at '
+            'least 1 ns')
+    if args.tf_cache > MAX_CACHE_S:
+        parser.error(
+            f'--tf-cache {args.tf_cache:g} is absurdly large (maximum '
+            f'{MAX_CACHE_S:g} s)')
+    return args
 
 
 def _parse_log_ts(ts: str) -> _dt.datetime | None:
@@ -159,12 +199,20 @@ def _read_log_entries(path: Path) -> list[tuple[int, str]]:
     return entries
 
 
-def _log_feature(t_ns: int, text: str, buffer: Buffer, args,
-                 max_tf_age_ns: int) -> dict:
+def _locate(chain: TfChain, args, t_ns: int):
+    """Return ``(pose or None, geo_status)`` of the track frame at ``t_ns``."""
+    verdict = chain.settle(chain.check(args.track_frame, t_ns))
+    if verdict == READY:
+        try:
+            return chain.lookup(args.track_frame, t_ns), 'exact'
+        except TfMismatch:
+            return None, 'tf_mismatch'
+    return None, verdict
+
+
+def _log_feature(t_ns: int, text: str, chain: TfChain, args) -> dict:
     """Georeference one log entry against earth->track_frame at its time."""
-    stamp = rclpy.time.Time(nanoseconds=t_ns).to_msg()
-    pose, status = _lookup_pose(
-        buffer, args.track_frame, args.earth_frame, stamp, max_tf_age_ns)
+    pose, status = _locate(chain, args, t_ns)
     geometry = None
     if pose is not None:
         lat, lon, _alt, _hdg, _pitch, _roll = ecef_pose_to_geo(pose[0], pose[1])
@@ -175,7 +223,7 @@ def _log_feature(t_ns: int, text: str, buffer: Buffer, args,
         'properties': {
             'feature_type': 'log_entry',
             'text': text,
-            'geo_status': status,   # exact | approx | stale | missing
+            'geo_status': status,
             'time': _iso(t_ns / 1e9),
             't_epoch': t_ns / 1e9,
         },
@@ -183,36 +231,47 @@ def _log_feature(t_ns: int, text: str, buffer: Buffer, args,
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    """Entry point for the ``contacts_to_geojson`` console script."""
+    args = _parse_args(argv)
     if not args.bag.exists():
         print(f'bag not found: {args.bag}', file=sys.stderr)
         return 2
 
     want_track = args.log is not None
-    buffer = Buffer(cache_time=Duration(seconds=args.tf_cache))
+    chain = TfChain(args.earth_frame, args.tf_cache, args.max_tf_gap)
     topics = [args.contacts_topic]
     if want_track:
         topics += ['/tf', '/tf_static']
 
     contacts: list[dict] = []
-    for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
-        if topic == '/tf':
-            for tr in msg.transforms:
-                buffer.set_transform(tr, 'contacts_to_geojson')
-        elif topic == '/tf_static':
-            for tr in msg.transforms:
-                buffer.set_transform_static(tr, 'contacts_to_geojson')
-        elif topic == args.contacts_topic:
-            contacts.append(_contact_feature(msg, t_ns))
+    try:
+        for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
+            if topic == '/tf':
+                chain.feed(msg.transforms, static=False,
+                           authority='contacts_to_geojson')
+            elif topic == '/tf_static':
+                chain.feed(msg.transforms, static=True,
+                           authority='contacts_to_geojson')
+            elif topic == args.contacts_topic:
+                contacts.append(_contact_feature(msg, t_ns))
+    except TfChainError as exc:
+        print(f'error: unsupported transform tree: {exc}', file=sys.stderr)
+        return 1
 
     features = list(contacts)
-    log_stats = {'exact': 0, 'approx': 0, 'stale': 0, 'missing': 0}
+    log_stats = {'exact': 0, NO_TF: 0, TF_GAP: 0, TF_LATE: 0, TF_EVICTED: 0,
+                 'tf_mismatch': 0}
     if want_track:
-        max_tf_age_ns = int(args.max_tf_age * _NS_PER_S)
-        for t_ns, text in _read_log_entries(args.log):
-            feat = _log_feature(t_ns, text, buffer, args, max_tf_age_ns)
-            log_stats[feat['properties']['geo_status']] += 1
-            features.append(feat)
+        # The whole bag is in the chain, so nothing is left to wait for.
+        try:
+            for t_ns, text in _read_log_entries(args.log):
+                feat = _log_feature(t_ns, text, chain, args)
+                log_stats[feat['properties']['geo_status']] += 1
+                features.append(feat)
+        except TfChainError as exc:
+            print(f'error: unsupported transform tree: {exc}',
+                  file=sys.stderr)
+            return 1
 
     features.sort(key=lambda f: f['properties']['t_epoch'])
     collection = {'type': 'FeatureCollection', 'features': features}
@@ -225,10 +284,21 @@ def main(argv: list[str] | None = None) -> int:
     n_log = sum(log_stats.values())
     print(f'wrote {len(contacts)} contacts'
           + (f' + {n_log} log entries '
-             f'({log_stats["exact"]} located, {log_stats["approx"]} approx, '
-             f'{log_stats["stale"]} stale, {log_stats["missing"]} unlocated)'
+             f'({log_stats["exact"]} located, {log_stats[NO_TF]} no_tf, '
+             f'{log_stats[TF_GAP]} tf_gap, {log_stats[TF_LATE]} tf_late, '
+             f'{log_stats[TF_EVICTED]} tf_evicted, '
+             f'{log_stats["tf_mismatch"]} tf_mismatch)'
              if want_track else '')
           + f' -> {args.output}')
+    if log_stats[TF_EVICTED]:
+        print(f'warning: {log_stats[TF_EVICTED]} log entries are older than '
+              'the transforms the cache still held when the bag ended '
+              f'(--tf-cache {args.tf_cache:g} s); raise --tf-cache to '
+              'locate them', file=sys.stderr)
+    if want_track and chain.rejected:
+        reasons = ', '.join(
+            f'{k}={v}' for k, v in sorted(chain.rejected.items()))
+        print(f'note: transforms rejected or re-fed: {reasons}')
     return 0
 
 
