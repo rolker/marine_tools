@@ -14,7 +14,8 @@ import struct
 
 from bag_analysis.cli import bag_to_xtf
 import pytest
-from xtf_fakes import base_args, fake_messages
+from xtf_fakes import (
+    base_args, fake_messages, Track, track_messages)
 
 _HEADER = 1024
 _PING_RECORD = 1024 + 256 + 128  # file header + ping with empty channels
@@ -73,6 +74,24 @@ def test_size_split_equals_unsplit_pings(tmp_path, monkeypatch, layout):
     assert _ping_bytes(parts) == single.read_bytes()[_HEADER:]
     numbers = [n for p in parts for n in _ping_numbers(p)]
     assert numbers == list(range(30))
+
+
+@pytest.mark.parametrize('offset', ['0', '0.05', '-0.05'])
+def test_split_with_transforms_after_the_pings_equals_unsplit(
+        tmp_path, monkeypatch, offset):
+    # Pings wait for /tf past them, so parts are cut from the queue's
+    # output: the joined parts must still be the unsplit bytes.
+    messages, _ = track_messages(Track(70), 60)
+    single = _unsplit(tmp_path, monkeypatch, messages,
+                      '--stamp-to-transmit-offset', offset)
+    rc, _ = _run(tmp_path, monkeypatch, messages, '--split-size', '0.02',
+                 '--stamp-to-transmit-offset', offset)
+    assert rc == 0
+    parts = _parts(tmp_path)
+    assert len(parts) >= 2
+    assert _ping_bytes(parts) == single.read_bytes()[_HEADER:]
+    numbers = [n for p in parts for n in _ping_numbers(p)]
+    assert numbers == list(range(60))
 
 
 def test_carry_over_is_global(tmp_path, monkeypatch):

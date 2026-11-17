@@ -162,19 +162,28 @@ class Track:
             q = _quat_from_matrix(_R_ECEF_TO_ENU.T @ enu_from_ned @ rz)
             self.quats.append(-q if k in flip else q)
 
-    def pose_at(self, stamp_ns):
-        """Return (position, quaternion) interpolated between samples."""
-        k = (stamp_ns - self.stamps[0]) // self.dt_ns
-        f = ((stamp_ns - self.stamps[0]) - k * self.dt_ns) / self.dt_ns
-        k = int(k)
-        if f == 0.0:
-            return self.positions[k], self.quats[k]
-        pos = (1 - f) * self.positions[k] + f * self.positions[k + 1]
-        return pos, slerp(self.quats[k], self.quats[k + 1], f)
+    def pose_at(self, stamp_ns, skip=()):
+        """
+        Return (position, quaternion) interpolated between samples.
 
-    def geo_at(self, stamp_ns):
+        Samples whose index is in ``skip`` are treated as absent, so the
+        bracket is the nearest samples that remain.
+        """
+        k = int((stamp_ns - self.stamps[0]) // self.dt_ns)
+        if self.stamps[k] == stamp_ns and k not in skip:
+            return self.positions[k], self.quats[k]
+        lo, hi = k, k + 1
+        while lo in skip:
+            lo -= 1
+        while hi in skip:
+            hi += 1
+        f = (stamp_ns - self.stamps[lo]) / (self.stamps[hi] - self.stamps[lo])
+        pos = (1 - f) * self.positions[lo] + f * self.positions[hi]
+        return pos, slerp(self.quats[lo], self.quats[hi], f)
+
+    def geo_at(self, stamp_ns, skip=()):
         """Return (lat, lon, alt, heading, pitch, roll) at ``stamp_ns``."""
-        pos, quat = self.pose_at(stamp_ns)
+        pos, quat = self.pose_at(stamp_ns, skip)
         return ecef_pose_to_geo(tuple(pos), tuple(quat))
 
     def tf_msg(self, k, child=FRAME, parent='earth'):
@@ -193,7 +202,8 @@ class Track:
 
 def track_messages(
         track, n_pings, *, ping_dt_s=0.1, fractions=(0.3, 0.7),
-        tf_delay_s=0.25, ping_lag_s=0.01, late_samples=(), first_ping=1):
+        tf_delay_s=0.25, ping_lag_s=0.01, late_samples=(), first_ping=1,
+        child=FRAME):
     """
     Return ``(messages, ping_stamps)`` for a track as the real bag records it.
 
@@ -209,14 +219,14 @@ def track_messages(
     entries = []
     for k in range(len(track.stamps)):
         rec = track.stamps[k] + int(tf_delay_s * _NS)
-        entries.append((rec, 0, k, '/tf', track.tf_msg(k)))
+        entries.append((rec, 0, k, '/tf', track.tf_msg(k, child=child)))
     for k in late_samples:
         rec_next = track.stamps[k + 1] + int(tf_delay_s * _NS)
         entries[k] = (rec_next + 1, 0, k, '/tf', entries[k][4])
     ping_stamps = []
     for n in range(n_pings):
         i = first_ping + n
-        stamp = track.stamps[i] + int(
+        stamp = track.stamps[0] + i * track.dt_ns + int(
             round(fractions[n % len(fractions)] * track.dt_ns))
         ping_stamps.append(stamp)
         rec = stamp + int(ping_lag_s * _NS)
@@ -243,6 +253,7 @@ def read_ping_headers(path):
         out.append({
             'time': (year, month, day, hour, minute, second, hsec),
             'ping_number': struct.unpack_from('<I', h, 28)[0],
+            'altitude': struct.unpack_from('<f', h, 196)[0],
             'heading': struct.unpack_from('<f', h, 124)[0],
             'lat': struct.unpack_from('<d', h, 128)[0],
             'lon': struct.unpack_from('<d', h, 136)[0],
