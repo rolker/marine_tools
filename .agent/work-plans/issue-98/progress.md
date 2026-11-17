@@ -181,11 +181,11 @@ See "Implementation Notes (deviations)" in the plan: golden test uses default li
 All seven closed as claimed (refuse unless `--overwrite`, exclusive `.partial`, no-replace move, zero-ping warning, option validation, best-effort cleanup, interrupt reconciliation plus fsync, directory/unwritable refusal, discarded ping count). Commit `1c2eca3` touched only `bag_to_xtf.py` and its tests; nothing unrelated.
 
 ### Findings
-- [ ] (must-fix) `--overwrite` opens an existing `.partial` with `'wb'`, which follows a symlink and truncates a hard-linked inode: the target file (outside the run's names) is emptied, while the report lists only the `.partial` path as "replaced". Probe: symlink `a_...Z.xtf.partial -> target`, target became empty. Unlink the old `.partial` (record it as replaced) and then open with `'xb'`; add symlink and hard-link tests — `bag_analysis/bag_analysis/cli/bag_to_xtf.py:627-631` (cross-model confirmed, codex)
-- [ ] (suggestion) hard-link fallback (`os.link` failing with EPERM/ENOTSUP, as on FAT and some SMB shares) is check-then-`os.replace`: a file appearing in between is replaced silently, yet the README and docstring say "nothing is ever replaced, even if a file appears". Either say so in the README for such filesystems or fall back to an exclusive create plus copy; no test covers the fallback at all — `bag_to_xtf.py:657-667`, `README.md` ("Without `--overwrite` nothing is ever replaced") (codex rated must-fix; kept as suggestion because the window is microseconds and the preflight already refused every pre-existing name)
-- [ ] (suggestion) `os.fsync(stream.fileno())` is unguarded: a filesystem that rejects file fsync (EINVAL/ENOSYS/ENOTSUP, some FUSE/SMB mounts) fails the run after a complete part was written, and `abort()` then deletes that part's `.partial`. Tolerate those errnos (keep EIO fatal), unlike `_fsync_dir` which already is best effort — `bag_to_xtf.py:676`
-- [ ] (suggestion) on the success path `_warn_old_files` (and `_report`) are not wrapped like they are on the failure path; an `iterdir` error on a dropped NAS mount after a complete conversion gives a traceback and a non-zero exit — `bag_to_xtf.py:914,918`
-- [ ] (suggestion) when the final-name move meets a file that appeared mid-run (`FileExistsError`), the finished part's `.partial` is then deleted by `abort()`: the new data is lost to protect the foreign file. Keep the `.partial` and name it in the report — `bag_to_xtf.py:685-696`
+- [x] (must-fix) `--overwrite` opens an existing `.partial` with `'wb'`, which follows a symlink and truncates a hard-linked inode: the target file (outside the run's names) is emptied, while the report lists only the `.partial` path as "replaced". Probe: symlink `a_...Z.xtf.partial -> target`, target became empty. Unlink the old `.partial` (record it as replaced) and then open with `'xb'`; add symlink and hard-link tests — `bag_analysis/bag_analysis/cli/bag_to_xtf.py:627-631` (cross-model confirmed, codex)
+- [x] (suggestion) hard-link fallback (`os.link` failing with EPERM/ENOTSUP, as on FAT and some SMB shares) is check-then-`os.replace`: a file appearing in between is replaced silently, yet the README and docstring say "nothing is ever replaced, even if a file appears". Either say so in the README for such filesystems or fall back to an exclusive create plus copy; no test covers the fallback at all — `bag_to_xtf.py:657-667`, `README.md` ("Without `--overwrite` nothing is ever replaced") (codex rated must-fix; kept as suggestion because the window is microseconds and the preflight already refused every pre-existing name)
+- [x] (suggestion) `os.fsync(stream.fileno())` is unguarded: a filesystem that rejects file fsync (EINVAL/ENOSYS/ENOTSUP, some FUSE/SMB mounts) fails the run after a complete part was written, and `abort()` then deletes that part's `.partial`. Tolerate those errnos (keep EIO fatal), unlike `_fsync_dir` which already is best effort — `bag_to_xtf.py:676`
+- [x] (suggestion) on the success path `_warn_old_files` (and `_report`) are not wrapped like they are on the failure path; an `iterdir` error on a dropped NAS mount after a complete conversion gives a traceback and a non-zero exit — `bag_to_xtf.py:914,918`
+- [x] (suggestion) when the final-name move meets a file that appeared mid-run (`FileExistsError`), the finished part's `.partial` is then deleted by `abort()`: the new data is lost to protect the foreign file. Keep the `.partial` and name it in the report — `bag_to_xtf.py:685-696`
 
 ### Answers to the seven points
 1. Without `--overwrite`: `.partial` is `xb` (not following symlinks), the move is link-then-unlink, so no replacement except the no-hard-link fallback race above (not reported silently, but unprotected). With `--overwrite`: the symlink/hard-link truncation above is the one unreported path. The probe file uses `TemporaryFile`, never a named file. One-part pass through the time name replaces an old file of that name, and it is reported and documented.
@@ -195,3 +195,24 @@ All seven closed as claimed (refuse unless `--overwrite`, exclusive `.partial`, 
 5. Caps (10 TB, 10^7 minutes, 10^9 s) reject nothing legitimate; `0` and `--no-split` cover "off".
 6. No, `1c2eca3` changed only this feature's code and tests.
 7. README matches the code for options, defaults, exit 2 on refusal, reporting and the up-front folder checks; the one inaccuracy is "nothing is ever replaced" (suggestion 1). Minor: the README does not list `--overwrite` in the options table and says nothing of `--max-pings` below 1 being rejected.
+
+## Implementation
+**Status**: complete
+**When**: 2026-11-17 11:20 -05:00
+**By**: Claude Sonnet
+
+**Branch**: feature/issue-98 at `3910f17` (local only, not pushed, no PR)
+**Addressed**: Local Review (Pre-Push) round 2, 2026-11-17 10:50 -05:00, at `29f24d5` (1 must-fix, 4 suggestions, 2 README notes)
+**Commits**: `7d69d6f` (code and tests), `3910f17` (README and plan)
+
+### Actions
+- [x] (must-fix) `--overwrite` and an existing `.partial`: unlink (recorded as replaced), then create with `'xb'`; symlink and hard-link tests assert the target / other link untouched; final move by rename also tested against a symlink — `bag_to_xtf.py` `start_part`
+- [x] no-hard-link fallback: `os.link`, else atomic `renameat2(RENAME_NOREPLACE)` via ctypes (falls back on EINVAL/ENOSYS/EPERM/..., or no libc symbol), else check-then-rename; each path forced in tests; README states the guarantee per path
+- [x] file fsync tolerates EINVAL/ENOSYS/ENOTSUP/EOPNOTSUPP, EIO stays fatal; both tested
+- [x] success path: summary and old-file check guarded; exit 0, says the parts are written and that the old-file check could not be done; both tested
+- [x] foreign file at a part's final name mid-run: finished `.partial` kept, named in the report, non-zero exit; existing test updated
+- [x] README: `--overwrite` in the options table, `--max-pings` below 1 rejected
+
+### Notes
+- Tests: 169 run in bag_analysis, 0 failures, 2 skipped (pyxtf not installed).
+- Not verified on a real SMB/FAT share; the real `renameat2` EEXIST path is exercised only where the test filesystem supports it, otherwise the check-then-rename path answers the same test.
