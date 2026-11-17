@@ -163,3 +163,35 @@ See "Implementation Notes (deviations)" in the plan: golden test uses default li
 - Plan and README updated; the superseded accepted deviation is rewritten in the plan.
 - Tests: 153 run in bag_analysis, 0 failures, 2 skipped (pyxtf not installed).
 
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-11-17 10:50 -05:00
+**By**: Claude Sonnet
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-98 at `29f24d5`
+**Mode**: pre-push (round 2, delta since `5f5d59f`)
+**Depth**: Standard (reason: survey-data writer, file-replacement logic; owner-requested)
+**Specialists**: manual static/adversarial read (Lens A + B), cross-model (gemini: no findings; codex: 2 must-fix), probe scripts. Tests 153 passed, 2 skipped.
+**Must-fix**: 1 | **Suggestions**: 4
+**Round**: 2 | **Ship**: continue — one cheap, real truncate-a-foreign-file path under `--overwrite` (confirmed by a probe and by codex); fix, then a narrow re-check
+
+### Round 1 findings
+All seven closed as claimed (refuse unless `--overwrite`, exclusive `.partial`, no-replace move, zero-ping warning, option validation, best-effort cleanup, interrupt reconciliation plus fsync, directory/unwritable refusal, discarded ping count). Commit `1c2eca3` touched only `bag_to_xtf.py` and its tests; nothing unrelated.
+
+### Findings
+- [ ] (must-fix) `--overwrite` opens an existing `.partial` with `'wb'`, which follows a symlink and truncates a hard-linked inode: the target file (outside the run's names) is emptied, while the report lists only the `.partial` path as "replaced". Probe: symlink `a_...Z.xtf.partial -> target`, target became empty. Unlink the old `.partial` (record it as replaced) and then open with `'xb'`; add symlink and hard-link tests — `bag_analysis/bag_analysis/cli/bag_to_xtf.py:627-631` (cross-model confirmed, codex)
+- [ ] (suggestion) hard-link fallback (`os.link` failing with EPERM/ENOTSUP, as on FAT and some SMB shares) is check-then-`os.replace`: a file appearing in between is replaced silently, yet the README and docstring say "nothing is ever replaced, even if a file appears". Either say so in the README for such filesystems or fall back to an exclusive create plus copy; no test covers the fallback at all — `bag_to_xtf.py:657-667`, `README.md` ("Without `--overwrite` nothing is ever replaced") (codex rated must-fix; kept as suggestion because the window is microseconds and the preflight already refused every pre-existing name)
+- [ ] (suggestion) `os.fsync(stream.fileno())` is unguarded: a filesystem that rejects file fsync (EINVAL/ENOSYS/ENOTSUP, some FUSE/SMB mounts) fails the run after a complete part was written, and `abort()` then deletes that part's `.partial`. Tolerate those errnos (keep EIO fatal), unlike `_fsync_dir` which already is best effort — `bag_to_xtf.py:676`
+- [ ] (suggestion) on the success path `_warn_old_files` (and `_report`) are not wrapped like they are on the failure path; an `iterdir` error on a dropped NAS mount after a complete conversion gives a traceback and a non-zero exit — `bag_to_xtf.py:914,918`
+- [ ] (suggestion) when the final-name move meets a file that appeared mid-run (`FileExistsError`), the finished part's `.partial` is then deleted by `abort()`: the new data is lost to protect the foreign file. Keep the `.partial` and name it in the report — `bag_to_xtf.py:685-696`
+
+### Answers to the seven points
+1. Without `--overwrite`: `.partial` is `xb` (not following symlinks), the move is link-then-unlink, so no replacement except the no-hard-link fallback race above (not reported silently, but unprotected). With `--overwrite`: the symlink/hard-link truncation above is the one unreported path. The probe file uses `TemporaryFile`, never a named file. One-part pass through the time name replaces an old file of that name, and it is reported and documented.
+2. Pattern `<stem>_\d{8}T\d{6}Z(_\d+)?<suffix>(.partial)?` plus plain name and plain `.partial`, `re.escape`d, `fullmatch`: not too wide. Misses only case variants on case-insensitive filesystems (mid-run guard still protects without `--overwrite`).
+3. Yes: `TemporaryFile` is unlinked on creation or uses `O_TMPFILE` and is random-named with `O_EXCL`; it cannot collide.
+4. Directory fsync is safe (open or fsync errors are swallowed). File fsync is not (see suggestion 3).
+5. Caps (10 TB, 10^7 minutes, 10^9 s) reject nothing legitimate; `0` and `--no-split` cover "off".
+6. No, `1c2eca3` changed only this feature's code and tests.
+7. README matches the code for options, defaults, exit 2 on refusal, reporting and the up-front folder checks; the one inaccuracy is "nothing is ever replaced" (suggestion 1). Minor: the README does not list `--overwrite` in the options table and says nothing of `--max-pings` below 1 being rejected.
