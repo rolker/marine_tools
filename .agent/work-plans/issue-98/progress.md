@@ -131,10 +131,35 @@ See "Implementation Notes (deviations)" in the plan: golden test uses default li
 **Round**: 1 | **Ship**: continue — one real data-loss path (earlier same-named part silently replaced), 4-way confirmed; fix then re-review narrowly
 
 ### Findings
-- [ ] (must-fix) a rerun whose first ping gives an existing part name silently replaces that file (end_part replace, then finish moves it), contradicting "nothing was deleted"; check the disk in _final_path (reserve final and .partial names) or warn about replaced files, and test it — `bag_analysis/bag_analysis/cli/bag_to_xtf.py:523`
-- [ ] (suggestion) zero-ping failure returns before _warn_old_files, so a stale plain output goes unmentioned — `bag_to_xtf.py:673`
-- [ ] (suggestion) inf (and 1e308) for --split-size/--split-duration/--split-gap raises uncaught OverflowError; reject non-finite via parser.error; also tiny --split-duration truncates to 0 ns and splits every ping — `bag_to_xtf.py:194`
-- [ ] (suggestion) abort()/_warn_old_files can raise inside the except handler and hide the original error and the finished-parts report; guard with try/except OSError — `bag_to_xtf.py:568`
-- [ ] (suggestion) interrupt between replace and parts.append (end_part) or between replace and path assignment (finish) leaves a complete part unreported and later called an old file; also no fsync before rename — `bag_to_xtf.py:545`
-- [ ] (suggestion) --output that is a directory is only detected after the whole bag is converted; check up front — `bag_to_xtf.py:650`
-- [ ] (suggestion) failure report does not say how many pings were in the discarded .partial — `bag_to_xtf.py:667`
+- [x] (must-fix) a rerun whose first ping gives an existing part name silently replaces that file (end_part replace, then finish moves it), contradicting "nothing was deleted"; check the disk in _final_path (reserve final and .partial names) or warn about replaced files, and test it — `bag_analysis/bag_analysis/cli/bag_to_xtf.py:523`
+- [x] (suggestion) zero-ping failure returns before _warn_old_files, so a stale plain output goes unmentioned — `bag_to_xtf.py:673`
+- [x] (suggestion) inf (and 1e308) for --split-size/--split-duration/--split-gap raises uncaught OverflowError; reject non-finite via parser.error; also tiny --split-duration truncates to 0 ns and splits every ping — `bag_to_xtf.py:194`
+- [x] (suggestion) abort()/_warn_old_files can raise inside the except handler and hide the original error and the finished-parts report; guard with try/except OSError — `bag_to_xtf.py:568`
+- [x] (suggestion) interrupt between replace and parts.append (end_part) or between replace and path assignment (finish) leaves a complete part unreported and later called an old file; also no fsync before rename — `bag_to_xtf.py:545`
+- [x] (suggestion) --output that is a directory is only detected after the whole bag is converted; check up front — `bag_to_xtf.py:650`
+- [x] (suggestion) failure report does not say how many pings were in the discarded .partial — `bag_to_xtf.py:667`
+
+## Implementation
+**Status**: complete
+**When**: 2026-11-17 10:16 -05:00
+**By**: Claude Sonnet
+
+**Branch**: feature/issue-98 at `7d329cc` (local only, not pushed, no PR)
+**Addressed**: Local Review (Pre-Push) round 1, 2026-11-17 09:30 -05:00, at `f6b9840` (1 must-fix, 6 suggestions)
+**Commits**: `1c2eca3` (code and tests), `7d329cc` (README and plan)
+
+### Actions
+- [x] (must-fix) rerun silently replacing a part: owner decision REFUSE UNLESS `--overwrite`; up-front scan, exclusive `.partial` open, no-replace move incl. the plain-name rename, replaced files reported, unregenerated old files warned ("mixes files from two runs") — `bag_to_xtf.py` `_preflight`, `_PartSink`
+- [x] zero-ping exit now runs the old-file warning
+- [x] non-finite, absurd and 0 ns option values rejected (exit 2)
+- [x] cleanup is best effort and cannot hide the original error or the parts report
+- [x] interrupt windows reconciled against the disk; parts fsynced before rename
+- [x] `--output` directory / unwritable folder refused up front
+- [x] failure report gives the ping count of the discarded `.partial`
+
+### Notes
+- Refuse path: exit 2, stderr `error: N file(s) for this output already exist in <folder>:` + up to 10 names + `... and K more (N files in all)` + `Nothing was written. Move them away, choose another --output, or pass --overwrite ...`.
+- A one-part `--overwrite` run passes through its time name, so an old file of that time name is replaced and listed (documented).
+- Plan and README updated; the superseded accepted deviation is rewritten in the plan.
+- Tests: 153 run in bag_analysis, 0 failures, 2 skipped (pyxtf not installed).
+
