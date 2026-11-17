@@ -117,3 +117,24 @@ See "Implementation Notes (deviations)" in the plan: golden test uses default li
 
 ### Not verified
 - pyxtf reading of the parts (pyxtf not installed on this host).
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-11-17 09:30 -05:00
+**By**: Claude Code Agent (Claude Sonnet)
+**Verdict**: changes-requested
+
+**Branch**: feature/issue-98 at `f6b9840`
+**Mode**: pre-push
+**Depth**: Standard (reason: 1248 lines, survey-data writer, owner-requested)
+**Must-fix**: 1 | **Suggestions**: 6
+**Round**: 1 | **Ship**: continue — one real data-loss path (earlier same-named part silently replaced), 4-way confirmed; fix then re-review narrowly
+
+### Findings
+- [ ] (must-fix) a rerun whose first ping gives an existing part name silently replaces that file (end_part replace, then finish moves it), contradicting "nothing was deleted"; check the disk in _final_path (reserve final and .partial names) or warn about replaced files, and test it — `bag_analysis/bag_analysis/cli/bag_to_xtf.py:523`
+- [ ] (suggestion) zero-ping failure returns before _warn_old_files, so a stale plain output goes unmentioned — `bag_to_xtf.py:673`
+- [ ] (suggestion) inf (and 1e308) for --split-size/--split-duration/--split-gap raises uncaught OverflowError; reject non-finite via parser.error; also tiny --split-duration truncates to 0 ns and splits every ping — `bag_to_xtf.py:194`
+- [ ] (suggestion) abort()/_warn_old_files can raise inside the except handler and hide the original error and the finished-parts report; guard with try/except OSError — `bag_to_xtf.py:568`
+- [ ] (suggestion) interrupt between replace and parts.append (end_part) or between replace and path assignment (finish) leaves a complete part unreported and later called an old file; also no fsync before rename — `bag_to_xtf.py:545`
+- [ ] (suggestion) --output that is a directory is only detected after the whole bag is converted; check up front — `bag_to_xtf.py:650`
+- [ ] (suggestion) failure report does not say how many pings were in the discarded .partial — `bag_to_xtf.py:667`
