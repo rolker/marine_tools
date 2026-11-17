@@ -48,3 +48,17 @@ Code read: `bag_analysis/cli/bag_to_xtf.py` (`_convert`, `main`, `_report`), `xt
 - [ ] In PR 1, refactor `_convert` into a ping generator so PR 2's two-pass design fits.
 - [ ] For PR 2, plan a measured-defaults task on real bags (0.5 m/s tracks included) and a nav-only first pass that does not hold sample data in memory.
 - [ ] Update the README section and CLI help; cover both layouts in tests.
+
+## Plan Authored
+**Status**: complete
+**When**: 2026-11-17 09:05 -05:00
+**By**: Claude Sonnet
+
+**Plan**: `.agent/work-plans/issue-98/plan.md` at `7bc6f49`
+**Branch**: feature/issue-98 at `7bc6f49`
+**Phases**: single (PR 1 only; PR 2 line/turn gets its own plan)
+
+### Open questions
+- [ ] Is deleting stale generated parts from an earlier run on success acceptable (alternative: refuse to run)?
+- [ ] Option names (--max-part-size-mb, --max-part-duration-min, --gap-split-s, --no-split) and MB = 10^6 bytes.
+- [ ] Confirm the 60 s gap default against real bags during implementation.
