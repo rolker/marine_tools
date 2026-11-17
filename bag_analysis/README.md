@@ -145,6 +145,50 @@ port with starboard, default 0.25 s), `--max-tf-age` (drop pings whose
 only TF is older than this, default 1 s), and `--max-pings` (cap output,
 for quick checks).
 
+### Splitting the output
+
+Big bags make big files (0.1 to 3.5 GB each for the Appledore exports),
+and some receiving tools fail above 2 GB. So `bag_to_xtf` splits its
+output into parts by default:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--split-size <MB>` | 500 | Start a new part before it would grow past this size. 1 MB is 10^6 bytes, so a part never exceeds the limit (except a single ping that is larger by itself, which gets a part alone). `0` turns the size limit off. |
+| `--split-duration <minutes>` | off | Start a new part when the current one covers this many minutes of pings. |
+| `--split-gap <seconds>` | 60 | Start a new part when more than this many seconds pass between two pings, for example when the sonar was switched off. `0` turns it off. |
+| `--no-split` | | One file, whatever its size, as before. Cannot be combined with the three options above. |
+
+Negative values are rejected. A size limit over 2 GB or smaller than one
+ping prints a warning. Whichever limit is reached first starts the next
+part, and the report says which one it was.
+
+Naming: a run that ends with one part writes the plain `--output` name,
+so existing scripts keep working. A run with several parts writes
+`<stem>_<UTC time of the part's first ping><suffix>`, for example
+`survey_20260615T150345Z.xtf`, and no plain-name file. Two parts that
+start in the same second get `_2`, `_3` and so on.
+
+Ping numbers, speed and the seconds-per-ping field run on across parts,
+so the pings of all parts joined together (everything after each file's
+1024-byte header) are byte for byte the pings of the unsplit file. One
+consequence: the first ping after a time gap carries a speed averaged
+over the gap (distance over the silent interval), just as in the
+unsplit file. Treat it as unreliable.
+
+The run report lists each part with its ping count, first and last ping
+time (UTC) and size.
+
+Each part is written to a `.partial` file and renamed when it is
+complete. If the run fails part way, the finished parts stay, only the
+unfinished `.partial` is deleted, the finished parts are listed, and the
+exit status is non-zero.
+
+Files from earlier runs are never deleted. If the output directory holds
+parts of the same name pattern that this run did not write, leftover
+`.partial` files, or a plain-name file from a run that did not replace
+it, the run ends with a warning that lists them. Remove them yourself
+when they are out of date so they do not get mixed up with the new parts.
+
 ## Schema
 
 `data.db` holds:
