@@ -6,6 +6,18 @@ plus the TF tree, georeferences each ping via an ``earth`` (ECEF) frame
 lookup of the ping's own ``header.frame_id``, pairs port with starboard,
 and streams two-channel XTF ping packets to disk.
 
+The pose is the one at the ping's time. Transforms past that time are later
+in the bag, so each ping is held until transforms on both sides of its time
+have been read (at most ``--tf-wait`` seconds of bag time), then looked up
+with tf2 at that time. There is no fallback to the latest transform: a ping
+whose transforms are further apart than ``--max-tf-gap`` around its time,
+or missing, is dropped and counted by reason. ``--stamp-to-transmit-offset``
+moves the lookup (and the ping time written) to ``stamp - offset`` for a
+sonar whose stamp is the time the host received the ping, not the time it
+was sent; the stamp as recorded is kept in the ping header's ComputerClock
+fields. Window, pairing: raw stamp. Written time, part names, split gap and
+duration, speed: stamp - offset.
+
 Usage::
 
     ros2 run bag_analysis bag_to_xtf \\
@@ -52,6 +64,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+from collections import deque
 import datetime as _dt
 import errno
 import math
@@ -62,11 +75,11 @@ import sys
 import tempfile
 
 import numpy as np
-from rclpy.duration import Duration
-import rclpy.time
-from tf2_ros import Buffer, TransformException
 
 from ..reader import iter_messages
+from ..tf_lookup import (
+    NO_TF, READY, stamp_ns as _stamp_ns, TF_GAP, TF_LATE, TfChain,
+    TfChainError, TfMismatch, WAITS)
 from ..xtf.geo import ecef_pose_to_geo
 from ..xtf.writer import (
     ChannelPing,
@@ -99,13 +112,15 @@ _MAX_SPLIT_DURATION_MIN = 1e7
 _MAX_SPLIT_GAP_S = 1e9
 # How many file names an error message lists before saying "and N more".
 _MAX_LISTED = 10
+# Largest stamp-to-transmit offset (s) accepted; anything bigger is a typo.
+_MAX_OFFSET_S = 3600.0
 
 
 class _PendingPing:
     """A georeferenced single-channel ping awaiting its counterpart."""
 
     __slots__ = (
-        't_ns', 'time', 'lat', 'lon', 'heading', 'pitch', 'roll',
+        't_ns', 'time', 'raw_ns', 'computer_time', 'lat', 'lon', 'heading', 'pitch', 'roll',
         'ecef', 'samples', 'slant_range', 'frequency', 'time_delay',
         'time_duration', 'sound_velocity',
     )
@@ -120,6 +135,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='bag_to_xtf',
         description='Convert recorded sidescan from a rosbag2 to XTF.',
+        allow_abbrev=False,
     )
     p.add_argument(
         '--bag', required=True, type=Path,
@@ -144,9 +160,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Max |dt| (s) on header stamps to pair port with starboard',
     )
     p.add_argument(
-        '--max-tf-age', type=float, default=1.0,
-        help=('Max age (s) of a fallback "latest" TF relative to the ping '
-              'stamp before the ping is dropped as un-georeferenceable'),
+        '--max-tf-gap', type=float, default=1.0, metavar='SECONDS',
+        help=('Largest allowed interval (s) between the two transform '
+              'samples that bracket the ping time, on every dynamic link of '
+              'the chain; a ping in a longer gap is dropped (counted '
+              'tf_gap). Default 1, about ten periods of a 10 Hz chain.'),
+    )
+    p.add_argument(
+        '--max-tf-age', default=None, help=argparse.SUPPRESS)
+    p.add_argument(
+        '--tf-wait', type=float, default=5.0, metavar='SECONDS',
+        help=('How long (s of bag time) a ping waits for transforms past its '
+              'time before it is dropped (counted tf_late). Must be larger '
+              'than --max-tf-gap. Default 5.'),
+    )
+    p.add_argument(
+        '--stamp-to-transmit-offset', type=float, default=0.0,
+        metavar='SECONDS',
+        help=('Seconds the ping stamp lags the moment the ping was '
+              'transmitted (the Garmin stamp is a host receive time). The '
+              'pose is looked up at stamp - offset and that is also the '
+              'ping time written; the stamp itself goes to the ComputerClock '
+              'fields. Negative values are allowed. Default 0.'),
     )
     p.add_argument(
         '--start-time', default=None,
@@ -244,6 +279,38 @@ def _parse_args(argv):
                 '0 or --no-split to remove a limit')
     if args.max_pings is not None and args.max_pings < 1:
         parser.error('--max-pings must be at least 1')
+    if args.max_tf_age is not None:
+        parser.error(
+            '--max-tf-age is gone: it bounded the age of a fallback to the '
+            'latest transform, which no longer exists. Use --max-tf-gap '
+            '(the largest allowed interval between the two transform '
+            'samples around the ping time) instead; its meaning is '
+            'different, so do not carry the old value over')
+    for flag, value in (
+            ('--max-tf-gap', args.max_tf_gap), ('--tf-wait', args.tf_wait),
+            ('--tf-cache', args.tf_cache),
+            ('--stamp-to-transmit-offset', args.stamp_to_transmit_offset)):
+        if not math.isfinite(value):
+            parser.error(f'{flag} must be a finite number')
+    if args.max_tf_gap <= 0.0:
+        parser.error('--max-tf-gap must be greater than 0')
+    if abs(args.stamp_to_transmit_offset) > _MAX_OFFSET_S:
+        parser.error(
+            f'--stamp-to-transmit-offset {args.stamp_to_transmit_offset:g} '
+            f'is absurdly large (limit {_MAX_OFFSET_S:g} s either way)')
+    if args.tf_wait <= args.max_tf_gap:
+        parser.error(
+            f'--tf-wait ({args.tf_wait:g} s) must be larger than '
+            f'--max-tf-gap ({args.max_tf_gap:g} s): a ping has to be able '
+            'to wait for the next sample of a chain that is allowed that '
+            'far apart')
+    if args.tf_cache <= (args.tf_wait + args.max_tf_gap
+                         + abs(args.stamp_to_transmit_offset)):
+        parser.error(
+            f'--tf-cache ({args.tf_cache:g} s) must be larger than '
+            '--tf-wait + --max-tf-gap + |--stamp-to-transmit-offset|, or a '
+            'waiting ping could outlive the transforms it needs')
+    args.offset_ns = round(args.stamp_to_transmit_offset * _NS_PER_S)
     explicit = [
         f'--{n.replace("_", "-")}'
         for n in ('split_size', 'split_duration', 'split_gap')
@@ -312,11 +379,6 @@ def _ping_geometry(msg, n_samples: int) -> tuple[float, float, float, float]:
     return slant_range, time_delay, time_duration, sound_speed
 
 
-def _stamp_ns(stamp) -> int:
-    """Nanoseconds since epoch from a builtin_interfaces/Time stamp."""
-    return stamp.sec * _NS_PER_S + stamp.nanosec
-
-
 def _parse_time(value):
     """
     Parse a CLI time to epoch nanoseconds, or None if not given.
@@ -337,54 +399,23 @@ def _parse_time(value):
     return int(parsed.timestamp() * 1e9)
 
 
-def _lookup_pose(buffer, frame, earth_frame, stamp, max_tf_age_ns):
+def _make_pending(msg, raw_ns, offset_ns, pose) -> _PendingPing:
     """
-    Look up earth->frame at the ping stamp, with a bounded latest fallback.
+    Build a georeferenced pending ping from a RawSonarImage + TF pose.
 
-    Returns ``(pose, status)`` where ``pose`` is
-    ``((x, y, z), (qx, qy, qz, qw))`` or ``None``, and ``status`` is one
-    of ``'exact'`` (stamped lookup), ``'approx'`` (fell back to the
-    latest transform, within ``max_tf_age_ns``), ``'stale'`` (latest
-    transform too old -> dropped), or ``'missing'`` (no transform at
-    all). A bounded fallback prevents silently stamping a ping with a
-    pose from an unrelated time when TF has a gap.
+    ``raw_ns`` is the stamp as recorded; the ping time written is
+    ``raw_ns - offset_ns``, the instant the pose was looked up at.
     """
-    try:
-        tf = buffer.lookup_transform(
-            earth_frame, frame, rclpy.time.Time.from_msg(stamp))
-        return _pose_from_tf(tf), 'exact'
-    except TransformException:
-        pass
-    try:
-        tf = buffer.lookup_transform(earth_frame, frame, rclpy.time.Time())
-    except TransformException:
-        return None, 'missing'
-    ping_ns = _stamp_ns(stamp)
-    age = abs(ping_ns - _stamp_ns(tf.header.stamp))
-    if ping_ns > 0 and age > max_tf_age_ns:
-        return None, 'stale'
-    return _pose_from_tf(tf), 'approx'
-
-
-def _pose_from_tf(tf):
-    """Extract ((x, y, z), (qx, qy, qz, qw)) from a TransformStamped."""
-    t = tf.transform.translation
-    q = tf.transform.rotation
-    return (t.x, t.y, t.z), (q.x, q.y, q.z, q.w)
-
-
-def _make_pending(msg, bag_t_ns, pose) -> _PendingPing:
-    """Build a georeferenced pending ping from a RawSonarImage + TF pose."""
     samples = _decode_samples(msg)
     slant_range, time_delay, time_duration, sound_speed = _ping_geometry(
         msg, samples.size)
     lat, lon, _alt, heading, pitch, roll = ecef_pose_to_geo(pose[0], pose[1])
-    # Prefer the acquisition stamp; fall back to bag-receive time only if
-    # the driver left the header unstamped.
-    stamp_ns = _stamp_ns(msg.header.stamp) or bag_t_ns
+    ping_ns = raw_ns - offset_ns
+    utc = _dt.timezone.utc
     return _PendingPing(
-        t_ns=stamp_ns,
-        time=_dt.datetime.fromtimestamp(stamp_ns / 1e9, tz=_dt.timezone.utc),
+        t_ns=ping_ns, raw_ns=raw_ns,
+        time=_dt.datetime.fromtimestamp(ping_ns / 1e9, tz=utc),
+        computer_time=_dt.datetime.fromtimestamp(raw_ns / 1e9, tz=utc),
         lat=lat, lon=lon, heading=heading, pitch=pitch, roll=roll,
         ecef=np.array(pose[0]), samples=samples, slant_range=slant_range,
         frequency=msg.ping_info.frequency, time_delay=time_delay,
@@ -425,88 +456,150 @@ def _seconds_per_ping(prev: _PendingPing | None, cur: _PendingPing) -> float:
     return dt
 
 
+class _Held:
+    """A ping read from the bag, waiting for the transforms past its time."""
+
+    __slots__ = ('side', 'msg', 'raw_ns', 'record_ns', 'lookup_ns',
+                 'altitude')
+
+    def __init__(self, side, msg, raw_ns, record_ns, offset_ns, altitude):
+        """Remember the message, its stamps and the altitude seen with it."""
+        self.side = side
+        self.msg = msg
+        self.raw_ns = raw_ns
+        self.record_ns = record_ns
+        self.lookup_ns = raw_ns - offset_ns
+        self.altitude = altitude
+
+
+def _resolve(held, chain, counts, now_ns, wait_ns, final):
+    """
+    Release pings from the front of ``held`` whose answer is known.
+
+    Yields ``(ping, pose)`` for each one that can be georeferenced and counts
+    the others by reason. Strictly first in, first out: a ping that still
+    waits blocks those behind it, so order and pairing are as read. A wait
+    ends when ``now_ns`` (bag record time) is more than ``wait_ns`` past the
+    ping's own record time, or when ``final`` says no more transforms will
+    come; the wait is then settled as ``no_tf`` or ``tf_late``.
+    """
+    while held:
+        head = held[0]
+        verdict = chain.check(head.msg.header.frame_id, head.lookup_ns)
+        if verdict in WAITS:
+            if not final and now_ns - head.record_ns <= wait_ns:
+                return
+            verdict = chain.settle(verdict)
+        held.popleft()
+        if verdict == READY:
+            try:
+                pose = chain.lookup(head.msg.header.frame_id, head.lookup_ns)
+            except TfMismatch:
+                counts['tf_mismatch'] += 1
+                continue
+            yield head, pose
+        else:
+            counts[verdict] += 1
+
+
+def _pair_up(pending, held, pose, args, counts):
+    """
+    Pair a georeferenced ping with the waiting one of the other channel.
+
+    Returns ``(port, starboard)`` when it completes a pair, else ``None``
+    after storing it (a ping it replaces is counted ``unpaired``). Pairing
+    compares the stamps as recorded.
+    """
+    ping = _make_pending(held.msg, held.raw_ns, args.offset_ns, pose)
+    side = held.side
+    other = 'starboard' if side == 'port' else 'port'
+    mate = pending[other]
+    pair_tol_ns = args.pair_tolerance * _NS_PER_S
+    if mate is not None and abs(ping.raw_ns - mate.raw_ns) <= pair_tol_ns:
+        pending['port'] = pending['starboard'] = None
+        return (ping, mate) if side == 'port' else (mate, ping)
+    if pending[side] is not None:
+        counts['unpaired'] += 1  # discarded; mate never arrived
+    pending[side] = ping
+    return None
+
+
 def _iter_pings(args, counts):
     """
     Read the bag and yield ``(port, starboard, altitude)`` per paired ping.
 
-    Owns everything up to the write: the TF buffer, nadir tracking, the
+    Owns everything up to the write: the TF chain, nadir tracking, the
     ``--start-time``/``--end-time`` window, georeferencing and port/
-    starboard pairing. ``altitude`` is the latest nadir range seen so far
-    (``None`` before the first one). The pending pair is cleared before
-    each ``yield`` so a consumer that stops early (``--max-pings``) does
-    not see the just-yielded pair counted as ``unpaired``.
+    starboard pairing. A ping that passes the window waits in a queue until
+    the transforms past its lookup time (stamp - offset) have been read,
+    then gets a stamped tf2 lookup; see ``_resolve``. ``altitude`` is the
+    latest nadir range seen when the completing ping was read (``None``
+    before the first one). The pending pair is cleared before each ``yield``
+    so a consumer that stops early (``--max-pings``) does not see the
+    just-yielded pair counted as ``unpaired``; pings still waiting are
+    discarded without being counted.
     """
-    buffer = Buffer(cache_time=Duration(seconds=args.tf_cache))
+    chain = TfChain(args.earth_frame, args.tf_cache, args.max_tf_gap)
     topics = [
         '/tf', '/tf_static', args.port_topic, args.starboard_topic,
         args.nadir_topic,
     ]
-    max_tf_age_ns = int(args.max_tf_age * _NS_PER_S)
-    pair_tol_ns = args.pair_tolerance * _NS_PER_S
+    wait_ns = round(args.tf_wait * _NS_PER_S)
     start_ns = _parse_time(args.start_time)
     end_ns = _parse_time(args.end_time)
 
     pending: dict = {'port': None, 'starboard': None}
+    held: deque = deque()
     latest_altitude = None
+    admitting = True
     try:
         for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
             if topic == '/tf':
-                for tr in msg.transforms:
-                    buffer.set_transform(tr, 'bag_to_xtf')
-                continue
-            if topic == '/tf_static':
-                for tr in msg.transforms:
-                    buffer.set_transform_static(tr, 'bag_to_xtf')
-                continue
-            if topic == args.nadir_topic:
+                chain.feed(msg.transforms, static=False,
+                           authority='bag_to_xtf')
+            elif topic == '/tf_static':
+                chain.feed(msg.transforms, static=True,
+                           authority='bag_to_xtf')
+            elif not admitting:
+                continue    # past --end-time: only /tf, to settle the queue
+            elif topic == args.nadir_topic:
                 latest_altitude = float(msg.range)
                 counts['nadir'] += 1
-                continue
-
-            if topic == args.port_topic:
-                side = 'port'
-            elif topic == args.starboard_topic:
-                side = 'starboard'
+            elif topic in (args.port_topic, args.starboard_topic):
+                side = 'port' if topic == args.port_topic else 'starboard'
+                counts[side] += 1
+                # Time-window trim (e.g. dock-out to dock-in), on the stamp
+                # as recorded. TF/nadir are fed regardless above; only
+                # sidescan pings are gated.
+                raw_ns = _stamp_ns(msg.header.stamp) or t_ns
+                if start_ns is not None and raw_ns < start_ns:
+                    counts['out_of_window'] += 1
+                elif end_ns is not None and raw_ns > end_ns:
+                    admitting = False
+                elif float(msg.sample_rate) <= 0.0:
+                    counts['malformed'] += 1
+                else:
+                    held.append(_Held(side, msg, raw_ns, t_ns,
+                                      args.offset_ns, latest_altitude))
             else:
                 continue
-            counts[side] += 1
 
-            # Time-window trim (e.g. dock-out to dock-in). TF/nadir are fed
-            # regardless above; only sidescan pings are gated. The bag is
-            # time-ordered, so once past end_ns nothing more is needed.
-            eff_ns = _stamp_ns(msg.header.stamp) or t_ns
-            if start_ns is not None and eff_ns < start_ns:
-                counts['out_of_window'] += 1
-                continue
-            if end_ns is not None and eff_ns > end_ns:
+            for item, pose in _resolve(
+                    held, chain, counts, t_ns, wait_ns, final=False):
+                pair = _pair_up(pending, item, pose, args, counts)
+                if pair is not None:
+                    yield pair[0], pair[1], item.altitude
+            if not admitting and not held:
                 break
 
-            if float(msg.sample_rate) <= 0.0:
-                counts['malformed'] += 1
-                continue
-
-            pose, status = _lookup_pose(
-                buffer, msg.header.frame_id, args.earth_frame,
-                msg.header.stamp, max_tf_age_ns)
-            if pose is None:
-                counts['no_tf' if status == 'missing' else 'stale_tf'] += 1
-                continue
-            if status == 'approx':
-                counts['approx_tf'] += 1
-            ping = _make_pending(msg, t_ns, pose)
-
-            other = 'starboard' if side == 'port' else 'port'
-            mate = pending[other]
-            if mate is not None and abs(ping.t_ns - mate.t_ns) <= pair_tol_ns:
-                port, stbd = (ping, mate) if side == 'port' else (mate, ping)
-                pending['port'] = pending['starboard'] = None
-                yield port, stbd, latest_altitude
-            else:
-                if pending[side] is not None:
-                    counts['unpaired'] += 1  # discarded; mate never arrived
-                pending[side] = ping
+        for item, pose in _resolve(held, chain, counts, 0, wait_ns,
+                                   final=True):
+            pair = _pair_up(pending, item, pose, args, counts)
+            if pair is not None:
+                yield pair[0], pair[1], item.altitude
     finally:
         counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
+        counts['tf_rejected'] = dict(chain.rejected)
 
 
 def _utc_label(when: _dt.datetime) -> str:
@@ -878,7 +971,8 @@ def _convert(args, sink, counts) -> int:
                 heading_deg=port.heading, pitch_deg=port.pitch,
                 roll_deg=port.roll, speed_mps=speed,
                 sound_velocity_mps=port.sound_velocity,
-                port=port_chan, starboard=stbd_chan)
+                port=port_chan, starboard=stbd_chan,
+                computer_time=port.computer_time)
             total += 1
             counts['paired'] += 1
             prev_emitted = port
@@ -959,9 +1053,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f'warning: {message}', file=sys.stderr)
 
     counts = {
-        'port': 0, 'starboard': 0, 'paired': 0, 'no_tf': 0, 'stale_tf': 0,
-        'approx_tf': 0, 'malformed': 0, 'unpaired': 0, 'nadir': 0,
-        'no_altitude': 0, 'out_of_window': 0,
+        'port': 0, 'starboard': 0, 'paired': 0, NO_TF: 0, TF_GAP: 0,
+        TF_LATE: 0, 'tf_mismatch': 0, 'malformed': 0, 'unpaired': 0,
+        'nadir': 0, 'no_altitude': 0, 'out_of_window': 0,
     }
     sink = _PartSink(args.output, args.sonar_name, args.layout, args.overwrite)
     try:
@@ -969,7 +1063,11 @@ def main(argv: list[str] | None = None) -> int:
         sink.finish()
     except BaseException as exc:
         # Say what went wrong first; nothing below may hide it.
-        print(f'error: conversion failed: {exc!r}', file=sys.stderr)
+        if isinstance(exc, TfChainError):
+            print(f'error: unsupported transform tree: {exc}',
+                  file=sys.stderr)
+        else:
+            print(f'error: conversion failed: {exc!r}', file=sys.stderr)
         if isinstance(exc, FileExistsError):
             print('error: a file appeared in the output folder during the '
                   'run and was NOT replaced (pass --overwrite to allow '
@@ -986,7 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
         _best_effort(_report_kept, sink)
         _best_effort(_report_replaced, sink)
         _check_old_files(args.output, sink)
-        if isinstance(exc, OSError):
+        if isinstance(exc, (OSError, TfChainError)):
             return 1
         raise
 
@@ -1107,14 +1205,19 @@ def _report(sink, ping_count: int, counts: dict, args) -> None:
     _report_replaced(sink)
     print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
           f' paired={counts["paired"]}')
-    print(f'  dropped: no_tf={counts["no_tf"]} stale_tf={counts["stale_tf"]} '
+    print(f'  dropped: no_tf={counts[NO_TF]} tf_gap={counts[TF_GAP]} '
+          f'tf_late={counts[TF_LATE]} tf_mismatch={counts["tf_mismatch"]} '
           f'malformed={counts["malformed"]} unpaired={counts["unpaired"]}')
+    print(f'  stamp-to-transmit offset: {args.stamp_to_transmit_offset:g} s '
+          '(pose looked up at stamp - offset; that is the ping time '
+          'written, the stamp is in the ComputerClock fields)')
     if counts['out_of_window']:
         print(f'  trimmed: {counts["out_of_window"]} pings outside '
               '--start-time/--end-time window')
-    if counts['approx_tf']:
-        print(f'  note: {counts["approx_tf"]} pings used a latest-TF fallback '
-              '(within --max-tf-age)')
+    if counts.get('tf_rejected'):
+        reasons = ', '.join(
+            f'{k}={v}' for k, v in sorted(counts['tf_rejected'].items()))
+        print(f'  note: tf2 rules rejected transforms: {reasons}')
     if counts['nadir'] == 0:
         print('  warning: no nadir_depth messages; altitude written as 0 for '
               'all pings')
