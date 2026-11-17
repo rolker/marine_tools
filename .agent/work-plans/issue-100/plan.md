@@ -69,8 +69,8 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    which the tools count separately as `tf_mismatch`. Decisions use the
    tool's own stamps, never exception text.
 2. **Lookup time.** L = stamp - offset in integer ns. `--stamp-to-transmit-offset
-   SECONDS` default 0, negative values allowed, only a non-finite value is a
-   usage error (exit 2). L <= 0 is `no_tf` (tf2 reads time 0 as "latest").
+   SECONDS` default 0, negative values allowed; a non-finite value, or one
+   over an hour either way (a typo), is a usage error (exit 2). L <= 0 is `no_tf` (tf2 reads time 0 as "latest").
 3. **Which clock is used where** (decided by the owner; checked, no concrete
    reason found against it):
    - raw stamp (`header.stamp`, or the bag record time when the stamp is
