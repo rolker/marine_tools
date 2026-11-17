@@ -500,6 +500,7 @@ def test_max_tf_age_cannot_be_reached_by_a_prefix(
     ['--tf-wait', '3', '--max-tf-gap', '3'],
     ['--tf-cache', '5'],                          # not above the wait
     ['--tf-cache', '6.5', '--stamp-to-transmit-offset', '-1'],
+    ['--tf-cache', '6.25'],                       # wait+gap+pair tolerance
     ['--tf-cache', 'inf'],
     ['--tf-cache', '1e30'],                       # beyond what Duration holds
     ['--max-tf-gap', '1e-10'],                    # rounds to 0 ns
@@ -646,3 +647,23 @@ def test_hundredths_are_cut_from_the_integer_nanoseconds(
     ping, = read_ping_headers(out)
     assert ping['time'] == (2025, 6, 15, *written)
     assert ping['clock'] == clock
+
+
+def test_tf_cache_bound_includes_the_pair_tolerance(
+        tmp_path, monkeypatch, capsys):
+    # defaults: wait 5 + gap 1 + offset 0 + pair tolerance 0.25 = 6.25
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, monkeypatch, [], '--tf-cache', '6.25')
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    for term in ('--tf-wait', '--max-tf-gap', '--stamp-to-transmit-offset',
+                 '--pair-tolerance'):
+        assert term in err
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, monkeypatch, [], '--tf-cache', '6.5',
+             '--pair-tolerance', '0.5')
+    assert exc.value.code == 2
+    capsys.readouterr()
+    _run(tmp_path, monkeypatch, [], '--tf-cache', '6.26')   # accepted
+    _run(tmp_path, monkeypatch, [], '--tf-cache', '6.6',
+         '--pair-tolerance', '0.5')

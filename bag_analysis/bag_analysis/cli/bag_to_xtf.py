@@ -324,11 +324,13 @@ def _parse_args(argv):
             'to wait for the next sample of a chain that is allowed that '
             'far apart')
     if args.tf_cache <= (args.tf_wait + args.max_tf_gap
-                         + abs(args.stamp_to_transmit_offset)):
+                         + abs(args.stamp_to_transmit_offset)
+                         + args.pair_tolerance):
         parser.error(
             f'--tf-cache ({args.tf_cache:g} s) must be larger than '
-            '--tf-wait + --max-tf-gap + |--stamp-to-transmit-offset|, or a '
-            'waiting ping could outlive the transforms it needs')
+            '--tf-wait + --max-tf-gap + |--stamp-to-transmit-offset| + '
+            '--pair-tolerance, or a waiting ping could outlive the '
+            'transforms it needs')
     args.offset_ns = round(args.stamp_to_transmit_offset * _NS_PER_S)
     explicit = [
         f'--{n.replace("_", "-")}'

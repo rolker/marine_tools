@@ -192,7 +192,7 @@ Two more counters count messages, not pings; no ping is formed from them:
 |---|---|---|
 | `--max-tf-gap <s>` | 1 | Largest allowed interval between the two samples around the ping time, on every dynamic link of the chain (about ten periods of a 10 Hz chain). A sample exactly at the ping time passes whatever its neighbours. Static transforms never count. tf2 itself interpolates across a gap of any length without saying so, which is why the tool checks. |
 | `--tf-wait <s>` | 5 | How long a ping waits for transforms past its time, in seconds of bag time (the time the messages were recorded, not the sonar stamps). Must be larger than `--max-tf-gap`. With a negative offset (below) the pose is looked up after the stamp and the wait is extended by that much. A chain that is never published costs about this much queued data, not the whole bag. |
-| `--tf-cache <s>` | 600 | tf2 cache length (at most 10,000,000). Must be larger than `--tf-wait` + `--max-tf-gap` + the offset below. |
+| `--tf-cache <s>` | 600 | tf2 cache length (at most 10,000,000). Must be larger than `--tf-wait` + `--max-tf-gap` + the offset below + `--pair-tolerance`. |
 | `--stamp-to-transmit-offset <s>` | 0 | See below. |
 
 `--max-tf-age` is gone. It limited how old a fallback "latest" transform

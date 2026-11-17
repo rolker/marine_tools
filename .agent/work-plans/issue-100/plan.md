@@ -130,7 +130,7 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    it expires the ping is dropped as `settle(verdict)`. At the end of the bag
    the remaining pings are settled the same way (`tf_late` after the last
    sample). Usage error unless `--tf-cache` > `--tf-wait` + `--max-tf-gap` +
-   |offset|, so a held ping cannot outlive the Buffer cache. A chain that is
+   |offset| + `--pair-tolerance`, so a held ping cannot outlive the Buffer cache. A chain that is
    never published costs about `--tf-wait` of queued pings, not the bag.
 6. **Options.** `--max-tf-gap` (default 1.0 s, about 10x the 10 Hz period):
    the largest allowed interval between the two transform samples that
