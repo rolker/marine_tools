@@ -26,21 +26,34 @@ file. A run that ends with a single part keeps the plain ``--output``
 name; with several parts every part is named after the UTC time of its
 first ping (``survey_20260615T150345Z.xtf``).
 
-Each part is streamed to a ``.partial`` file and renamed into place once
-it is complete, so a crash never leaves a truncated-but-valid-looking
-XTF behind. After a failure the finished parts are kept and listed, and
-only the unfinished ``.partial`` is deleted. Files left by earlier runs
-are never deleted; they are listed in a warning at the end. A run that
-writes zero pings (wrong topics, no nav, all-malformed) exits non-zero.
+Each part is streamed to a ``.partial`` file, synced to disk and renamed
+into place once it is complete, so a crash never leaves a
+truncated-but-valid-looking XTF behind. After a failure the finished
+parts are kept and listed, and only the unfinished ``.partial`` is
+deleted.
+
+The run refuses to start (exit 2, nothing written) if the output folder
+already holds the plain ``--output`` file or any file of this output's
+part-name pattern (parts and ``.partial`` leftovers), unless
+``--overwrite`` is given. With ``--overwrite`` the run replaces the files
+whose names it produces and lists them; files of the pattern that it did
+not regenerate are never deleted, only warned about. Without
+``--overwrite`` a file that appears mid-run is never replaced either.
+A run that writes zero pings (wrong topics, no nav, all-malformed) exits
+non-zero.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import errno
+import math
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 
 import numpy as np
 from rclpy.duration import Duration
@@ -73,6 +86,13 @@ _DEFAULT_SPLIT_GAP_S = 60.0
 # File header (1024) + ping header (256) + two channel headers (2 x 64).
 _MIN_PING_FILE_BYTES = 1024 + 256 + 128
 _XTF_OFFSET_LIMIT = 2 ** 31
+# Largest accepted split limits; anything bigger is a typo, and 0 /
+# --no-split already mean "no limit".
+_MAX_SPLIT_SIZE_MB = 1e7
+_MAX_SPLIT_DURATION_MIN = 1e7
+_MAX_SPLIT_GAP_S = 1e9
+# How many file names an error message lists before saying "and N more".
+_MAX_LISTED = 10
 
 
 class _PendingPing:
@@ -166,6 +186,15 @@ def _build_parser() -> argparse.ArgumentParser:
               'combined with --split-size, --split-duration or --split-gap.'),
     )
     p.add_argument(
+        '--overwrite', action='store_true',
+        help=('Allow replacing files in the output folder. Without it the '
+              'run refuses to start if the plain --output file or any file '
+              "of this output's part-name pattern (parts, .partial "
+              'leftovers) already exists. With it, the files this run '
+              'produces replace same-named ones and are listed; other old '
+              'files of the pattern are only warned about, never deleted.'),
+    )
+    p.add_argument(
         '--layout', choices=(LAYOUT_STANDARD, LAYOUT_PINGMAPPER),
         default=LAYOUT_STANDARD,
         help=(
@@ -189,10 +218,24 @@ def _parse_args(argv):
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
-    for name in ('split_size', 'split_duration', 'split_gap'):
+    caps = {
+        'split_size': _MAX_SPLIT_SIZE_MB,
+        'split_duration': _MAX_SPLIT_DURATION_MIN,
+        'split_gap': _MAX_SPLIT_GAP_S,
+    }
+    for name, cap in caps.items():
         value = getattr(args, name)
-        if value is not None and not value >= 0.0:
-            parser.error(f'--{name.replace("_", "-")} must not be negative')
+        flag = f'--{name.replace("_", "-")}'
+        if value is None:
+            continue
+        if not math.isfinite(value):
+            parser.error(f'{flag} must be a finite number')
+        if value < 0.0:
+            parser.error(f'{flag} must not be negative')
+        if value > cap:
+            parser.error(
+                f'{flag} {value:g} is absurdly large (maximum {cap:g}); use '
+                '0 or --no-split to remove a limit')
     if args.max_pings is not None and args.max_pings < 1:
         parser.error('--max-pings must be at least 1')
     explicit = [
@@ -225,9 +268,17 @@ def _parse_args(argv):
                 f'--split-size {size_mb} MB is over 2 GB; many XTF tools '
                 'use 32-bit file offsets and cannot read parts that large')
     if duration_min:
-        args.split_duration_ns = int(duration_min * 60 * _NS_PER_S)
+        args.split_duration_ns = round(duration_min * 60 * _NS_PER_S)
+        if args.split_duration_ns < 1:
+            parser.error(
+                f'--split-duration {duration_min:g} rounds to 0 ns; every '
+                'ping would start a new part')
     if gap_s > 0:
-        args.split_gap_ns = int(gap_s * _NS_PER_S)
+        args.split_gap_ns = round(gap_s * _NS_PER_S)
+        if args.split_gap_ns < 1:
+            parser.error(
+                f'--split-gap {gap_s:g} rounds to 0 ns; every ping would '
+                'start a new part')
     return args
 
 
@@ -475,27 +526,74 @@ class _PartInfo:
         self.reason = reason    # why this part started (None for part 1)
 
 
+def _fsync_dir(path: Path) -> None:
+    """Flush a directory entry to disk, best effort (not all systems can)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _settled(src: Path, dst: Path) -> bool:
+    """
+    Return True if moving ``src`` to ``dst`` has in fact completed.
+
+    Used after an interrupted move to find out what the disk says. A
+    hard-link move interrupted between the link and the unlink leaves
+    both names on one file; the leftover ``src`` is removed here.
+    """
+    try:
+        if not os.path.lexists(src):
+            return os.path.lexists(dst)
+        if os.path.lexists(dst) and os.path.samefile(src, dst):
+            src.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
 class _PartSink:
     """
     Write pings into a series of part files.
 
     A part is opened lazily, when its first ping is in hand, as a
-    ``.partial`` named after that ping's UTC time. ``end_part`` closes it
-    and renames it to its final time name. ``finish`` renames the only
-    part of a one-part run to the plain output name. ``abort`` removes the
-    unfinished ``.partial`` and leaves the finished parts alone.
+    ``.partial`` named after that ping's UTC time. ``end_part`` syncs and
+    closes it and moves it to its final time name. ``finish`` moves the
+    only part of a one-part run to the plain output name. ``abort``
+    removes the unfinished ``.partial`` and leaves the finished parts
+    alone.
+
+    Without ``overwrite`` no file this run did not create is ever
+    replaced: ``.partial`` files are opened exclusively and a part is
+    moved into place with a hard link, which fails if the name exists.
+    With ``overwrite`` same-named files are replaced and listed in
+    ``replaced``.
     """
 
-    def __init__(self, output: Path, sonar_name: str, layout: str) -> None:
+    def __init__(
+            self, output: Path, sonar_name: str, layout: str,
+            overwrite: bool = False) -> None:
         """Remember where to write; nothing is created yet."""
         self.output = output
         self._sonar_name = sonar_name
         self._layout = layout
+        self._overwrite = overwrite
         self.parts: list[_PartInfo] = []
+        self.replaced: list[Path] = []
+        self.discarded: tuple[Path, int] | None = None
+        self.cleanup_errors: list[str] = []
         self._names: set[str] = set()
         self._stream = None
         self._partial: Path | None = None
         self._final: Path | None = None
+        self._pings = 0
         self._first = self._last = None
         self._first_t_ns = 0
         self._reason = None
@@ -524,11 +622,20 @@ class _PartSink:
 
     def start_part(self, when, t_ns, reason) -> None:
         """Open the next part, named after its first ping at ``when``."""
-        self._final = self._final_path(when)
-        self._partial = self._final.with_name(self._final.name + '.partial')
-        self._stream = open(self._partial, 'wb')
+        final = self._final_path(when)
+        partial = final.with_name(final.name + '.partial')
+        if self._overwrite:
+            existed = os.path.lexists(partial)
+            stream = open(partial, 'wb')
+            if existed:
+                self.replaced.append(partial)
+        else:
+            stream = open(partial, 'xb')    # never truncate a foreign file
+        # Only now is the .partial ours; abort() must not touch it before.
+        self._final, self._partial, self._stream = final, partial, stream
+        self._pings = 0
         self.writer = XtfWriter(
-            self._stream, sonar_name=self._sonar_name, layout=self._layout)
+            stream, sonar_name=self._sonar_name, layout=self._layout)
         self._first = self._last = when
         self._first_t_ns = t_ns
         self._reason = reason
@@ -536,17 +643,59 @@ class _PartSink:
     def write_ping(self, **kwargs) -> None:
         """Write one ping into the open part."""
         self.writer.write_ping(**kwargs)
+        self._pings += 1
         self._last = kwargs['time']
 
+    def _place(self, src: Path, dst: Path) -> None:
+        """Move ``src`` to ``dst``; replace an existing ``dst`` only if allowed."""
+        if self._overwrite:
+            existed = os.path.lexists(dst)
+            os.replace(src, dst)
+            if existed:
+                self.replaced.append(dst)
+            return
+        try:
+            os.link(src, dst)
+        except FileExistsError:
+            raise
+        except OSError:
+            # No hard links here: check, then rename (a small race remains).
+            if os.path.lexists(dst):
+                raise FileExistsError(
+                    errno.EEXIST, 'File exists', str(dst)) from None
+            os.replace(src, dst)
+            return
+        os.unlink(src)
+
     def end_part(self) -> None:
-        """Close the open part and move it to its final time name."""
+        """Sync and close the open part and move it to its final time name."""
         writer, stream = self.writer, self._stream
         self.writer = self._stream = None
-        stream.close()
-        self._partial.replace(self._final)
-        self.parts.append(_PartInfo(
-            self._final, writer.ping_count, self._first, self._last,
-            writer.bytes_written, self._reason))
+        try:
+            stream.flush()
+            os.fsync(stream.fileno())
+        finally:
+            stream.close()
+        partial, final = self._partial, self._final
+        info = _PartInfo(
+            final, writer.ping_count, self._first, self._last,
+            writer.bytes_written, self._reason)
+        try:
+            self.parts.append(info)
+            self._place(partial, final)
+        except BaseException:
+            # An interrupt can land on either side of the move: let the
+            # disk decide whether this part is finished.
+            done = _settled(partial, final)
+            if done and info not in self.parts:
+                self.parts.append(info)
+            elif not done and info in self.parts:
+                self.parts.remove(info)
+            if done:
+                self._partial = None
+            raise
+        self._partial = None
+        _fsync_dir(final.parent)
 
     def finish(self) -> None:
         """End the open part; a one-part run takes the plain output name."""
@@ -554,19 +703,36 @@ class _PartSink:
             self.end_part()
         if len(self.parts) == 1:
             only = self.parts[0]
-            only.path.replace(self.output)
+            src = only.path
+            try:
+                self._place(src, self.output)
+            except BaseException:
+                if _settled(src, self.output):
+                    only.path = self.output
+                raise
             only.path = self.output
+            _fsync_dir(self.output.parent)
 
     def abort(self) -> None:
-        """Drop the unfinished part (if any); finished parts stay."""
+        """
+        Drop the unfinished part (if any); finished parts stay.
+
+        Never raises for a file-system problem: trouble is recorded in
+        ``cleanup_errors`` so it cannot hide the error that got us here.
+        """
         stream, self.writer, self._stream = self._stream, None, None
         if stream is not None:
             try:
                 stream.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                self.cleanup_errors.append(f'could not close part: {exc}')
         if self._partial is not None:
-            self._partial.unlink(missing_ok=True)
+            self.discarded = (self._partial, self._pings)
+            try:
+                self._partial.unlink(missing_ok=True)
+            except OSError as exc:
+                self.cleanup_errors.append(
+                    f'could not remove {self._partial}: {exc}')
             self._partial = None
 
 
@@ -641,13 +807,72 @@ def _convert(args, sink, counts) -> int:
     return total
 
 
+def _list_names(paths, indent='  ') -> str:
+    """Return the names, one per line; a long list is cut with a count."""
+    names = [p.name for p in paths]
+    lines = [f'{indent}{n}' for n in names[:_MAX_LISTED]]
+    if len(names) > _MAX_LISTED:
+        lines.append(f'{indent}... and {len(names) - _MAX_LISTED} more '
+                     f'({len(names)} files in all)')
+    return '\n'.join(lines)
+
+
+def _preflight(args) -> int | None:
+    """
+    Check the output location before the bag is read.
+
+    Returns an exit code (2) if the run must not start, else ``None``.
+    Nothing is written, apart from the output folder being created and a
+    temporary probe file that is removed again.
+    """
+    output = args.output
+    if output.is_dir():
+        print(f'error: --output is a directory: {output}', file=sys.stderr)
+        return 2
+    folder = output.parent
+    if folder.is_dir():
+        try:
+            existing = _old_files(output, [])
+        except OSError as exc:
+            print(f'error: cannot read output folder {folder}: {exc}',
+                  file=sys.stderr)
+            return 2
+        if existing and not args.overwrite:
+            print(
+                f'error: {len(existing)} file(s) for this output already '
+                f'exist in {folder}:\n{_list_names(existing)}\n'
+                'Nothing was written. Move them away, choose another '
+                '--output, or pass --overwrite to let this run replace the '
+                'files it produces.', file=sys.stderr)
+            return 2
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=folder):
+            pass
+    except OSError as exc:
+        print(f'error: output folder {folder} is not writable: {exc}',
+              file=sys.stderr)
+        return 2
+    return None
+
+
+def _best_effort(func, *a, **kw) -> None:
+    """Run a reporting step; a failure in it is noted, never raised."""
+    try:
+        func(*a, **kw)
+    except Exception as exc:    # noqa: BLE001 - must not mask the real error
+        print(f'warning: {func.__name__} failed: {exc!r}', file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``bag_to_xtf`` console script."""
     args = _parse_args(argv)
     if not args.bag.exists():
         print(f'error: bag not found: {args.bag}', file=sys.stderr)
         return 2
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    refused = _preflight(args)
+    if refused is not None:
+        return refused
     for message in args.split_warnings:
         print(f'warning: {message}', file=sys.stderr)
 
@@ -656,16 +881,28 @@ def main(argv: list[str] | None = None) -> int:
         'approx_tf': 0, 'malformed': 0, 'unpaired': 0, 'nadir': 0,
         'no_altitude': 0, 'out_of_window': 0,
     }
-    sink = _PartSink(args.output, args.sonar_name, args.layout)
+    sink = _PartSink(args.output, args.sonar_name, args.layout, args.overwrite)
     try:
         ping_count = _convert(args, sink, counts)
         sink.finish()
     except BaseException as exc:
+        # Say what went wrong first; nothing below may hide it.
+        print(f'error: conversion failed: {exc!r}', file=sys.stderr)
+        if isinstance(exc, FileExistsError):
+            print('error: a file appeared in the output folder during the '
+                  'run and was NOT replaced (pass --overwrite to allow '
+                  'that)', file=sys.stderr)
         # Finished parts stay; only the unfinished .partial is removed.
         sink.abort()
-        print(f'error: conversion failed: {exc!r}', file=sys.stderr)
-        _report_parts(sink.parts, header='finished parts kept')
-        _warn_old_files(args.output, sink.parts)
+        if sink.discarded is not None:
+            path, pings = sink.discarded
+            print(f'discarded unfinished part {path.name}: {pings} pings '
+                  'were in it and are not written anywhere')
+        for note in sink.cleanup_errors:
+            print(f'warning: {note}', file=sys.stderr)
+        _best_effort(_report_parts, sink.parts, header='finished parts kept')
+        _best_effort(_report_replaced, sink)
+        _best_effort(_warn_old_files, args.output, sink.parts)
         if isinstance(exc, OSError):
             return 1
         raise
@@ -674,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
         print('error: no pings written (check topics, nav/TF, sample_rate)',
               file=sys.stderr)
         _report(sink, ping_count, counts, args)
+        _warn_old_files(args.output, sink.parts)
         return 1
 
     _report(sink, ping_count, counts, args)
@@ -721,12 +959,21 @@ def _warn_old_files(output: Path, parts) -> None:
     old = _old_files(output, [p.path for p in parts])
     if not old:
         return
-    print('WARNING: files from an earlier run are still in '
-          f'{output.parent}; nothing was deleted:', file=sys.stderr)
-    for path in old:
-        print(f'  {path.name}', file=sys.stderr)
+    print(f'WARNING: {output.parent} now mixes files from two runs. These '
+          "files match this output's name pattern but were not written by "
+          f'this run ({len(old)} in all; not regenerated, nothing was '
+          'deleted):', file=sys.stderr)
+    print(_list_names(old), file=sys.stderr)
     print('  Remove them yourself if they are out of date, so they are not '
           'mixed up with the parts just written.', file=sys.stderr)
+
+
+def _report_replaced(sink) -> None:
+    """List the files of an earlier run that this run replaced."""
+    if sink.replaced:
+        print(f'replaced {len(sink.replaced)} file(s) of an earlier run '
+              '(--overwrite):')
+        print(_list_names(sink.replaced))
 
 
 def _report(sink, ping_count: int, counts: dict, args) -> None:
@@ -740,6 +987,7 @@ def _report(sink, ping_count: int, counts: dict, args) -> None:
     else:
         print(f'wrote {ping_count} XTF pings -> {sink.output}')
     _report_parts(parts, limit=args.split_bytes)
+    _report_replaced(sink)
     print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
           f' paired={counts["paired"]}')
     print(f'  dropped: no_tf={counts["no_tf"]} stale_tf={counts["stale_tf"]} '
