@@ -115,8 +115,11 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
 5. **Bounded hold, on bag record time.** The wait limit is `--tf-wait`
    (default 5 s), measured from the ping's own record time against the record
    time of the message just read (record time is monotone; stamps are not
-   used, so a bad stamp on any topic cannot flush the queue and the offset
-   cannot make a ping late). It is its own quantity: it must exceed
+   used, so a bad stamp on any topic cannot flush the queue). A negative
+   offset looks the pose up `|offset|` after the stamp, so the wait is
+   `--tf-wait + max(0, -offset)`: otherwise every ping would be `tf_late`
+   for a legitimate offset, whatever the cause looked like (review round 1).
+   It is its own quantity: it must exceed
    `--max-tf-gap` (usage error otherwise) and covers the 0.05 to 0.23 s
    bag-order lag seen on the real bag plus a missing-sample allowance. When
    it expires the ping is dropped as `settle(verdict)`. At the end of the bag
@@ -137,10 +140,13 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    at stamp - offset; ping time written = that`) and any transforms the
    tracker rejected. `approx_tf` and its note are removed.
 7. **`--end-time`**: the first ping past the end time is still counted in
-   `counts[side]` (as today) but stops admission without `break`; /tf keeps
-   being read only until the queue is empty (or the bag ends), then the
-   generator returns. Sonar and nadir messages after that point are not
-   counted.
+   `counts[side]` (as today) but stops admission without `break`. After that
+   point every message of any subscribed topic only advances the clock: /tf
+   is still fed, nothing else is counted, and the queue is resolved (so held
+   pings settle on the wait limit by record time, with no more /tf needed).
+   When the queue is empty the generator returns without reading the rest of
+   the bag (review round 1; before, a bag whose /tf stopped was read to the
+   end).
 8. **`--max-pings`**: unchanged consumer `break`/`close()`; the finally block
    discards the queue without counting it as `unpaired` or dropped (only the
    half-pair in `pending` counts, as today).

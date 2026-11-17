@@ -535,3 +535,61 @@ def test_a_ping_with_one_unresolvable_half_is_dropped_whole(
     assert _dropped(report)['unpaired'] == 0
     for ping, (port_ns, _) in zip(written, (pings[0], pings[3])):
         _check_pose(ping, track.geo_at(port_ns))
+
+
+def test_negative_offset_waits_for_the_transforms_it_looks_up(
+        tmp_path, monkeypatch, capsys):
+    # The lookup is 6 s after the stamp, so the transforms it needs are
+    # recorded more than the default 5 s of bag time after the ping. The
+    # wait is counted from the lookup time, so no ping is called late.
+    track = Track(140)
+    messages, stamps = track_messages(track, 60)
+    rc, out = _run(tmp_path, monkeypatch, messages, '--no-split',
+                   '--stamp-to-transmit-offset', '-6')
+    report = capsys.readouterr().out
+    assert rc == 0, report
+    assert _dropped(report)['tf_late'] == 0
+    pings = read_ping_headers(out)
+    assert len(pings) == 60
+    for stamp, ping in zip(stamps, pings):
+        _check_pose(ping, track.geo_at(stamp + 6 * _NS))
+
+
+def test_negative_offset_with_no_transforms_is_still_tf_late(
+        tmp_path, monkeypatch, capsys):
+    # The cause is still named: the transforms past the lookup never come.
+    track = Track(70)                      # ends at 6.9 s
+    messages, stamps = track_messages(track, 60)
+    rc, _ = _run(tmp_path, monkeypatch, messages, '--no-split',
+                 '--stamp-to-transmit-offset', '-6')
+    report = capsys.readouterr().out
+    assert rc == 0
+    assert _dropped(report)['tf_late'] > 0
+
+
+def test_pings_held_at_end_time_settle_without_reading_to_the_bag_end(
+        tmp_path, monkeypatch, capsys):
+    track = Track(70)
+    messages, stamps = track_messages(track, 60)
+    # /tf stops after sample 38; the pings up to the end time at ping 40 wait
+    # for samples that never come, and only sonar messages follow.
+    messages = [m for m in messages if not (
+        m[0] == '/tf' and m[1].transforms[0].header.stamp.sec * _NS
+        + m[1].transforms[0].header.stamp.nanosec > track.stamps[38])]
+    consumed = []
+
+    def reader(*a, **k):
+        for m in messages:
+            consumed.append(1)
+            yield m
+    monkeypatch.setattr(bag_to_xtf, 'iter_messages', reader)
+    bag = tmp_path / 'bag'
+    bag.mkdir()
+    end = stamps[40] + 10_000_000
+    rc = bag_to_xtf.main(base_args(
+        bag, tmp_path / 'out.xtf', '--no-split', '--tf-wait', '1.2',
+        '--end-time', f'{end / _NS:.6f}'))
+    report = capsys.readouterr().out
+    assert rc == 0
+    assert _dropped(report)['tf_late'] > 0
+    assert len(consumed) < len(messages) - 10
