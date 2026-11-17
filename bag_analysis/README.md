@@ -143,7 +143,101 @@ Other options: `--port-topic` / `--starboard-topic` / `--nadir-topic`,
 `--earth-frame` (default `earth`), `--pair-tolerance` (max |Δt| to pair
 port with starboard, default 0.25 s), `--max-tf-age` (drop pings whose
 only TF is older than this, default 1 s), and `--max-pings` (cap output,
-for quick checks).
+for quick checks; a value below 1 is rejected).
+
+### Splitting the output
+
+Big bags make big files (0.1 to 3.5 GB each for the Appledore exports),
+and some receiving tools fail above 2 GB. So `bag_to_xtf` splits its
+output into parts by default:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--split-size <MB>` | 500 | Start a new part before it would grow past this size. 1 MB is 10^6 bytes, so a part never exceeds the limit (except a single ping that is larger by itself, which gets a part alone). `0` turns the size limit off. |
+| `--split-duration <minutes>` | off | Start a new part when the current one covers this many minutes of pings. |
+| `--split-gap <seconds>` | 60 | Start a new part when more than this many seconds pass between two pings, for example when the sonar was switched off. `0` turns it off. |
+| `--no-split` | | One file, whatever its size, as before. Cannot be combined with the three options above. |
+| `--overwrite` | off | Let the run replace existing files of its output (see "Existing files" below). Without it the run refuses to start if any exist. |
+
+Negative, non-finite (`inf`, `nan`) and absurdly large values are
+rejected, as is a duration or gap that rounds to 0 ns. A size limit over 2 GB or smaller than one
+ping prints a warning. Whichever limit is reached first starts the next
+part, and the report says which one it was.
+
+Naming: a run that ends with one part writes the plain `--output` name,
+so existing scripts keep working. A run with several parts writes
+`<stem>_<UTC time of the part's first ping><suffix>`, for example
+`survey_20260615T150345Z.xtf`, and no plain-name file. Two parts that
+start in the same second get `_2`, `_3` and so on.
+
+Ping numbers, speed and the seconds-per-ping field run on across parts,
+so the pings of all parts joined together (everything after each file's
+1024-byte header) are byte for byte the pings of the unsplit file. One
+consequence: the first ping after a time gap carries a speed averaged
+over the gap (distance over the silent interval), just as in the
+unsplit file. Treat it as unreliable.
+
+The run report lists each part with its ping count, first and last ping
+time (UTC) and size.
+
+Each part is written to a `.partial` file, synced to disk and renamed
+when it is complete. If the run fails part way, the finished parts stay,
+only the unfinished `.partial` is deleted (the report says how many
+pings were in it), the finished parts are listed, and the exit status is
+non-zero.
+
+#### Existing files: refused unless `--overwrite`
+
+Before the bag is read, `bag_to_xtf` looks in the output folder for the
+plain `--output` file and for any file of this output's part-name
+pattern (the time-stamped parts, their `_2` variants and `.partial`
+leftovers). If there is any and `--overwrite` was not given, it prints
+the files (a long list is cut, with the count), writes nothing and exits
+with status 2. This also covers a `--max-pings` test run over a full
+export, and it is a change from the single-file behaviour before
+splitting: a rerun used to replace the plain output silently, now it
+refuses. `--output` that is a directory, or a folder that cannot be
+written, is refused up front the same way (status 2).
+
+With `--overwrite` the run replaces the files whose names it produces
+and the report lists every file it replaced. An old `.partial` is
+unlinked and created afresh, never opened for writing, so a symlink or a
+hard link under that name is removed as a name and its target (or the
+other link) is left alone; a finished part replaces an existing name by
+rename, which also swaps the name without writing through it. A
+one-part run goes through its time name before it takes the plain name,
+so an old file of that time name is replaced (and listed) too. Old files of the pattern that
+the run did not regenerate (for example the extra parts of an earlier,
+larger split) are never deleted; the run ends with a warning that the
+folder now mixes two runs and lists them. Remove them yourself when they
+are out of date.
+
+Without `--overwrite` a file that appears while the run is going is not
+replaced, with one caveat that depends on the filesystem. `.partial`
+files are always created exclusively. A finished part is then moved to
+its name by the first of these that the filesystem supports:
+
+1. a hard link followed by removing the `.partial`: atomic, fails if the
+   name exists (the normal case on local disks and most NAS shares);
+2. where hard links are not supported (FAT, some SMB shares), an atomic
+   no-replace rename (Linux `renameat2` with `RENAME_NOREPLACE`): the
+   same guarantee;
+3. where neither exists, a check that the name is free followed by a
+   rename. This is the only path with a gap: a file created in the
+   microseconds between the check and the rename would be replaced. The
+   up-front refusal has already ruled out every name that existed when
+   the run started.
+
+If the name is taken, the run fails with a non-zero status and the file
+that appeared is untouched. The finished part is complete data: it stays
+under its `.partial` name, and the report names it so you can rename it
+yourself. Parts already finished are listed as before. Syncing a part to
+disk is skipped on filesystems that cannot do it (`EINVAL`, `ENOSYS`,
+`ENOTSUP`); an I/O error while syncing still fails the run.
+
+If listing the folder or printing the summary fails after a complete
+conversion, the run still exits 0: the parts are written. It says so and
+says that the check for files of earlier runs could not be done.
 
 ## Schema
 

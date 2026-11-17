@@ -104,6 +104,7 @@ class XtfWriter:
         self._stream = stream
         self._layout = layout
         self._ping_count = 0
+        self._bytes_written = 0
         self._write_file_header(
             sonar_name, program_name, note,
             port_frequency_hz, starboard_frequency_hz,
@@ -113,6 +114,22 @@ class XtfWriter:
     def ping_count(self) -> int:
         """Return the number of ping packets written so far."""
         return self._ping_count
+
+    @property
+    def bytes_written(self) -> int:
+        """Return the number of bytes written so far, file header included."""
+        return self._bytes_written
+
+    @staticmethod
+    def ping_size(port: ChannelPing, starboard: ChannelPing) -> int:
+        """
+        Return the exact number of bytes ``write_ping`` will add.
+
+        Computed from the sample counts alone, so it costs no byte
+        conversion. The layout does not change the total.
+        """
+        return _ping_record_size(
+            np.asarray(port.samples).size, np.asarray(starboard.samples).size)
 
     # -- file header ------------------------------------------------------
     def _write_file_header(
@@ -136,7 +153,12 @@ class XtfWriter:
         # CHANINFO[0] = port, CHANINFO[1] = starboard.
         self._pack_chan_info(buf, 0, _CHAN_TYPE_PORT, 'PORT', port_freq)
         self._pack_chan_info(buf, 1, _CHAN_TYPE_STBD, 'STBD', stbd_freq)
-        self._stream.write(buf)
+        self._write(buf)
+
+    def _write(self, data) -> None:
+        """Write ``data`` to the stream and count its bytes."""
+        self._stream.write(data)
+        self._bytes_written += len(data)
 
     @staticmethod
     def _pack_chan_info(
@@ -183,11 +205,7 @@ class XtfWriter:
         n_port = len(port_bytes) // _BYTES_PER_SAMPLE
         n_stbd = len(stbd_bytes) // _BYTES_PER_SAMPLE
 
-        num_bytes_record = (
-            _PING_HEADER_LEN
-            + 2 * _PING_CHAN_HEADER_LEN
-            + len(port_bytes) + len(stbd_bytes)
-        )
+        num_bytes_record = _ping_record_size(n_port, n_stbd)
 
         header = bytearray(_PING_HEADER_LEN)
         struct.pack_into('<H', header, 0, _PING_MAGIC)
@@ -219,19 +237,19 @@ class XtfWriter:
         port_header = self._chan_header(0, n_port, port)
         stbd_header = self._chan_header(1, n_stbd, starboard)
 
-        self._stream.write(header)
+        self._write(header)
         if self._layout == LAYOUT_PINGMAPPER:
             # Contiguous: both channel headers, then both channels' samples.
-            self._stream.write(port_header)
-            self._stream.write(stbd_header)
-            self._stream.write(port_bytes)
-            self._stream.write(stbd_bytes)
+            self._write(port_header)
+            self._write(stbd_header)
+            self._write(port_bytes)
+            self._write(stbd_bytes)
         else:
             # Standard interleaved: each header immediately followed by its data.
-            self._stream.write(port_header)
-            self._stream.write(port_bytes)
-            self._stream.write(stbd_header)
-            self._stream.write(stbd_bytes)
+            self._write(port_header)
+            self._write(port_bytes)
+            self._write(stbd_header)
+            self._write(stbd_bytes)
         self._ping_count += 1
 
     @staticmethod
@@ -250,6 +268,15 @@ class XtfWriter:
         # (a float) written in the file header.
         struct.pack_into('<I', buf, 42, num_samples)              # NumSamples
         return bytes(buf)
+
+
+def _ping_record_size(n_port: int, n_stbd: int) -> int:
+    """Return the byte size of one two-channel ping packet."""
+    return (
+        _PING_HEADER_LEN
+        + 2 * _PING_CHAN_HEADER_LEN
+        + (n_port + n_stbd) * _BYTES_PER_SAMPLE
+    )
 
 
 def _samples_to_bytes(samples: np.ndarray) -> bytes:

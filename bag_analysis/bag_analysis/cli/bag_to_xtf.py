@@ -17,18 +17,49 @@ sensor frames (a self-contained ``bizzyboat_sonar`` bag does); a
 sidescan-only ``*_sidescan_raw`` bag has no nav and cannot be
 georeferenced.
 
-The output is written to a ``.partial`` sibling and atomically renamed
-into place only after a clean run, so a crash mid-stream never leaves a
-truncated-but-valid-looking XTF behind. A run that writes zero pings
-(wrong topics, no nav, all-malformed) exits non-zero.
+Output is split into parts so no file gets too big for the receiving
+tool: a new part starts when the next ping would push the file past
+``--split-size`` (default 500 MB), when the part has run longer than
+``--split-duration`` (default off), or when the sonar was silent for
+more than ``--split-gap`` seconds (default 60). ``--no-split`` writes one
+file. A run that ends with a single part keeps the plain ``--output``
+name; with several parts every part is named after the UTC time of its
+first ping (``survey_20260615T150345Z.xtf``).
+
+Each part is streamed to a ``.partial`` file, synced to disk and renamed
+into place once it is complete, so a crash never leaves a
+truncated-but-valid-looking XTF behind. After a failure the finished
+parts are kept and listed, and only the unfinished ``.partial`` is
+deleted.
+
+The run refuses to start (exit 2, nothing written) if the output folder
+already holds the plain ``--output`` file or any file of this output's
+part-name pattern (parts and ``.partial`` leftovers), unless
+``--overwrite`` is given. With ``--overwrite`` the run replaces the files
+whose names it produces and lists them (an old ``.partial`` is unlinked,
+never written through); files of the pattern that it did not regenerate
+are never deleted, only warned about. Without ``--overwrite`` a file that
+appears mid-run is not replaced: parts move into place by hard link, else
+by an atomic no-replace rename (Linux), and only where neither exists by a
+check followed by a rename. A finished part that cannot take its name is
+kept under its ``.partial`` name and reported.
+A run that writes zero pings (wrong topics, no nav, all-malformed) exits
+non-zero.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import datetime as _dt
+import errno
+import math
+import os
 from pathlib import Path
+import re
 import sys
+import tempfile
 
 import numpy as np
 from rclpy.duration import Duration
@@ -56,6 +87,18 @@ _DEFAULT_STBD = '/bizzy/sensors/sidescan/garmin_sidescan/sonar_image_starboard'
 _DEFAULT_NADIR = '/bizzy/sensors/sidescan/garmin_sidescan/nadir_depth'
 _DEFAULT_SOUND_SPEED = 1500.0
 _NS_PER_S = 1_000_000_000
+_DEFAULT_SPLIT_SIZE_MB = 500.0
+_DEFAULT_SPLIT_GAP_S = 60.0
+# File header (1024) + ping header (256) + two channel headers (2 x 64).
+_MIN_PING_FILE_BYTES = 1024 + 256 + 128
+_XTF_OFFSET_LIMIT = 2 ** 31
+# Largest accepted split limits; anything bigger is a typo, and 0 /
+# --no-split already mean "no limit".
+_MAX_SPLIT_SIZE_MB = 1e7
+_MAX_SPLIT_DURATION_MIN = 1e7
+_MAX_SPLIT_GAP_S = 1e9
+# How many file names an error message lists before saying "and N more".
+_MAX_LISTED = 10
 
 
 class _PendingPing:
@@ -128,6 +171,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Stop after writing this many ping packets (for testing)',
     )
     p.add_argument(
+        '--split-size', type=float, default=None, metavar='MB',
+        help=('Start a new output file before it would exceed this many MB '
+              '(1 MB = 10^6 bytes). Default 500; 0 turns the size limit off. '
+              'Many XTF tools fail on files over 2 GB.'),
+    )
+    p.add_argument(
+        '--split-duration', type=float, default=None, metavar='MINUTES',
+        help=('Start a new output file when the current one spans this many '
+              'minutes of pings. Default: off.'),
+    )
+    p.add_argument(
+        '--split-gap', type=float, default=None, metavar='SECONDS',
+        help=('Start a new output file when more than this many seconds pass '
+              'between consecutive pings. Default 60; 0 turns it off.'),
+    )
+    p.add_argument(
+        '--no-split', action='store_true',
+        help=('Write a single output file, whatever its size. Cannot be '
+              'combined with --split-size, --split-duration or --split-gap.'),
+    )
+    p.add_argument(
+        '--overwrite', action='store_true',
+        help=('Allow replacing files in the output folder. Without it the '
+              'run refuses to start if the plain --output file or any file '
+              "of this output's part-name pattern (parts, .partial "
+              'leftovers) already exists. With it, the files this run '
+              'produces replace same-named ones and are listed; other old '
+              'files of the pattern are only warned about, never deleted.'),
+    )
+    p.add_argument(
         '--layout', choices=(LAYOUT_STANDARD, LAYOUT_PINGMAPPER),
         default=LAYOUT_STANDARD,
         help=(
@@ -139,6 +212,80 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     return p
+
+
+def _parse_args(argv):
+    """
+    Parse ``argv`` and resolve the split limits.
+
+    Adds ``split_bytes``, ``split_duration_ns`` and ``split_gap_ns`` to the
+    namespace (``None`` = that limit is off) and ``split_warnings`` (messages
+    to print before the run starts).
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    caps = {
+        'split_size': _MAX_SPLIT_SIZE_MB,
+        'split_duration': _MAX_SPLIT_DURATION_MIN,
+        'split_gap': _MAX_SPLIT_GAP_S,
+    }
+    for name, cap in caps.items():
+        value = getattr(args, name)
+        flag = f'--{name.replace("_", "-")}'
+        if value is None:
+            continue
+        if not math.isfinite(value):
+            parser.error(f'{flag} must be a finite number')
+        if value < 0.0:
+            parser.error(f'{flag} must not be negative')
+        if value > cap:
+            parser.error(
+                f'{flag} {value:g} is absurdly large (maximum {cap:g}); use '
+                '0 or --no-split to remove a limit')
+    if args.max_pings is not None and args.max_pings < 1:
+        parser.error('--max-pings must be at least 1')
+    explicit = [
+        f'--{n.replace("_", "-")}'
+        for n in ('split_size', 'split_duration', 'split_gap')
+        if getattr(args, n) is not None]
+    if args.no_split and explicit:
+        parser.error(
+            f'--no-split cannot be combined with {", ".join(explicit)}')
+
+    size_mb = _DEFAULT_SPLIT_SIZE_MB if args.split_size is None \
+        else args.split_size
+    gap_s = _DEFAULT_SPLIT_GAP_S if args.split_gap is None \
+        else args.split_gap
+    duration_min = args.split_duration
+    args.split_bytes = None
+    args.split_duration_ns = None
+    args.split_gap_ns = None
+    args.split_warnings = []
+    if args.no_split:
+        return args
+    if size_mb > 0:
+        args.split_bytes = int(size_mb * 1_000_000)
+        if args.split_bytes < _MIN_PING_FILE_BYTES:
+            args.split_warnings.append(
+                f'--split-size {size_mb} MB is smaller than a file header '
+                'plus one ping; every ping will get its own part')
+        if args.split_bytes > _XTF_OFFSET_LIMIT:
+            args.split_warnings.append(
+                f'--split-size {size_mb} MB is over 2 GB; many XTF tools '
+                'use 32-bit file offsets and cannot read parts that large')
+    if duration_min:
+        args.split_duration_ns = round(duration_min * 60 * _NS_PER_S)
+        if args.split_duration_ns < 1:
+            parser.error(
+                f'--split-duration {duration_min:g} rounds to 0 ns; every '
+                'ping would start a new part')
+    if gap_s > 0:
+        args.split_gap_ns = round(gap_s * _NS_PER_S)
+        if args.split_gap_ns < 1:
+            parser.error(
+                f'--split-gap {gap_s:g} rounds to 0 ns; every ping would '
+                'start a new part')
+    return args
 
 
 def _decode_samples(msg) -> np.ndarray:
@@ -278,8 +425,17 @@ def _seconds_per_ping(prev: _PendingPing | None, cur: _PendingPing) -> float:
     return dt
 
 
-def _convert(args, stream, counts) -> int:
-    """Run the read/georeference/pair/write loop; return pings written."""
+def _iter_pings(args, counts):
+    """
+    Read the bag and yield ``(port, starboard, altitude)`` per paired ping.
+
+    Owns everything up to the write: the TF buffer, nadir tracking, the
+    ``--start-time``/``--end-time`` window, georeferencing and port/
+    starboard pairing. ``altitude`` is the latest nadir range seen so far
+    (``None`` before the first one). The pending pair is cleared before
+    each ``yield`` so a consumer that stops early (``--max-pings``) does
+    not see the just-yielded pair counted as ``unpaired``.
+    """
     buffer = Buffer(cache_time=Duration(seconds=args.tf_cache))
     topics = [
         '/tf', '/tf_static', args.port_topic, args.starboard_topic,
@@ -290,141 +446,665 @@ def _convert(args, stream, counts) -> int:
     start_ns = _parse_time(args.start_time)
     end_ns = _parse_time(args.end_time)
 
-    writer = XtfWriter(
-        stream, sonar_name=args.sonar_name, layout=args.layout)
     pending: dict = {'port': None, 'starboard': None}
     latest_altitude = None
+    try:
+        for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
+            if topic == '/tf':
+                for tr in msg.transforms:
+                    buffer.set_transform(tr, 'bag_to_xtf')
+                continue
+            if topic == '/tf_static':
+                for tr in msg.transforms:
+                    buffer.set_transform_static(tr, 'bag_to_xtf')
+                continue
+            if topic == args.nadir_topic:
+                latest_altitude = float(msg.range)
+                counts['nadir'] += 1
+                continue
+
+            if topic == args.port_topic:
+                side = 'port'
+            elif topic == args.starboard_topic:
+                side = 'starboard'
+            else:
+                continue
+            counts[side] += 1
+
+            # Time-window trim (e.g. dock-out to dock-in). TF/nadir are fed
+            # regardless above; only sidescan pings are gated. The bag is
+            # time-ordered, so once past end_ns nothing more is needed.
+            eff_ns = _stamp_ns(msg.header.stamp) or t_ns
+            if start_ns is not None and eff_ns < start_ns:
+                counts['out_of_window'] += 1
+                continue
+            if end_ns is not None and eff_ns > end_ns:
+                break
+
+            if float(msg.sample_rate) <= 0.0:
+                counts['malformed'] += 1
+                continue
+
+            pose, status = _lookup_pose(
+                buffer, msg.header.frame_id, args.earth_frame,
+                msg.header.stamp, max_tf_age_ns)
+            if pose is None:
+                counts['no_tf' if status == 'missing' else 'stale_tf'] += 1
+                continue
+            if status == 'approx':
+                counts['approx_tf'] += 1
+            ping = _make_pending(msg, t_ns, pose)
+
+            other = 'starboard' if side == 'port' else 'port'
+            mate = pending[other]
+            if mate is not None and abs(ping.t_ns - mate.t_ns) <= pair_tol_ns:
+                port, stbd = (ping, mate) if side == 'port' else (mate, ping)
+                pending['port'] = pending['starboard'] = None
+                yield port, stbd, latest_altitude
+            else:
+                if pending[side] is not None:
+                    counts['unpaired'] += 1  # discarded; mate never arrived
+                pending[side] = ping
+    finally:
+        counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
+
+
+def _utc_label(when: _dt.datetime) -> str:
+    """Return ``YYYYmmddTHHMMSSZ`` for a UTC datetime."""
+    return when.strftime('%Y%m%dT%H%M%SZ')
+
+
+def _utc_iso(when: _dt.datetime) -> str:
+    """Return ``YYYY-mm-ddTHH:MM:SSZ`` for a UTC datetime."""
+    return when.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class _PartInfo:
+    """A finished part: where it is and what it holds."""
+
+    def __init__(self, path, pings, first, last, size, reason) -> None:
+        """Record the part's path, ping count, time span, size and cause."""
+        self.path = path
+        self.pings = pings
+        self.first = first
+        self.last = last
+        self.size = size
+        self.reason = reason    # why this part started (None for part 1)
+
+
+def _fsync_dir(path: Path) -> None:
+    """Flush a directory entry to disk, best effort (not all systems can)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _settled(src: Path, dst: Path) -> bool:
+    """
+    Return True if moving ``src`` to ``dst`` has in fact completed.
+
+    Used after an interrupted move to find out what the disk says. A
+    hard-link move interrupted between the link and the unlink leaves
+    both names on one file; the leftover ``src`` is removed here.
+    """
+    try:
+        if not os.path.lexists(src):
+            return os.path.lexists(dst)
+        if os.path.lexists(dst) and os.path.samefile(src, dst):
+            src.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+# fsync results that mean "this filesystem cannot do it" (some FUSE and
+# SMB mounts), as opposed to EIO and friends, which mean data may be lost.
+_FSYNC_UNSUPPORTED = frozenset(
+    {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP})
+# Errors of a no-replace rename that mean "not available here": try the
+# next way. Anything else (EEXIST aside) is a real failure.
+_NOREPLACE_UNSUPPORTED = frozenset(
+    {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP,
+     errno.EPERM, errno.EXDEV, errno.ENOTTY})
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
+
+def _fsync_file(stream) -> None:
+    """Sync a file; tolerate filesystems that cannot, keep EIO fatal."""
+    try:
+        os.fsync(stream.fileno())
+    except OSError as exc:
+        if exc.errno not in _FSYNC_UNSUPPORTED:
+            raise
+
+
+def _get_renameat2():
+    """Return libc ``renameat2`` (Linux), or None if it is not there."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c') or None,
+                           use_errno=True)
+        func = libc.renameat2
+    except (OSError, AttributeError):
+        return None
+    func.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                     ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    func.restype = ctypes.c_int
+    return func
+
+
+def _rename_noreplace(src: Path, dst: Path) -> bool:
+    """
+    Rename ``src`` to ``dst`` atomically, failing if ``dst`` exists.
+
+    Returns True when done. Raises ``FileExistsError`` if ``dst`` exists.
+    Returns False if the kernel, libc or filesystem cannot do an atomic
+    no-replace rename, so the caller must try something else.
+    """
+    func = _get_renameat2()
+    if func is None:
+        return False
+    result = func(_AT_FDCWD, os.fsencode(src), _AT_FDCWD, os.fsencode(dst),
+                  _RENAME_NOREPLACE)
+    if result == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(errno.EEXIST, 'File exists', str(dst))
+    if err in _NOREPLACE_UNSUPPORTED:
+        return False
+    raise OSError(err, os.strerror(err), str(dst))
+
+
+class _PartSink:
+    """
+    Write pings into a series of part files.
+
+    A part is opened lazily, when its first ping is in hand, as a
+    ``.partial`` named after that ping's UTC time. ``end_part`` syncs and
+    closes it and moves it to its final time name. ``finish`` moves the
+    only part of a one-part run to the plain output name. ``abort``
+    removes the unfinished ``.partial`` and leaves the finished parts
+    alone.
+
+    Without ``overwrite`` ``.partial`` files are opened exclusively and a
+    part is moved into place without replacing: by hard link (atomic),
+    else by an atomic no-replace rename (Linux ``renameat2``), else, only
+    if neither exists on this filesystem, by a check followed by a
+    rename, which leaves a window of microseconds. With ``overwrite`` an
+    existing ``.partial`` is unlinked (never opened, so a symlink or hard
+    link is never written through) and recorded in ``replaced``; a final
+    move replaces by rename, which swaps the name and never writes
+    through it.
+
+    A finished part whose final name was taken meanwhile stays under its
+    ``.partial`` name and is listed in ``kept``.
+    """
+
+    def __init__(
+            self, output: Path, sonar_name: str, layout: str,
+            overwrite: bool = False) -> None:
+        """Remember where to write; nothing is created yet."""
+        self.output = output
+        self._sonar_name = sonar_name
+        self._layout = layout
+        self._overwrite = overwrite
+        self.parts: list[_PartInfo] = []
+        self.replaced: list[Path] = []
+        self.kept: list[tuple[Path, _PartInfo]] = []
+        self.discarded: tuple[Path, int] | None = None
+        self.cleanup_errors: list[str] = []
+        self._names: set[str] = set()
+        self._stream = None
+        self._partial: Path | None = None
+        self._final: Path | None = None
+        self._pings = 0
+        self._first = self._last = None
+        self._first_t_ns = 0
+        self._reason = None
+        self.writer: XtfWriter | None = None
+
+    @property
+    def is_open(self) -> bool:
+        """Return True while a part is being written."""
+        return self.writer is not None
+
+    @property
+    def first_t_ns(self) -> int:
+        """Return the stamp (ns) of the open part's first ping."""
+        return self._first_t_ns
+
+    def _final_path(self, when: _dt.datetime) -> Path:
+        stem, suffix = self.output.stem, self.output.suffix
+        base = f'{stem}_{_utc_label(when)}'
+        name = f'{base}{suffix}'
+        n = 2
+        while name in self._names:
+            name = f'{base}_{n}{suffix}'
+            n += 1
+        self._names.add(name)
+        return self.output.with_name(name)
+
+    def start_part(self, when, t_ns, reason) -> None:
+        """Open the next part, named after its first ping at ``when``."""
+        final = self._final_path(when)
+        partial = final.with_name(final.name + '.partial')
+        if self._overwrite and os.path.lexists(partial):
+            # Never open an existing name for writing: that would follow
+            # a symlink or truncate a hard-linked inode. Remove the name
+            # (the link, not its target), then create it afresh.
+            partial.unlink()
+            self.replaced.append(partial)
+        stream = open(partial, 'xb')        # never truncate a foreign file
+        # Only now is the .partial ours; abort() must not touch it before.
+        self._final, self._partial, self._stream = final, partial, stream
+        self._pings = 0
+        self.writer = XtfWriter(
+            stream, sonar_name=self._sonar_name, layout=self._layout)
+        self._first = self._last = when
+        self._first_t_ns = t_ns
+        self._reason = reason
+
+    def write_ping(self, **kwargs) -> None:
+        """Write one ping into the open part."""
+        self.writer.write_ping(**kwargs)
+        self._pings += 1
+        self._last = kwargs['time']
+
+    def _place(self, src: Path, dst: Path) -> None:
+        """Move ``src`` to ``dst``; replace an existing ``dst`` only if allowed."""
+        if self._overwrite:
+            existed = os.path.lexists(dst)
+            os.replace(src, dst)    # swaps the name; never writes through it
+            if existed:
+                self.replaced.append(dst)
+            return
+        try:
+            os.link(src, dst)
+        except FileExistsError:
+            raise
+        except OSError:
+            # No hard links here. Next best: an atomic no-replace rename.
+            if _rename_noreplace(src, dst):
+                return
+            # Last resort: check, then rename. A file created in between
+            # is replaced (a window of microseconds).
+            if os.path.lexists(dst):
+                raise FileExistsError(
+                    errno.EEXIST, 'File exists', str(dst)) from None
+            os.replace(src, dst)
+            return
+        os.unlink(src)
+
+    def end_part(self) -> None:
+        """Sync and close the open part and move it to its final time name."""
+        writer, stream = self.writer, self._stream
+        self.writer = self._stream = None
+        try:
+            stream.flush()
+            _fsync_file(stream)
+        finally:
+            stream.close()
+        partial, final = self._partial, self._final
+        info = _PartInfo(
+            final, writer.ping_count, self._first, self._last,
+            writer.bytes_written, self._reason)
+        try:
+            self.parts.append(info)
+            self._place(partial, final)
+        except BaseException as exc:
+            # An interrupt can land on either side of the move: let the
+            # disk decide whether this part is finished.
+            done = _settled(partial, final)
+            if done and info not in self.parts:
+                self.parts.append(info)
+            elif not done and info in self.parts:
+                self.parts.remove(info)
+            if done:
+                self._partial = None
+            elif isinstance(exc, FileExistsError):
+                # The part is complete and synced; only its name was
+                # taken. Keep the data under its .partial name.
+                self.kept.append((partial, info))
+                self._partial = None
+            raise
+        self._partial = None
+        _fsync_dir(final.parent)
+
+    def finish(self) -> None:
+        """End the open part; a one-part run takes the plain output name."""
+        if self.is_open:
+            self.end_part()
+        if len(self.parts) == 1:
+            only = self.parts[0]
+            src = only.path
+            try:
+                self._place(src, self.output)
+            except BaseException:
+                if _settled(src, self.output):
+                    only.path = self.output
+                raise
+            only.path = self.output
+            _fsync_dir(self.output.parent)
+
+    def abort(self) -> None:
+        """
+        Drop the unfinished part (if any); finished parts stay.
+
+        Never raises for a file-system problem: trouble is recorded in
+        ``cleanup_errors`` so it cannot hide the error that got us here.
+        """
+        stream, self.writer, self._stream = self._stream, None, None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError as exc:
+                self.cleanup_errors.append(f'could not close part: {exc}')
+        if self._partial is not None:
+            self.discarded = (self._partial, self._pings)
+            try:
+                self._partial.unlink(missing_ok=True)
+            except OSError as exc:
+                self.cleanup_errors.append(
+                    f'could not remove {self._partial}: {exc}')
+            self._partial = None
+
+
+def _rollover_reason(args, sink, prev_t_ns, t_ns, ping_bytes):
+    """
+    Return why the next ping must start a new part, or ``None``.
+
+    Compared in integer nanoseconds against the previous *emitted* ping.
+    The first limit reached wins: gap, then duration, then size.
+    """
+    if (args.split_gap_ns is not None and prev_t_ns is not None
+            and t_ns - prev_t_ns > args.split_gap_ns):
+        return 'gap'
+    if (args.split_duration_ns is not None
+            and t_ns - sink.first_t_ns >= args.split_duration_ns):
+        return 'duration'
+    writer = sink.writer
+    if (args.split_bytes is not None and writer.ping_count > 0
+            and writer.bytes_written + ping_bytes > args.split_bytes):
+        return 'size'
+    return None
+
+
+def _convert(args, sink, counts) -> int:
+    """Write every paired ping from the bag into parts; return the count."""
+    total = 0
     prev_emitted = None
 
-    def emit(port: _PendingPing, stbd: _PendingPing) -> None:
-        nonlocal prev_emitted
-        speed = _speed_mps(prev_emitted, port) if prev_emitted else 0.0
-        seconds_per_ping = _seconds_per_ping(prev_emitted, port)
-        if latest_altitude is None:
-            counts['no_altitude'] += 1
-        writer.write_ping(
-            time=port.time, ping_number=writer.ping_count,
-            latitude_deg=port.lat, longitude_deg=port.lon,
-            sensor_depth_m=0.0, altitude_m=latest_altitude or 0.0,
-            heading_deg=port.heading, pitch_deg=port.pitch,
-            roll_deg=port.roll, speed_mps=speed,
-            sound_velocity_mps=port.sound_velocity,
-            port=ChannelPing(
+    pings = _iter_pings(args, counts)
+    try:
+        for port, stbd, altitude in pings:
+            speed = _speed_mps(prev_emitted, port) if prev_emitted else 0.0
+            seconds_per_ping = _seconds_per_ping(prev_emitted, port)
+            if altitude is None:
+                counts['no_altitude'] += 1
+            port_chan = ChannelPing(
                 samples=port.samples, slant_range_m=port.slant_range,
                 frequency_hz=port.frequency, time_delay_s=port.time_delay,
                 time_duration_s=port.time_duration,
-                seconds_per_ping=seconds_per_ping),
-            starboard=ChannelPing(
+                seconds_per_ping=seconds_per_ping)
+            stbd_chan = ChannelPing(
                 samples=stbd.samples, slant_range_m=stbd.slant_range,
                 frequency_hz=stbd.frequency, time_delay_s=stbd.time_delay,
                 time_duration_s=stbd.time_duration,
-                seconds_per_ping=seconds_per_ping),
-        )
-        counts['paired'] += 1
-        prev_emitted = port
+                seconds_per_ping=seconds_per_ping)
 
-    for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
-        if topic == '/tf':
-            for tr in msg.transforms:
-                buffer.set_transform(tr, 'bag_to_xtf')
-            continue
-        if topic == '/tf_static':
-            for tr in msg.transforms:
-                buffer.set_transform_static(tr, 'bag_to_xtf')
-            continue
-        if topic == args.nadir_topic:
-            latest_altitude = float(msg.range)
-            counts['nadir'] += 1
-            continue
+            reason = None
+            if sink.is_open:
+                reason = _rollover_reason(
+                    args, sink, prev_emitted.t_ns if prev_emitted else None,
+                    port.t_ns, XtfWriter.ping_size(port_chan, stbd_chan))
+                if reason:
+                    sink.end_part()
+            if not sink.is_open:
+                sink.start_part(port.time, port.t_ns, reason)
 
-        if topic == args.port_topic:
-            side = 'port'
-        elif topic == args.starboard_topic:
-            side = 'starboard'
-        else:
-            continue
-        counts[side] += 1
+            sink.write_ping(
+                time=port.time, ping_number=total,
+                latitude_deg=port.lat, longitude_deg=port.lon,
+                sensor_depth_m=0.0, altitude_m=altitude or 0.0,
+                heading_deg=port.heading, pitch_deg=port.pitch,
+                roll_deg=port.roll, speed_mps=speed,
+                sound_velocity_mps=port.sound_velocity,
+                port=port_chan, starboard=stbd_chan)
+            total += 1
+            counts['paired'] += 1
+            prev_emitted = port
+            if args.max_pings is not None and total >= args.max_pings:
+                break
+    finally:
+        pings.close()
+    return total
 
-        # Time-window trim (e.g. dock-out to dock-in). TF/nadir are fed
-        # regardless above; only sidescan pings are gated. The bag is
-        # time-ordered, so once past end_ns nothing more is needed.
-        eff_ns = _stamp_ns(msg.header.stamp) or t_ns
-        if start_ns is not None and eff_ns < start_ns:
-            counts['out_of_window'] += 1
-            continue
-        if end_ns is not None and eff_ns > end_ns:
-            break
 
-        if float(msg.sample_rate) <= 0.0:
-            counts['malformed'] += 1
-            continue
+def _list_names(paths, indent='  ') -> str:
+    """Return the names, one per line; a long list is cut with a count."""
+    names = [p.name for p in paths]
+    lines = [f'{indent}{n}' for n in names[:_MAX_LISTED]]
+    if len(names) > _MAX_LISTED:
+        lines.append(f'{indent}... and {len(names) - _MAX_LISTED} more '
+                     f'({len(names)} files in all)')
+    return '\n'.join(lines)
 
-        pose, status = _lookup_pose(
-            buffer, msg.header.frame_id, args.earth_frame,
-            msg.header.stamp, max_tf_age_ns)
-        if pose is None:
-            counts['no_tf' if status == 'missing' else 'stale_tf'] += 1
-            continue
-        if status == 'approx':
-            counts['approx_tf'] += 1
-        ping = _make_pending(msg, t_ns, pose)
 
-        other = 'starboard' if side == 'port' else 'port'
-        mate = pending[other]
-        if mate is not None and abs(ping.t_ns - mate.t_ns) <= pair_tol_ns:
-            port, stbd = (ping, mate) if side == 'port' else (mate, ping)
-            emit(port, stbd)
-            pending['port'] = pending['starboard'] = None
-        else:
-            if pending[side] is not None:
-                counts['unpaired'] += 1  # discarded; mate never arrived
-            pending[side] = ping
+def _preflight(args) -> int | None:
+    """
+    Check the output location before the bag is read.
 
-        if args.max_pings is not None and writer.ping_count >= args.max_pings:
-            break
+    Returns an exit code (2) if the run must not start, else ``None``.
+    Nothing is written, apart from the output folder being created and a
+    temporary probe file that is removed again.
+    """
+    output = args.output
+    if output.is_dir():
+        print(f'error: --output is a directory: {output}', file=sys.stderr)
+        return 2
+    folder = output.parent
+    if folder.is_dir():
+        try:
+            existing = _old_files(output, [])
+        except OSError as exc:
+            print(f'error: cannot read output folder {folder}: {exc}',
+                  file=sys.stderr)
+            return 2
+        if existing and not args.overwrite:
+            print(
+                f'error: {len(existing)} file(s) for this output already '
+                f'exist in {folder}:\n{_list_names(existing)}\n'
+                'Nothing was written. Move them away, choose another '
+                '--output, or pass --overwrite to let this run replace the '
+                'files it produces.', file=sys.stderr)
+            return 2
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=folder):
+            pass
+    except OSError as exc:
+        print(f'error: output folder {folder} is not writable: {exc}',
+              file=sys.stderr)
+        return 2
+    return None
 
-    counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
-    return writer.ping_count
+
+def _best_effort(func, *a, **kw) -> None:
+    """Run a reporting step; a failure in it is noted, never raised."""
+    try:
+        func(*a, **kw)
+    except Exception as exc:    # noqa: BLE001 - must not mask the real error
+        print(f'warning: {func.__name__} failed: {exc!r}', file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``bag_to_xtf`` console script."""
-    args = _build_parser().parse_args(argv)
+    args = _parse_args(argv)
     if not args.bag.exists():
         print(f'error: bag not found: {args.bag}', file=sys.stderr)
         return 2
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    refused = _preflight(args)
+    if refused is not None:
+        return refused
+    for message in args.split_warnings:
+        print(f'warning: {message}', file=sys.stderr)
 
     counts = {
         'port': 0, 'starboard': 0, 'paired': 0, 'no_tf': 0, 'stale_tf': 0,
         'approx_tf': 0, 'malformed': 0, 'unpaired': 0, 'nadir': 0,
         'no_altitude': 0, 'out_of_window': 0,
     }
-    # Write to a sibling .partial and rename on success, so a crash never
-    # leaves a truncated file at the destination path.
-    partial = args.output.with_name(args.output.name + '.partial')
+    sink = _PartSink(args.output, args.sonar_name, args.layout, args.overwrite)
     try:
-        with open(partial, 'wb') as stream:
-            ping_count = _convert(args, stream, counts)
-    except BaseException:
-        partial.unlink(missing_ok=True)
+        ping_count = _convert(args, sink, counts)
+        sink.finish()
+    except BaseException as exc:
+        # Say what went wrong first; nothing below may hide it.
+        print(f'error: conversion failed: {exc!r}', file=sys.stderr)
+        if isinstance(exc, FileExistsError):
+            print('error: a file appeared in the output folder during the '
+                  'run and was NOT replaced (pass --overwrite to allow '
+                  'that)', file=sys.stderr)
+        # Finished parts stay; only the unfinished .partial is removed.
+        sink.abort()
+        if sink.discarded is not None:
+            path, pings = sink.discarded
+            print(f'discarded unfinished part {path.name}: {pings} pings '
+                  'were in it and are not written anywhere')
+        for note in sink.cleanup_errors:
+            print(f'warning: {note}', file=sys.stderr)
+        _best_effort(_report_parts, sink.parts, header='finished parts kept')
+        _best_effort(_report_kept, sink)
+        _best_effort(_report_replaced, sink)
+        _check_old_files(args.output, sink)
+        if isinstance(exc, OSError):
+            return 1
         raise
 
     if ping_count == 0:
-        partial.unlink(missing_ok=True)
         print('error: no pings written (check topics, nav/TF, sample_rate)',
               file=sys.stderr)
-        _report(args.output, ping_count, counts)
+        _summarize(sink, ping_count, counts, args)
+        _check_old_files(args.output, sink)
         return 1
 
-    partial.replace(args.output)
-    _report(args.output, ping_count, counts)
+    _summarize(sink, ping_count, counts, args)
+    _check_old_files(args.output, sink)
     return 0
 
 
-def _report(output: Path, ping_count: int, counts: dict) -> None:
+def _summarize(sink, ping_count, counts, args) -> None:
+    """Print the summary; if that fails, still say the parts are written."""
+    try:
+        _report(sink, ping_count, counts, args)
+    except Exception as exc:    # noqa: BLE001 - the data is already safe
+        print(f'warning: the summary could not be printed ({exc!r}); the '
+              f'{len(sink.parts)} part(s) were written:', file=sys.stderr)
+        _best_effort(_report_parts, sink.parts)
+
+
+def _check_old_files(output: Path, sink) -> None:
+    """Warn about old files; a listing error is reported, never raised."""
+    try:
+        _warn_old_files(output, sink.parts, [p for p, _ in sink.kept])
+    except Exception as exc:    # noqa: BLE001 - must not undo a finished run
+        print(f'warning: the check for files of earlier runs could not be '
+              f'done ({exc!r}); the output folder may hold old files that '
+              'mix with the parts just written', file=sys.stderr)
+
+
+def _mb(size: int) -> str:
+    return f'{size:,} bytes ({size / 1e6:.1f} MB)'
+
+
+def _report_parts(parts, *, header=None, limit=None) -> None:
+    """Print one line per part: file, pings, time span, size."""
+    if header:
+        print(f'{header}: {len(parts)}')
+    for n, part in enumerate(parts, 1):
+        note = ''
+        if part.reason:
+            note = f'  (new part: {part.reason})'
+        if limit is not None and part.size > limit:
+            note += '  (over the size limit: a single ping)'
+        print(f'  part {n}: {part.path.name}  pings={part.pings}  '
+              f'{_utc_iso(part.first)} to {_utc_iso(part.last)}  '
+              f'{_mb(part.size)}{note}')
+
+
+def _old_files(output: Path, written) -> list[Path]:
+    """Return files from earlier runs that this run did not write."""
+    stem, suffix = re.escape(output.stem), re.escape(output.suffix)
+    part_re = re.compile(
+        rf'{stem}_\d{{8}}T\d{{6}}Z(_\d+)?{suffix}(\.partial)?')
+    keep = {p.name for p in written}
+    found = []
+    for path in sorted(output.parent.iterdir()):
+        if path.name in keep:
+            continue
+        if (part_re.fullmatch(path.name)
+                or path.name in (output.name, output.name + '.partial')):
+            found.append(path)
+    return found
+
+
+def _warn_old_files(output: Path, parts, kept=()) -> None:
+    """Warn about earlier runs' files next to the output; delete nothing."""
+    old = _old_files(output, [p.path for p in parts] + list(kept))
+    if not old:
+        return
+    print(f'WARNING: {output.parent} now mixes files from two runs. These '
+          "files match this output's name pattern but were not written by "
+          f'this run ({len(old)} in all; not regenerated, nothing was '
+          'deleted):', file=sys.stderr)
+    print(_list_names(old), file=sys.stderr)
+    print('  Remove them yourself if they are out of date, so they are not '
+          'mixed up with the parts just written.', file=sys.stderr)
+
+
+def _report_kept(sink) -> None:
+    """List complete parts left under their .partial name."""
+    if not sink.kept:
+        return
+    print(f'{len(sink.kept)} finished part(s) could not take their final '
+          'name (another file appeared there during the run, and was not '
+          'replaced). They are complete data and were left under their '
+          '.partial name; rename them yourself:')
+    for path, info in sink.kept:
+        print(f'  {path.name}  pings={info.pings}  '
+              f'{_utc_iso(info.first)} to {_utc_iso(info.last)}  '
+              f'{_mb(info.size)}')
+
+
+def _report_replaced(sink) -> None:
+    """List the files of an earlier run that this run replaced."""
+    if sink.replaced:
+        print(f'replaced {len(sink.replaced)} file(s) of an earlier run '
+              '(--overwrite):')
+        print(_list_names(sink.replaced))
+
+
+def _report(sink, ping_count: int, counts: dict, args) -> None:
     """Print a conversion summary, including any data loss."""
-    print(f'wrote {ping_count} XTF pings -> {output}')
+    parts = sink.parts
+    if len(parts) == 1:
+        print(f'wrote {ping_count} XTF pings -> {parts[0].path}')
+    elif parts:
+        print(f'wrote {ping_count} XTF pings in {len(parts)} parts '
+              f'-> {sink.output.parent}')
+    else:
+        print(f'wrote {ping_count} XTF pings -> {sink.output}')
+    _report_parts(parts, limit=args.split_bytes)
+    _report_replaced(sink)
     print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
           f' paired={counts["paired"]}')
     print(f'  dropped: no_tf={counts["no_tf"]} stale_tf={counts["stale_tf"]} '
