@@ -58,7 +58,7 @@ New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small syn
 | `bag_analysis/bag_analysis/cli/bag_to_xtf.py` | `_iter_pings` generator, `_PartSink`, split options and validation, lazy naming, failure handling, old-file warning, report |
 | `bag_analysis/bag_analysis/xtf/writer.py` | `ping_size`, `bytes_written` |
 | `bag_analysis/test/test_xtf_writer.py` | size tests |
-| `bag_analysis/test/test_xtf_cli.py` or `test_xtf_golden.py` (new) + golden data | characterization test |
+| `bag_analysis/test/test_xtf_golden.py` (new), `test/data/xtf_golden_single.xtf`, `test/xtf_fakes.py` (shared synthetic bag stream) | characterization test and fake-bag helper |
 | `bag_analysis/test/test_xtf_split.py` (new) | split tests above |
 | `bag_analysis/README.md` | `bag_to_xtf` section |
 
@@ -94,6 +94,15 @@ New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small syn
 
 Resolved by the owner: stale files are warned about, never deleted; option names as above; MB = 10^6 bytes. Remaining:
 - Is 60 s a good gap default? Confirm against real bags in step 9.
+
+## Implementation Notes (deviations)
+
+- The golden test runs with the default limits (a small run is one part) rather than `--no-split`, because the golden file was captured from code that had no such option.
+- `--max-pings` below 1 is now rejected (exit 2). The old loop checked the cap only after a ping was processed, so `--max-pings 0` ended the run with no pings; the generator form would instead have converted everything.
+- The sink, options, report and old-file warning landed in one commit because they share `main` and the report; the README is separate.
+- A part's time name is not checked against files on disk: a rerun that produces the same first-ping name replaces the earlier file of that name (same content for the same bag and options). Only files this run did not write are warned about.
+- A start-up warning for a size limit below header-plus-minimal-ping (1408 bytes) is used, since the real ping size is not known at option-parsing time; a part that exceeds the limit because of one big ping is flagged in the report.
+- Real-data check (step 9): 5 parts from the 4 GB bag of 2026-08-25, all at most 500 MB, parts' ping bytes equal the `--no-split` run (sha256). pyxtf is not installed here, so the pyxtf checks only ran as skipped tests. Gaps: largest 7.5 s in three bags, one 1037.7 s gap in the 2026-08-28 bag, so 60 s sits well between them and is kept.
 
 ## Estimated Scope
 
