@@ -295,3 +295,19 @@ def two_frame_messages(track, pings, *, drop_port_samples=(),
         entries.append((rec, 3, n, STBD_TOPIC, stbd))
     entries.sort(key=lambda e: e[:3])
     return [(e[3], e[4], e[0]) for e in entries]
+
+
+def single_ping_messages(stamp_ns, *, span_ns=400_000_000):
+    """
+    Return the messages of one ping pair stamped exactly ``stamp_ns``.
+
+    Two /tf samples ``span_ns`` either side of the stamp (the same pose, so
+    any lookup time between them gives it), then the port and starboard
+    messages.
+    """
+    return [
+        ('/tf', _tf_msg(stamp_ns - span_ns, 0.0), stamp_ns - span_ns),
+        ('/tf', _tf_msg(stamp_ns + span_ns, 0.0), stamp_ns + span_ns + 1),
+        (PORT_TOPIC, _sonar_msg(stamp_ns, 0, 40), stamp_ns + span_ns + 2),
+        (STBD_TOPIC, _sonar_msg(stamp_ns, 500, 40), stamp_ns + span_ns + 3),
+    ]

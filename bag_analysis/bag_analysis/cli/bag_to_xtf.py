@@ -418,6 +418,20 @@ def _parse_time(value):
     return int(parsed.timestamp() * 1e9)
 
 
+_EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+
+
+def _utc_from_ns(ns: int) -> _dt.datetime:
+    """
+    Return the UTC time of ``ns`` since the epoch, cut to microseconds.
+
+    Integer arithmetic only: a float of seconds carries about 240 ns of
+    error at today's epoch and rounds to the microsecond, which moved an
+    instant just under a hundredth of a second, or a second, over the line.
+    """
+    return _EPOCH + _dt.timedelta(microseconds=ns // 1000)
+
+
 def _make_pending(msg, raw_ns, offset_ns, pose) -> _PendingPing:
     """
     Build a georeferenced pending ping from a RawSonarImage + TF pose.
@@ -430,11 +444,9 @@ def _make_pending(msg, raw_ns, offset_ns, pose) -> _PendingPing:
         msg, samples.size)
     lat, lon, _alt, heading, pitch, roll = ecef_pose_to_geo(pose[0], pose[1])
     ping_ns = raw_ns - offset_ns
-    utc = _dt.timezone.utc
     return _PendingPing(
         t_ns=ping_ns, raw_ns=raw_ns,
-        time=_dt.datetime.fromtimestamp(ping_ns / 1e9, tz=utc),
-        computer_time=_dt.datetime.fromtimestamp(raw_ns / 1e9, tz=utc),
+        time=_utc_from_ns(ping_ns), computer_time=_utc_from_ns(raw_ns),
         lat=lat, lon=lon, heading=heading, pitch=pitch, roll=roll,
         ecef=np.array(pose[0]), samples=samples, slant_range=slant_range,
         frequency=msg.ping_info.frequency, time_delay=time_delay,

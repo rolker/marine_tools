@@ -87,6 +87,11 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    inter-ping intervals are identical on either clock; only labels move. A
    part can therefore be named up to |offset| before the first raw stamp that
    `--start-time` admitted; documented.
+   Times are made from the integer nanoseconds (`_utc_from_ns`), truncated to
+   microseconds, then to hundredths by the writer: the earlier float path
+   rounded an instant such as x.009999999 or x.999999999 up over the
+   hundredth or the second (found by the hand-worked boundary tests of
+   review round 1).
 4. **Pairing first, then the hold queue in `_iter_pings`.** (Revised after
    local review round 1: pairing used to follow the lookup, so a ping dropped
    for a transform reason left its mate pending, and the mate paired with the

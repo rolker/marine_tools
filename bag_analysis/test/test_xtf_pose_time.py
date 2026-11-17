@@ -23,8 +23,8 @@ from bag_analysis.xtf.geo import ecef_pose_to_geo, quaternion_to_matrix
 import numpy as np
 import pytest
 from xtf_fakes import (
-    base_args, FRAME, PORT_TOPIC, read_ping_headers, STBD_TOPIC, Track,
-    track_messages, two_frame_messages)
+    base_args, FRAME, PORT_TOPIC, read_ping_headers, single_ping_messages,
+    STBD_TOPIC, Track, track_messages, two_frame_messages)
 
 _NS = 1_000_000_000
 
@@ -593,3 +593,39 @@ def test_pings_held_at_end_time_settle_without_reading_to_the_bag_end(
     assert rc == 0
     assert _dropped(report)['tf_late'] > 0
     assert len(consumed) < len(messages) - 10
+
+
+# Integer-nanosecond boundaries of the XTF hundredths. The written time is
+# the truncation of the instant to 1/100 s, worked out here by hand from
+# 1_750_000_000 s since the epoch = 2025-06-15 15:06:40 UTC exactly
+# (20254 days = 1_749_945_600 s, plus 54_400 s = 15 h 6 min 40 s).
+_T0_S = 1_750_000_000
+_BOUNDARY = [
+    # id, stamp ns past _T0_S, offset (s), written time, ComputerClock
+    ('just_under_a_hundredth', 9_999_999, '0',
+     (15, 6, 40, 0), (15, 6, 40, 0)),
+    ('on_a_hundredth', 10_000_000, '0',
+     (15, 6, 40, 1), (15, 6, 40, 1)),
+    ('just_under_a_second', 999_999_999, '0',
+     (15, 6, 40, 99), (15, 6, 40, 99)),
+    ('just_under_a_minute', 59_999_999_999, '0',
+     (15, 7, 39, 99), (15, 7, 39, 99)),
+    ('offset_of_one_ns_crosses_back', 1_000_000_000, '1e-9',
+     (15, 6, 40, 99), (15, 6, 41, 0)),
+    ('negative_offset_crosses_forward', 999_999_999, '-2e-9',
+     (15, 6, 41, 0), (15, 6, 40, 99)),
+]
+
+
+@pytest.mark.parametrize(
+    'stamp_past, offset, written, clock',
+    [c[1:] for c in _BOUNDARY], ids=[c[0] for c in _BOUNDARY])
+def test_hundredths_are_cut_from_the_integer_nanoseconds(
+        tmp_path, monkeypatch, capsys, stamp_past, offset, written, clock):
+    messages = single_ping_messages(_T0_S * _NS + stamp_past)
+    rc, out = _run(tmp_path, monkeypatch, messages, '--no-split',
+                   '--stamp-to-transmit-offset=' + offset)
+    assert rc == 0, capsys.readouterr().out
+    ping, = read_ping_headers(out)
+    assert ping['time'] == (2025, 6, 15, *written)
+    assert ping['clock'] == clock
