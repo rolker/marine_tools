@@ -260,3 +260,22 @@ def test_pyxtf_cross_check_if_available():
         assert len(sonar) == 2
     finally:
         os.unlink(path)
+
+
+@pytest.mark.parametrize('layout', [LAYOUT_STANDARD, LAYOUT_PINGMAPPER])
+def test_ping_size_and_bytes_written_match_the_file(layout):
+    stream = io.BytesIO()
+    writer = XtfWriter(stream, layout=layout)
+    assert writer.bytes_written == _FILE_HEADER_LEN
+    t = _dt.datetime(2026, 6, 15, tzinfo=_dt.timezone.utc)
+    for number, (n_port, n_stbd) in enumerate([(4, 4), (3, 7), (0, 1)]):
+        port, stbd = _chan(range(n_port)), _chan(range(n_stbd))
+        before = writer.bytes_written
+        expected = writer.ping_size(port, stbd)
+        writer.write_ping(
+            time=t, ping_number=number, latitude_deg=0.0, longitude_deg=0.0,
+            sensor_depth_m=0.0, altitude_m=0.0, heading_deg=0.0,
+            pitch_deg=0.0, roll_deg=0.0, speed_mps=0.0,
+            sound_velocity_mps=1500.0, port=port, starboard=stbd)
+        assert writer.bytes_written - before == expected
+        assert writer.bytes_written == len(stream.getvalue())
