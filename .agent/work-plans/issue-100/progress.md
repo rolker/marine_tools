@@ -176,9 +176,9 @@ Gap of any length is interpolated; lookups past newest/before oldest raise; lead
 **Round**: 2 | **Ship**: recommended — no must-fix; all nine round-1 items verified closed; the pairing change is order-equivalent to the old logic when nothing is dropped. Specialists: static/tests (288 passed, 2 skipped, flake8 and pep257 included), governance/plan drift read by the lead, lead's own adversarial read of the delta (pairing, counters, time, wait, evicted); Gemini ran and found nothing; Codex hit its usage limit again (not run); no separate Claude subagent passes this round.
 
 ### Findings
-- [ ] (suggestion) `tf_evicted` is set whenever any stamp was ever dropped from a link, so a lookup older than the first sample ever fed is also called evicted once the bag outlasts the cache (a `contacts_to_geojson` entry before the recording start, bag longer than 6 h): the label and the "raise --tf-cache" advice are wrong there. Keep the first-ever stamp per link and answer evicted only at or after it — `tf_lookup.py:_check_link, _Stamps.drop_before`
-- [ ] (suggestion) With `--max-pings` the generator's finally counts halves read ahead while the last pair waited as `unpaired`, which the old code left in the queue uncounted; the `_iter_pings` docstring says waiting pings are not counted — `bag_to_xtf.py:_iter_pings` (finally)
-- [ ] (suggestion) The `--tf-cache` bound is wait + gap + |offset| and omits `--pair-tolerance` (the first half of a pair can be that much older than the completing message that starts the wait); at the margin that gives a reported `tf_evicted`, never a wrong pose — `bag_to_xtf.py:_parse_args` (~326)
+- [x] (suggestion) `tf_evicted` is set whenever any stamp was ever dropped from a link, so a lookup older than the first sample ever fed is also called evicted once the bag outlasts the cache (a `contacts_to_geojson` entry before the recording start, bag longer than 6 h): the label and the "raise --tf-cache" advice are wrong there. Keep the first-ever stamp per link and answer evicted only at or after it — `tf_lookup.py:_check_link, _Stamps.drop_before`
+- [x] (suggestion) With `--max-pings` the generator's finally counts halves read ahead while the last pair waited as `unpaired`, which the old code left in the queue uncounted; the `_iter_pings` docstring says waiting pings are not counted — `bag_to_xtf.py:_iter_pings` (finally)
+- [x] (suggestion) The `--tf-cache` bound is wait + gap + |offset| and omits `--pair-tolerance` (the first half of a pair can be that much older than the completing message that starts the wait); at the margin that gives a reported `tf_evicted`, never a wrong pose — `bag_to_xtf.py:_parse_args` (~326)
 
 ### Answers to the seven points
 1. Pairing: with no drops the same messages pair, in the same order, with the same `unpaired` count, as the old code (same sequence of pair/replace operations on the same stream, the queue is FIFO, altitude is the completing message's). Duplicate stamps, a channel running ahead, three messages within tolerance (third waits as pending), --max-pings, window and end of bag behave as before. A half cannot be emitted twice or lost uncounted: a pair is consumed once; pending halves are counted at finally. The only difference found is the --max-pings read-ahead count (suggestion 2).
@@ -190,3 +190,23 @@ Gap of any length is interpolated; lookups past newest/before oldest raise; lead
 7. README matches the code for counters, options, `--end-time`, evicted and the earth-ancestor rule.
 
 Cross-model: Gemini found nothing; Codex failed with a usage limit (recorded).
+
+## Implementation
+**Status**: complete
+**When**: 2026-11-17 14:10 -05:00
+**By**: Claude Sonnet
+
+**Branch**: feature/issue-100 at `467f65f`
+**Addressed**: Local Review (Pre-Push), round 2, at `c36b710`: all 3 suggestions, none deferred
+**Commits**: `5c07e24` `7ea80a8` `467f65f`
+
+### Actions
+- [x] Suggestion 1, `tf_evicted` mislabel — `tf_lookup.py:_Stamps, _check_link` (`5c07e24`). Each link keeps the oldest stamp ever accepted; a lookup before the first sample held is `tf_evicted` only when stamps were dropped and the time is at or after that stamp, else `no_tf`. Tests in `test_tf_lookup.py` (including an older sample accepted late) and `test_contacts_to_geojson.py` (entry before the recording, `--tf-cache 3`); README rows updated.
+- [x] Suggestion 2, `--max-pings` read-ahead — `bag_to_xtf.py:_iter_pings` (`7ea80a8`). `GeneratorExit` marks an early stop and the finally block then skips the `pending` count. Test `test_max_pings_does_not_count_the_halves_read_ahead` fails on the old code and passes now; plan step 8 updated.
+- [x] Suggestion 3, `--tf-cache` bound — `bag_to_xtf.py:_parse_args` (`467f65f`). Bound is wait + gap + |offset| + `--pair-tolerance`; the usage error names all four terms; README and plan step 5 updated. Boundary test: 6.25 refused, 6.26 accepted, and a 0.5 tolerance case.
+
+### Verification
+- `./sensors_ws/test.sh bag_analysis`: 293 tests, 0 failures, 2 skipped (flake8/pep257 included). Golden and split-join tests unchanged. The new max-pings and cache-bound tests failed on the pre-fix code.
+
+### Not done / not verified
+- Nothing deferred. Not pushed, no PR.
