@@ -10,7 +10,7 @@ https://github.com/rolker/marine_tools/issues/98
 
 Today `main` opens one `.partial`, `_convert` builds one `XtfWriter` on it, takes `ping_number` from `writer.ping_count`, and `main` renames at the end.
 
-Owner decisions (Roland, final) folded in below: stale files are warned about and never deleted; option names are `--split-size`, `--split-duration`, `--split-gap`, `--no-split`; every plan-review suggestion is adopted.
+Owner decisions (Roland, final) folded in below: **the run refuses to start if the plain output or any file of this output's part-name pattern exists, unless `--overwrite` (step 6)**; files the run did not regenerate are warned about and never deleted; option names are `--split-size`, `--split-duration`, `--split-gap`, `--no-split`; every plan-review suggestion is adopted.
 
 ## Approach
 
@@ -23,7 +23,11 @@ Owner decisions (Roland, final) folded in below: stale files are warned about an
    All comparisons are in integer nanoseconds (`t_ns`), not the microsecond-truncated datetimes. `--max-pings` counts pings across all parts, checked in the loop as today.
 4. **Naming (lazy).** A part's `.partial` is opened only when its first ping is in hand, and is named after that ping: `<stem>_<first-ping UTC YYYYmmddTHHMMSSZ><suffix>.partial`. Time is the ping stamp (not wall clock), UTC. Two parts whose first ping falls in the same UTC second get `_2`, `_3`... before the suffix (checked against names used this run). When a part is finished it is renamed to its final time name. At the end of a successful run that has exactly one part, that part is renamed to the plain `--output`, so existing scripts keep working. With two or more parts there is no plain-name file from this run. Because names vary, a killed run's `.partial` files are no longer overwritten by the next run; the end-of-run warning lists them (step 6).
 5. **Failure.** Finished parts stay. On any `BaseException` only the current `.partial` is deleted; every finished part keeps its time name (a failed run is never a "single part" run, so nothing is renamed to the plain name). `main` prints the finished-part list and returns non-zero for a handled error; for an exception it prints the list then re-raises. Zero pings overall still returns 1 with no files.
-6. **Old files: warn only, delete nothing (owner decision).** After a successful run, scan the output directory for files left by earlier runs and print one loud end-of-run warning listing them: files matching this run's part pattern (`re.escape(stem)` + `_\d{8}T\d{6}Z(_\d+)?` + `re.escape(suffix)`, `fullmatch`) that this run did not write, leftover `<name>.partial` files matching the same pattern plus `.partial`, and a plain `--output` name that exists but was not written by this run (only possible after a multi-part run, since a one-part run overwrites it). Nothing is deleted and there is no removal option. A stem with regex metacharacters is tested. Exit stays 0. On failure the warning is also printed (it is cheap and the user still needs to know), still without deleting.
+6. **Existing files: refuse unless `--overwrite` (owner decision, replaces the earlier "rerun replaces same-named part" rule).** Before the bag is read (`_preflight`): `--output` that is a directory, or a folder that cannot be written (probe file), is exit 2. Then scan the folder for the plain `--output`, `<name>.partial`, and files matching `re.escape(stem)` + `_\d{8}T\d{6}Z(_\d+)?` + `re.escape(suffix)` (`fullmatch`, optional `.partial`). If any exist and `--overwrite` is not set: print an error naming them (first 10, then "and N more" with the total) and exit 2, writing nothing. This deliberately changes the single-file behaviour too (the plain output used to be replaced silently); the README says so.
+   - With `--overwrite`: the run may replace files whose names it produces, and the end-of-run report lists each replaced file. A one-part run passes through its time name before taking the plain name, so an old file of that time name is replaced (and listed). Old files of the pattern that were not regenerated are warned about and never deleted; the warning says the folder now mixes two runs. Exit stays 0.
+   - Fail-safe races: without `--overwrite`, `.partial` files are opened `'xb'` and a part is moved into place by hard link (fails if the name exists; rename after an existence check where links are unsupported), including the plain-name move of a one-part run. A foreign file that appears mid-run is never truncated or replaced; the run fails with the finished parts kept, listed.
+   - Failure handling: the original error is printed first; cleanup (`abort`, report, old-file warning) is best effort and cannot hide it; the report says how many pings were in the discarded `.partial`. Parts are fsynced before rename. An interrupt around a rename is reconciled against the disk so a moved part is still reported.
+   - Zero pings still returns 1 with no files, and still prints the old-file warning.
 7. **Options** (all in `_build_parser`):
    - `--split-size <MB>` (float, default 500; 0 means no size limit). MB = 10^6 bytes, so a part never exceeds that.
    - `--split-duration <minutes>` (float, default off).
@@ -49,7 +53,9 @@ New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small syn
 - `--max-pings` across parts; `--start-time`/`--end-time` trimming with splitting.
 - Failure: exception mid-run in part 2 leaves finished parts with time names, no `.partial`; a failure in part 1 leaves nothing; exit code non-zero on a handled error.
 - Zero pings: exit 1, no files.
-- Old files: earlier parts, a leftover `.partial` and a plain-name file are listed in the warning and still exist afterwards; unrelated files are not listed; a stem with regex metacharacters matches only its own parts; nothing is deleted on success or failure.
+- Existing files: a rerun without `--overwrite` refuses (exit 2) and leaves every file byte-identical, also for `--max-pings` over a full export, the plain-name single file and a `.partial` leftover; a long list is capped; with `--overwrite` it replaces and reports; when the old run had more parts the leftovers are warned about ("mixes files from two runs") and kept; a foreign file appearing mid-run as `.partial`, as a final name or as the plain name is not replaced; unrelated files are not listed; a stem with regex metacharacters matches only its own parts; nothing is deleted on success or failure.
+- Options: `inf`, `nan`, `1e308`, and a duration or gap that rounds to 0 ns are rejected (exit 2); a directory or unwritable `--output` is refused before the bag is read.
+- Failure: cleanup errors do not hide the original error or the parts report; the discarded `.partial`'s ping count is reported; an interrupt just after a rename still reports the part; parts are fsynced.
 
 ## Files to Change
 
@@ -66,7 +72,7 @@ New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small syn
 
 | Principle | Consideration |
 |---|---|
-| Robustness / error handling | Failure and old-file rules are specified and tested; no silent partial sets; nothing is ever deleted that this run did not write |
+| Robustness / error handling | Failure and old-file rules are specified and tested; no silent partial sets; nothing is ever deleted, and nothing is replaced without `--overwrite` |
 | Tests with the change | Both layouts, `--max-pings`, trimming, validation, moving-track carry-over covered |
 | Workspace separation | Change lives in marine_tools only |
 | Data of record | Real bags read only; test output under the scratchpad |
@@ -100,7 +106,7 @@ Resolved by the owner: stale files are warned about, never deleted; option names
 - The golden test runs with the default limits (a small run is one part) rather than `--no-split`, because the golden file was captured from code that had no such option.
 - `--max-pings` below 1 is now rejected (exit 2). The old loop checked the cap only after a ping was processed, so `--max-pings 0` ended the run with no pings; the generator form would instead have converted everything.
 - The sink, options, report and old-file warning landed in one commit because they share `main` and the report; the README is separate.
-- A part's time name is not checked against files on disk: a rerun that produces the same first-ping name replaces the earlier file of that name (same content for the same bag and options). Only files this run did not write are warned about.
+- Superseded (pre-push review round 1, owner decision): the first implementation let a rerun replace a same-named part silently. Now a rerun refuses unless `--overwrite` (step 6); with it, replaced files are listed and unregenerated old files are warned about.
 - A start-up warning for a size limit below header-plus-minimal-ping (1408 bytes) is used, since the real ping size is not known at option-parsing time; a part that exceeds the limit because of one big ping is flagged in the report.
 - Real-data check (step 9): 5 parts from the 4 GB bag of 2026-08-25, all at most 500 MB, parts' ping bytes equal the `--no-split` run (sha256). pyxtf is not installed here, so the pyxtf checks only ran as skipped tests. Gaps: largest 7.5 s in three bags, one 1037.7 s gap in the 2026-08-28 bag, so 60 s sits well between them and is kept.
 

@@ -158,7 +158,8 @@ output into parts by default:
 | `--split-gap <seconds>` | 60 | Start a new part when more than this many seconds pass between two pings, for example when the sonar was switched off. `0` turns it off. |
 | `--no-split` | | One file, whatever its size, as before. Cannot be combined with the three options above. |
 
-Negative values are rejected. A size limit over 2 GB or smaller than one
+Negative, non-finite (`inf`, `nan`) and absurdly large values are
+rejected, as is a duration or gap that rounds to 0 ns. A size limit over 2 GB or smaller than one
 ping prints a warning. Whichever limit is reached first starts the next
 part, and the report says which one it was.
 
@@ -178,16 +179,38 @@ unsplit file. Treat it as unreliable.
 The run report lists each part with its ping count, first and last ping
 time (UTC) and size.
 
-Each part is written to a `.partial` file and renamed when it is
-complete. If the run fails part way, the finished parts stay, only the
-unfinished `.partial` is deleted, the finished parts are listed, and the
-exit status is non-zero.
+Each part is written to a `.partial` file, synced to disk and renamed
+when it is complete. If the run fails part way, the finished parts stay,
+only the unfinished `.partial` is deleted (the report says how many
+pings were in it), the finished parts are listed, and the exit status is
+non-zero.
 
-Files from earlier runs are never deleted. If the output directory holds
-parts of the same name pattern that this run did not write, leftover
-`.partial` files, or a plain-name file from a run that did not replace
-it, the run ends with a warning that lists them. Remove them yourself
-when they are out of date so they do not get mixed up with the new parts.
+#### Existing files: refused unless `--overwrite`
+
+Before the bag is read, `bag_to_xtf` looks in the output folder for the
+plain `--output` file and for any file of this output's part-name
+pattern (the time-stamped parts, their `_2` variants and `.partial`
+leftovers). If there is any and `--overwrite` was not given, it prints
+the files (a long list is cut, with the count), writes nothing and exits
+with status 2. This also covers a `--max-pings` test run over a full
+export, and it is a change from the single-file behaviour before
+splitting: a rerun used to replace the plain output silently, now it
+refuses. `--output` that is a directory, or a folder that cannot be
+written, is refused up front the same way (status 2).
+
+With `--overwrite` the run replaces the files whose names it produces
+and the report lists every file it replaced. A one-part run goes through
+its time name before it takes the plain name, so an old file of that
+time name is replaced (and listed) too. Old files of the pattern that
+the run did not regenerate (for example the extra parts of an earlier,
+larger split) are never deleted; the run ends with a warning that the
+folder now mixes two runs and lists them. Remove them yourself when they
+are out of date.
+
+Without `--overwrite` nothing is ever replaced, even if a file appears
+while the run is going: `.partial` files are created exclusively and a
+part is moved into place only if its name is free. Such a run fails, the
+file that appeared is untouched, and the finished parts are listed.
 
 ## Schema
 
