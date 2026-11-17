@@ -195,8 +195,9 @@ def track_messages(
         track, n_pings, *, ping_dt_s=0.1, fractions=(0.3, 0.7),
         tf_delay_s=0.25, ping_lag_s=0.01, late_samples=(), first_ping=1):
     """
-    Return ``(messages, ping_stamps)`` for a track recorded the way the
-    real bag is: each /tf sample is recorded ``tf_delay_s`` after its stamp,
+    Return ``(messages, ping_stamps)`` for a track as the real bag records it.
+
+    Each /tf sample is recorded ``tf_delay_s`` after its stamp,
     each ping ``ping_lag_s`` after its stamp, so pings come in the bag
     before the /tf past them and several pings are waiting at once.
 
