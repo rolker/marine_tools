@@ -95,3 +95,25 @@ Read cold as a dispatched sub-agent (handoff header present); independent of the
 
 ### Dimension verdicts
 Scope Good (one PR, 5 files). Issue alignment Needs work (time span, option names, pyxtf). File targeting Good (`contacts_to_geojson` imports `_lookup_pose`/`_stamp_ns`, untouched). Consequences Good. Docs impact Good. Principle alignment Needs work (stale deletion, error handling). ADR none triggered. ROS conventions N/A.
+
+## Implementation
+**Status**: complete
+**When**: 2026-11-17 09:25 -05:00
+**By**: Claude Sonnet
+
+**Plan**: `.agent/work-plans/issue-98/plan.md` (amended for the owner decisions and the plan-review findings)
+**Branch**: feature/issue-98 (local only, not pushed, no PR)
+
+### Done
+- Plan amended first (stale files: warn only, option names `--split-size` / `--split-duration` / `--split-gap` / `--no-split`, all review suggestions).
+- Golden-file test captured from the pre-refactor code, then `_iter_pings` generator refactor with the golden test unchanged.
+- `XtfWriter.ping_size` / `bytes_written`; `_PartSink` with lazy per-part naming, one-part rename to the plain name, failure handling, option validation, per-part report with time span, end-of-run warning for old files (nothing deleted).
+- README section and module docstring.
+- Tests: 127 run in bag_analysis, 0 failures, 2 skipped (pyxtf not installed here, so the pyxtf read tests skip).
+- Real data: bizzyboat_sonar 2026-08-25T13-59-09, whole bag: 5 parts, all <= 500 MB, parts' ping bytes equal the --no-split run (sha256). Largest gap in three bags 7.5 s; one 1037.7 s gap in the 2026-08-28 bag split correctly. 60 s default kept.
+
+### Deviations
+See "Implementation Notes (deviations)" in the plan: golden test uses default limits, `--max-pings` below 1 rejected, sink/options/report/old-file warning in one commit.
+
+### Not verified
+- pyxtf reading of the parts (pyxtf not installed on this host).
