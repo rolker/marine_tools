@@ -10,47 +10,55 @@ https://github.com/rolker/marine_tools/issues/98
 
 Today `main` opens one `.partial`, `_convert` builds one `XtfWriter` on it, takes `ping_number` from `writer.ping_count`, and `main` renames at the end.
 
+Owner decisions (Roland, final) folded in below: stale files are warned about and never deleted; option names are `--split-size`, `--split-duration`, `--split-gap`, `--no-split`; every plan-review suggestion is adopted.
+
 ## Approach
 
-1. **Ping generator (also prepares PR 2).** Split `_convert` into `_iter_pings(args, counts)`, a generator yielding `(port, stbd, altitude)` for each paired ping. It owns TF, nadir, window trim, pairing and `--max-pings`-independent logic, and the `unpaired` count (in a `finally`, so an early `close()` still counts leftovers). The write side is separate. PR 2 can then run the generator twice (a nav-only pass, then the writing pass) without touching the pairing code. No behaviour change in this step; a test pins that the single-file output is byte-identical to before.
-2. **Exact next-ping size.** `XtfWriter` gets `ping_size(port, starboard)` (256 + 2x64 + sample bytes, the same arithmetic `write_ping` uses, shared in one helper so they cannot drift) and a `bytes_written` property (starts at 1024 for the header). No `stream.tell()` after the fact.
-3. **Part manager** (`_PartSink` in `bag_to_xtf.py`). Holds the current part's `.partial` path, stream, writer, first-ping time, last-ping time. `ping_number` and `prev_emitted` (speed, seconds-per-ping) stay in the emit loop, outside the sink, so they are global and the concatenated parts hold exactly what one file would. Before each ping, the loop asks whether to roll over; if so it closes the current part and opens the next. A new part starts when any of:
+1. **Golden output first, then the ping generator (also prepares PR 2).** Before touching `_convert`, commit a characterization test that builds a synthetic bag stream (fake `iter_messages`, fake TF), runs today's code and compares the whole output file to a golden file stored in the test directory, together with the report counts. Then split `_convert` into `_iter_pings(args, counts)`, a generator yielding `(port, stbd, altitude)` for each paired ping. It owns TF, nadir, window trim, pairing and the `unpaired` count. The write side is separate. The generator clears the pending pair **before** it yields, so an early `close()` (from `--max-pings`) does not count the just-yielded pair as `unpaired`; the `paired` / `no_altitude` counts are kept on the consumer side only. The golden test must pass unchanged after the refactor, and a `--max-pings` case pins the counts. PR 2 can later run the generator twice (a nav-only pass, then the writing pass) without touching the pairing code.
+2. **Exact next-ping size.** `XtfWriter` gets `ping_size(port, starboard)` and a `bytes_written` property (starts at 1024 for the header, grows by what `write_ping` writes). `ping_size` is computed from sample counts (`np.asarray(samples).size * 2`), not by building the byte arrays; `write_ping` and `ping_size` share one helper for the arithmetic (256 + 2 x 64 + 2 bytes per sample on both channels) so they cannot drift. No `stream.tell()`.
+3. **Part sink** (`_PartSink` in `bag_to_xtf.py`). Holds the current part's `.partial` path, stream, writer, first-ping and last-ping time, and ping count. `ping_number` and `prev_emitted` (speed, seconds-per-ping) stay in the emit loop, outside the sink, so they are global and the concatenated parts hold exactly the pings one file would. "Previous ping" for the gap rule is the previous **emitted** ping, across parts. Before each ping the loop asks whether to roll over; if so it closes the current part and opens the next. A new part starts when any of:
    - `bytes_written + ping_size > max_part_bytes` and the part holds at least one ping (one oversized ping gets a part alone);
-   - `ping.time - part_first_time >= max_duration` (only if set);
-   - `ping.time - previous_ping.time > gap_s`.
-   `--max-pings` counts pings across all parts (global count, checked in the loop as today).
-4. **Naming.** Part 1 streams to `<output>.partial` and its final name is undecided. If a second part is ever started, part 1 is renamed to `<stem>_<first-ping UTC YYYYmmddTHHMMSSZ><suffix>` and so is every later part. If the run ends with one part, it is renamed to the plain `--output`, so existing scripts keep working. Later parts stream to a `.partial` named after their own first ping, so no rename needs lookahead. Two parts whose first ping falls in the same UTC second get `_2`, `_3`... appended before the suffix (checked against names used this run). Time uses the ping's stamp (not wall clock), UTC.
-5. **Failure.** Finished parts stay. On any `BaseException` only the current `.partial` is deleted. If part 1 had been waiting for the plain name it is finalised with its time name at that moment (a failed run is never a "single part" run). `main` prints the finished-part list and returns non-zero for a handled error; for an exception it prints the list then re-raises. Zero pings overall still returns 1 with no files.
-6. **Stale parts.** After a successful run, delete files in the output directory that match this run's part pattern `<stem>_\d{8}T\d{6}Z(_\d+)?<suffix>` and were not written by this run, and print their names. A multi-part run does not touch a plain `--output` file from an earlier run, but warns that it exists. Nothing else in the directory is touched. On failure nothing stale is removed.
+   - `t_ns - part_first_t_ns >= max_duration_ns` (only if set);
+   - `t_ns - prev_emitted_t_ns > gap_ns`.
+   All comparisons are in integer nanoseconds (`t_ns`), not the microsecond-truncated datetimes. `--max-pings` counts pings across all parts, checked in the loop as today.
+4. **Naming (lazy).** A part's `.partial` is opened only when its first ping is in hand, and is named after that ping: `<stem>_<first-ping UTC YYYYmmddTHHMMSSZ><suffix>.partial`. Time is the ping stamp (not wall clock), UTC. Two parts whose first ping falls in the same UTC second get `_2`, `_3`... before the suffix (checked against names used this run). When a part is finished it is renamed to its final time name. At the end of a successful run that has exactly one part, that part is renamed to the plain `--output`, so existing scripts keep working. With two or more parts there is no plain-name file from this run. Because names vary, a killed run's `.partial` files are no longer overwritten by the next run; the end-of-run warning lists them (step 6).
+5. **Failure.** Finished parts stay. On any `BaseException` only the current `.partial` is deleted; every finished part keeps its time name (a failed run is never a "single part" run, so nothing is renamed to the plain name). `main` prints the finished-part list and returns non-zero for a handled error; for an exception it prints the list then re-raises. Zero pings overall still returns 1 with no files.
+6. **Old files: warn only, delete nothing (owner decision).** After a successful run, scan the output directory for files left by earlier runs and print one loud end-of-run warning listing them: files matching this run's part pattern (`re.escape(stem)` + `_\d{8}T\d{6}Z(_\d+)?` + `re.escape(suffix)`, `fullmatch`) that this run did not write, leftover `<name>.partial` files matching the same pattern plus `.partial`, and a plain `--output` name that exists but was not written by this run (only possible after a multi-part run, since a one-part run overwrites it). Nothing is deleted and there is no removal option. A stem with regex metacharacters is tested. Exit stays 0. On failure the warning is also printed (it is cheap and the user still needs to know), still without deleting.
 7. **Options** (all in `_build_parser`):
-   - `--max-part-size-mb` (float, default 500; 0 means no size limit). MB = 10^6 bytes, so a part never exceeds that.
-   - `--max-part-duration-min` (float, default off).
-   - `--gap-split-s` (float, default 60; 0 means off). Separate from `_MAX_SECONDS_PER_PING`, which is the ping-interval field's rule.
+   - `--split-size <MB>` (float, default 500; 0 means no size limit). MB = 10^6 bytes, so a part never exceeds that.
+   - `--split-duration <minutes>` (float, default off).
+   - `--split-gap <seconds>` (float, default 60; 0 means off). Separate from `_MAX_SECONDS_PER_PING`, which is the ping-interval field's rule.
    - `--no-split` turns all three off and gives today's single file.
-   Report: print each part with its ping count and size, plus the reason each rollover happened (size, duration, gap).
-8. **Docs.** README section for `bag_to_xtf` and `--help` text: options, naming rule, single-part keeps plain name, failure behaviour, stale-part cleanup.
-9. **Check on real data.** Convert one 2+ GB Appledore bag with the default, with `--no-split` for comparison, and with a small size and a small gap, output only under `/home/roland/project11/.agent/scratchpad/xtf_split/`. Compare: sum of part pings equals the unsplit count, and the part contents concatenated (pings only, without file headers) match the unsplit file's pings byte for byte. Look at real gaps in the bags to confirm or move the 60 s default. Bags are read only.
+   - Validation (argparse `parser.error`, exit 2): negative values are rejected; `--no-split` together with any explicit limit is rejected (detected by defaults of `None` resolved after parsing); a size limit smaller than the header plus one minimum ping is not rejected (each ping becomes its own part, by design) but prints a warning at start; a size limit above 2^31 bytes prints a warning (the XTF 32-bit offset motivation).
+   - Report: for each part print file name, ping count, first and last ping UTC (time span) and size, plus the reason each rollover happened (size, duration, gap).
+8. **Docs.** README section for `bag_to_xtf` and `--help` text: options, naming rule, single part keeps the plain name, failure behaviour, the old-file warning, and a note that the first ping after a gap carries a speed averaged over the gap (distance over the sonar-off interval), exactly as the unsplit file does today, because the carry-over is kept global so the parts equal the single file. Update the module docstring (it says one `.partial` and one rename).
+9. **Check on real data.** Convert one real Appledore bag (read only) with the default, with `--no-split` over the same window, and with a small size; output only under `/home/roland/project11/.agent/scratchpad/xtf_split/`. Check no part exceeds the limit, each part opens in pyxtf if importable, and the parts' ping bytes (after the 1024-byte header) concatenated equal the unsplit run's ping bytes (sha256). Look at real inter-ping gaps to confirm or move the 60 s default. Delete the large outputs afterwards, keep a short text record.
 
 ## Tests
 
-New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small synthetic pings, plus writer tests:
+Characterization test (step 1, before the refactor): golden file for the single-file output and the report counts, including a `--max-pings` case.
+
+New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small synthetic pings. The synthetic track **moves** (ECEF position advancing each ping) with ping spacing 0.1 to 0.5 s (under `_MAX_SECONDS_PER_PING`), so speed and seconds-per-ping are non-trivial, with a split falling mid-run. Writer tests are added to `test_xtf_writer.py`.
 - Writer: `ping_size` equals the bytes `write_ping` actually adds, in both layouts; `bytes_written` equals file length.
-- Size split: no part exceeds the limit (assert on file sizes), oversized single ping gets its own part, concatenated ping bytes equal the unsplit file's, `ping_number` runs continuously, first ping of part 2 carries speed and seconds-per-ping from the last ping of part 1. Both layouts.
+- Size split: no part exceeds the limit (assert on file sizes), oversized single ping gets its own part, concatenated ping bytes (after each 1024-byte header) equal the unsplit file's, `ping_number` runs continuously, first ping of part 2 carries the same speed and seconds-per-ping as in the unsplit file. The carry-over assertion must fail if `prev_emitted` is reset at a boundary (verify by temporarily resetting it). Both layouts.
+- Every part is read with pyxtf under `pytest.importorskip('pyxtf')`: ping counts add up to the total.
 - Duration split alone and combined with size (first reached wins).
-- Gap split: gap longer than threshold starts a new part; shorter does not; `--gap-split-s 0` and `--no-split` give one file.
-- Naming: one part gets the plain name; more than one gets time names and no plain file; same-second collision gives `_2`.
+- Gap split: gap longer than the threshold starts a new part; shorter does not; `--split-gap 0` and `--no-split` give one file. Gap is measured against the previous emitted ping, in integer nanoseconds (a case just under and just over).
+- Naming: one part gets the plain name; more than one gets time names, no plain file, and no `.partial` left; same-second collision gives `_2`.
+- Option validation: negatives, `--no-split` with a limit, tiny size limit warning, over-2^31 warning.
 - `--max-pings` across parts; `--start-time`/`--end-time` trimming with splitting.
-- Failure: exception mid-run in part 2 leaves finished parts, no `.partial`, part 1 has its time name; a failure in part 1 leaves nothing.
+- Failure: exception mid-run in part 2 leaves finished parts with time names, no `.partial`; a failure in part 1 leaves nothing; exit code non-zero on a handled error.
 - Zero pings: exit 1, no files.
-- Stale parts: an earlier run's parts are removed on success, unrelated files and a plain-name file remain (plain one warned about), nothing removed on failure.
+- Old files: earlier parts, a leftover `.partial` and a plain-name file are listed in the warning and still exist afterwards; unrelated files are not listed; a stem with regex metacharacters matches only its own parts; nothing is deleted on success or failure.
 
 ## Files to Change
 
 | File | Change |
 |------|--------|
-| `bag_analysis/bag_analysis/cli/bag_to_xtf.py` | `_iter_pings` generator, `_PartSink`, split options, naming, failure and stale-part handling, report |
+| `bag_analysis/bag_analysis/cli/bag_to_xtf.py` | `_iter_pings` generator, `_PartSink`, split options and validation, lazy naming, failure handling, old-file warning, report |
 | `bag_analysis/bag_analysis/xtf/writer.py` | `ping_size`, `bytes_written` |
 | `bag_analysis/test/test_xtf_writer.py` | size tests |
+| `bag_analysis/test/test_xtf_cli.py` or `test_xtf_golden.py` (new) + golden data | characterization test |
 | `bag_analysis/test/test_xtf_split.py` (new) | split tests above |
 | `bag_analysis/README.md` | `bag_to_xtf` section |
 
@@ -58,8 +66,8 @@ New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small syn
 
 | Principle | Consideration |
 |---|---|
-| Robustness / error handling | Failure and stale-file rules are specified and tested; no silent partial sets |
-| Tests with the change | Both layouts, `--max-pings`, trimming, cleanup covered |
+| Robustness / error handling | Failure and old-file rules are specified and tested; no silent partial sets; nothing is ever deleted that this run did not write |
+| Tests with the change | Both layouts, `--max-pings`, trimming, validation, moving-track carry-over covered |
 | Workspace separation | Change lives in marine_tools only |
 | Data of record | Real bags read only; test output under the scratchpad |
 
@@ -79,13 +87,12 @@ New `test_xtf_split.py` using a fake `iter_messages` (monkeypatch) and small syn
 
 ## Documentation & Instruction Impact
 
-- **Stale docs** (must land in this PR): `bag_analysis/README.md` `bag_to_xtf` section and the module docstring (it currently says one `.partial` and one rename).
+- **Stale docs** (must land in this PR): `bag_analysis/README.md` `bag_to_xtf` section and the module docstring.
 - **Agent-instruction candidates**: None. This repo has no `.agents/README.md`, a separate task.
 
 ## Open Questions
 
-- Stale-part deletion on success (step 6) is my choice; the alternative is to refuse to run when stale parts exist. Is deleting generated parts acceptable?
-- Option names and the 10^6-byte MB are my choices.
+Resolved by the owner: stale files are warned about, never deleted; option names as above; MB = 10^6 bytes. Remaining:
 - Is 60 s a good gap default? Confirm against real bags in step 9.
 
 ## Estimated Scope
