@@ -143,7 +143,7 @@ Other options: `--port-topic` / `--starboard-topic` / `--nadir-topic`,
 `--earth-frame` (default `earth`), `--pair-tolerance` (max |Δt| to pair
 port with starboard, default 0.25 s), `--max-tf-age` (drop pings whose
 only TF is older than this, default 1 s), and `--max-pings` (cap output,
-for quick checks).
+for quick checks; a value below 1 is rejected).
 
 ### Splitting the output
 
@@ -157,6 +157,7 @@ output into parts by default:
 | `--split-duration <minutes>` | off | Start a new part when the current one covers this many minutes of pings. |
 | `--split-gap <seconds>` | 60 | Start a new part when more than this many seconds pass between two pings, for example when the sonar was switched off. `0` turns it off. |
 | `--no-split` | | One file, whatever its size, as before. Cannot be combined with the three options above. |
+| `--overwrite` | off | Let the run replace existing files of its output (see "Existing files" below). Without it the run refuses to start if any exist. |
 
 Negative, non-finite (`inf`, `nan`) and absurdly large values are
 rejected, as is a duration or gap that rounds to 0 ns. A size limit over 2 GB or smaller than one
@@ -199,18 +200,44 @@ refuses. `--output` that is a directory, or a folder that cannot be
 written, is refused up front the same way (status 2).
 
 With `--overwrite` the run replaces the files whose names it produces
-and the report lists every file it replaced. A one-part run goes through
-its time name before it takes the plain name, so an old file of that
-time name is replaced (and listed) too. Old files of the pattern that
+and the report lists every file it replaced. An old `.partial` is
+unlinked and created afresh, never opened for writing, so a symlink or a
+hard link under that name is removed as a name and its target (or the
+other link) is left alone; a finished part replaces an existing name by
+rename, which also swaps the name without writing through it. A
+one-part run goes through its time name before it takes the plain name,
+so an old file of that time name is replaced (and listed) too. Old files of the pattern that
 the run did not regenerate (for example the extra parts of an earlier,
 larger split) are never deleted; the run ends with a warning that the
 folder now mixes two runs and lists them. Remove them yourself when they
 are out of date.
 
-Without `--overwrite` nothing is ever replaced, even if a file appears
-while the run is going: `.partial` files are created exclusively and a
-part is moved into place only if its name is free. Such a run fails, the
-file that appeared is untouched, and the finished parts are listed.
+Without `--overwrite` a file that appears while the run is going is not
+replaced, with one caveat that depends on the filesystem. `.partial`
+files are always created exclusively. A finished part is then moved to
+its name by the first of these that the filesystem supports:
+
+1. a hard link followed by removing the `.partial`: atomic, fails if the
+   name exists (the normal case on local disks and most NAS shares);
+2. where hard links are not supported (FAT, some SMB shares), an atomic
+   no-replace rename (Linux `renameat2` with `RENAME_NOREPLACE`): the
+   same guarantee;
+3. where neither exists, a check that the name is free followed by a
+   rename. This is the only path with a gap: a file created in the
+   microseconds between the check and the rename would be replaced. The
+   up-front refusal has already ruled out every name that existed when
+   the run started.
+
+If the name is taken, the run fails with a non-zero status and the file
+that appeared is untouched. The finished part is complete data: it stays
+under its `.partial` name, and the report names it so you can rename it
+yourself. Parts already finished are listed as before. Syncing a part to
+disk is skipped on filesystems that cannot do it (`EINVAL`, `ENOSYS`,
+`ENOTSUP`); an I/O error while syncing still fails the run.
+
+If listing the folder or printing the summary fails after a complete
+conversion, the run still exits 0: the parts are written. It says so and
+says that the check for files of earlier runs could not be done.
 
 ## Schema
 
