@@ -121,7 +121,8 @@ near-field gate (`sample0`) is included. Altitude-above-bottom is taken
 from the latest `nadir_depth` (`sensor_msgs/Range`).
 
 **The bag must contain the full TF chain from `earth` to the sidescan
-frames** — a self-contained `bizzyboat_sonar` bag does; a sidescan-only
+frames**, and `earth` (or `--earth-frame`) must be an ancestor of the ping's
+`header.frame_id` in it — a self-contained `bizzyboat_sonar` bag does; a sidescan-only
 `*_sidescan_raw` bag has no nav and cannot be georeferenced. The
 down-look channel is dropped (XTF is a two-channel port/starboard
 format). The converted samples are raw amplitudes, untouched by any
@@ -129,8 +130,11 @@ artifact filtering.
 
 To trim dock idle from a survey, pass `--start-time` / `--end-time`
 (epoch seconds or an ISO-8601 UTC timestamp like
-`2026-06-15T16:26:49`); pings outside the window are skipped (TF is
-still consumed across the whole bag, so georeferencing is unaffected).
+`2026-06-15T16:26:49`); pings outside the window are skipped. TF is read
+from the start of the bag, so a ping at the start of the window has its
+transforms. After `--end-time` no new ping is taken; `/tf` is read only
+until the pings already held have their answer (a pose, or `tf_late` once
+`--tf-wait` of bag time has passed), then the rest of the bag is not read.
 A quick way to find the dock-out/dock-in times is the boat speed from
 `/bizzy/odom`. Example:
 
@@ -153,8 +157,19 @@ transform samples just past a ping come later in the bag than the ping, so
 the ping's time, then asks tf2 for the pose at exactly that time. There is
 no fallback to the latest transform and no option to turn one on. (Before
 this, 98% of the pings of a real bag were written with the latest
-transform, a pose 0.05 s old on median and up to 0.23 s old; every XTF
+transform. Measured on bag 2026-08-25T13-59-09: 524,684 of 535,122 written
+ping messages (98.05%) used the fallback, and the pose was older than the
+ping stamp by 0.049 s median, 0.112 s at the 99th percentile and 0.229 s
+at worst, over 267,559 port pings; the method and results are recorded in
+[issue #100](https://github.com/rolker/marine_tools/issues/100). Every XTF
 made earlier is affected, so regenerate any you still use.)
+
+Which port and starboard messages form a ping is decided first, on their
+stamps as recorded (`--pair-tolerance`), whatever the transforms are. The
+pose is then looked up for the pair. A ping that cannot be located is
+dropped **as a whole**, counted **once** under its reason, and neither of
+its messages can pair with a neighbour. The drop counters count pings;
+`unpaired` and `malformed` count messages.
 
 A ping is dropped, and counted by reason in the summary, when:
 
@@ -163,13 +178,21 @@ A ping is dropped, and counted by reason in the summary, when:
 | `no_tf` | its time is before the first transform sample of a link in the chain, or a frame of the chain never appears |
 | `tf_gap` | the two samples around its time, on any dynamic link of the chain, are further apart than `--max-tf-gap` |
 | `tf_late` | no transform past its time arrived within `--tf-wait`, or the bag ended first |
+| `tf_evicted` | its time is older than the oldest sample the `--tf-cache` still held, so older samples had been dropped (raise `--tf-cache`; with the default and a ping waiting at most `--tf-wait` this should stay 0) |
 | `tf_mismatch` | tf2 refused a lookup that the tool's own record of the samples said would work (should stay 0; if not, please report it) |
+
+Two more counters count messages, not pings; no ping is formed from them:
+
+| Counter | Meaning |
+|---|---|
+| `unpaired` | a port or starboard message whose stamp was not within `--pair-tolerance` of any message of the other channel (it was replaced by the next message of its own channel, or the bag ended first) |
+| `malformed` | a message with a sample rate of 0 or less, which cannot be converted |
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--max-tf-gap <s>` | 1 | Largest allowed interval between the two samples around the ping time, on every dynamic link of the chain (about ten periods of a 10 Hz chain). A sample exactly at the ping time passes whatever its neighbours. Static transforms never count. tf2 itself interpolates across a gap of any length without saying so, which is why the tool checks. |
-| `--tf-wait <s>` | 5 | How long a ping waits for transforms past its time, in seconds of bag time (the time the messages were recorded, not the sonar stamps). Must be larger than `--max-tf-gap`. A chain that is never published costs about this much queued data, not the whole bag. |
-| `--tf-cache <s>` | 600 | tf2 cache length. Must be larger than `--tf-wait` + `--max-tf-gap` + the offset below. |
+| `--tf-wait <s>` | 5 | How long a ping waits for transforms past its time, in seconds of bag time (the time the messages were recorded, not the sonar stamps). Must be larger than `--max-tf-gap`. With a negative offset (below) the pose is looked up after the stamp and the wait is extended by that much. A chain that is never published costs about this much queued data, not the whole bag. |
+| `--tf-cache <s>` | 600 | tf2 cache length (at most 10,000,000). Must be larger than `--tf-wait` + `--max-tf-gap` + the offset below. |
 | `--stamp-to-transmit-offset <s>` | 0 | See below. |
 
 `--max-tf-age` is gone. It limited how old a fallback "latest" transform
@@ -181,9 +204,12 @@ The run stops with exit 1 and a message, keeping the parts finished so far,
 if the transform tree is one it does not support: a frame that gets a
 second parent partway through the bag, or a frame published on both `/tf`
 and `/tf_static`. tf2 would silently keep only one of the two, so poses
-would be wrong. Transforms that tf2 itself rejects (NaN, a zero
-quaternion, a frame that is its own parent, an empty frame id, data older
-than the cache) are not used and are listed in the summary. A transform
+would be wrong. A loop in the tree stops the run the same way. Transforms
+that tf2 itself rejects (NaN, a zero quaternion, a frame that is its own
+parent, an empty frame id, data older than the cache) are not used and are
+listed in the summary; so is a stamp fed twice for the same frame
+(`duplicate_stamp`), which tf2 accepts and answers with whichever value
+came last, so check the recording if it is not 0. A transform
 that arrives after a transform with a later stamp for the same frame is
 filed in order, but a ping already answered from the wider bracket is not
 revisited.
@@ -316,14 +342,19 @@ Operator contacts become points from their own `geo_pose`. Deployment-log
 entries (`**<timestamp>** — text`) are placed on the boat track: the pose of
 `--track-frame` (default `bizzy/base_link`) at the entry's time, from tf2,
 with the same rules as `bag_to_xtf` above: transforms on both sides of the
-time, no fallback to the latest transform. The tool reads the whole bag's
-transforms first, so it never waits; an entry after the last transform is
-`tf_late`. Log timestamps have minute precision at best, so an entry is
+time, no fallback to the latest transform, and `earth` must be an ancestor
+of the track frame. The tool reads the whole bag's transforms first, so it
+never waits; an entry after the last transform is `tf_late`. Its
+`--tf-cache` (default 6 h) is the span of transforms kept: an entry older
+than what the cache still holds at the end of the bag is `tf_evicted`, and
+the tool says so and names the option to raise. Rejected or re-fed
+transforms are listed after the summary line. Log timestamps have minute precision at best, so an entry is
 located only as well as its time is known.
 
 An entry that cannot be located is still written, with `"geometry": null`,
 and a `geo_status` property: `exact` (located), `no_tf`, `tf_gap`,
-`tf_late` or `tf_mismatch`, with the meanings of the table above. The old
+`tf_late`, `tf_evicted` or `tf_mismatch`, with the meanings of the table
+above. The old
 `approx`, `stale` and `missing` statuses are gone.
 
 `--max-tf-gap` (default 1 s, the same bar as `bag_to_xtf`) replaces
