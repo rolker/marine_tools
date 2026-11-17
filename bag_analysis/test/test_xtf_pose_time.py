@@ -8,7 +8,9 @@ does, so several pings wait at once. The expected pose of each ping is
 computed from the two bracketing samples with an interpolation written for
 the test, not from tf2.
 
-Counters are per message (a ping pair is two messages).
+Drop counters (``no_tf``, ``tf_gap``, ``tf_late``, ``tf_mismatch``) count
+pings, a port and a starboard message paired on their stamps; ``unpaired``
+and ``malformed`` count messages.
 """
 
 import datetime as _dt
@@ -22,7 +24,7 @@ import numpy as np
 import pytest
 from xtf_fakes import (
     base_args, FRAME, PORT_TOPIC, read_ping_headers, STBD_TOPIC, Track,
-    track_messages)
+    track_messages, two_frame_messages)
 
 _NS = 1_000_000_000
 
@@ -41,8 +43,9 @@ def _wrap(d):
 
 
 def _dropped(report):
-    line = re.search(r'dropped: (.*)', report).group(1)
-    return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', line)}
+    lines = re.findall(r'dropped [^:\n]*: (.*)', report)
+    return {k: int(v) for line in lines
+            for k, v in re.findall(r'(\w+)=(\d+)', line)}
 
 
 def _check_pose(ping, geo):
@@ -116,8 +119,8 @@ def test_ping_before_the_first_sample_is_no_tf(
     rc, out = _run(tmp_path, monkeypatch, messages, '--no-split')
     report = capsys.readouterr().out
     assert rc == 0
-    # pings 1 and 2 (indices 0 and 1) are before sample 3: two pairs
-    assert _dropped(report)['no_tf'] == 4
+    # pings 1 and 2 (indices 0 and 1) are before sample 3: two pings
+    assert _dropped(report)['no_tf'] == 2
     pings = read_ping_headers(out)
     assert len(pings) == 58
     for stamp, ping in zip(stamps[2:], pings):
@@ -132,7 +135,7 @@ def test_ping_after_the_last_sample_is_tf_late(
     report = capsys.readouterr().out
     assert rc == 0
     late = [s for s in stamps if s > track.stamps[-1]]
-    assert _dropped(report)['tf_late'] == 2 * len(late)
+    assert _dropped(report)['tf_late'] == len(late)
     pings = read_ping_headers(out)
     assert len(pings) == 60 - len(late)
     for stamp, ping in zip(stamps[:len(pings)], pings):
@@ -154,7 +157,7 @@ def test_gap_longer_than_the_limit_drops_only_its_pings(
     inside = [s for s in stamps
               if track.stamps[19] < s < track.stamps[30]]
     assert len(inside) == 11
-    assert _dropped(report)['tf_gap'] == 22
+    assert _dropped(report)['tf_gap'] == 11
     kept = [s for s in stamps if s not in inside]
     pings = read_ping_headers(out)
     assert len(pings) == len(kept)
@@ -216,7 +219,7 @@ def test_two_links_with_different_rates_and_a_hole_in_the_slow_one(
     in_hole = [s for s in stamps
                if track.stamps[15] < s < track.stamps[50]]
     ok = [s for s in stamps if s not in in_hole]
-    assert _dropped(report)['tf_gap'] == 2 * len(in_hole) > 0
+    assert _dropped(report)['tf_gap'] == len(in_hole) > 0
     pings = read_ping_headers(out)
     assert len(pings) == len(ok)
     for stamp, ping in zip(ok, pings):
@@ -304,7 +307,7 @@ def test_a_chain_that_never_comes_costs_one_wait_not_the_bag(
     rc, out = _run(tmp_path, monkeypatch, messages, '--tf-wait', '2')
     report = capsys.readouterr().out
     assert rc == 1                       # nothing could be written
-    assert _dropped(report)['no_tf'] == 120
+    assert _dropped(report)['no_tf'] == 60
     assert not out.exists()
     # 2 s of bag time at 20 messages/s, plus the one being read
     assert max(depths) <= 45
@@ -322,7 +325,7 @@ def test_a_bad_stamp_does_not_flush_the_queue(tmp_path, monkeypatch, capsys):
     rc, out = _run(tmp_path, monkeypatch, messages, '--no-split')
     report = capsys.readouterr().out
     assert rc == 0
-    assert _dropped(report)['tf_late'] == 2
+    assert _dropped(report)['tf_late'] == 1
     good = [s for i, s in enumerate(stamps) if i != 30]
     pings = read_ping_headers(out)
     assert len(pings) == 59
@@ -333,20 +336,20 @@ def test_a_bad_stamp_does_not_flush_the_queue(tmp_path, monkeypatch, capsys):
 def test_a_lookup_that_fails_after_ready_is_counted_apart(
         tmp_path, monkeypatch, capsys):
     track = Track(70)
-    messages, _ = track_messages(track, 60)
+    messages, stamps = track_messages(track, 60)
     original = tf_lookup.TfChain.lookup
-    calls = []
+    refused = set(stamps[::3])          # every third ping
 
     def sometimes(self, frame, lookup_ns):
-        calls.append(1)
-        if len(calls) % 3 == 0:
+        if lookup_ns in refused:
             raise tf_lookup.TfMismatch('forced')
         return original(self, frame, lookup_ns)
     monkeypatch.setattr(tf_lookup.TfChain, 'lookup', sometimes)
     rc, out = _run(tmp_path, monkeypatch, messages, '--no-split')
     dropped = _dropped(capsys.readouterr().out)
     assert rc == 0
-    assert dropped['tf_mismatch'] == 40
+    assert dropped['tf_mismatch'] == 20     # a ping, not a message
+    assert len(read_ping_headers(out)) == 40
     assert dropped['no_tf'] == 0 and dropped['tf_gap'] == 0
 
 
@@ -487,3 +490,43 @@ def test_wait_gap_and_cache_are_checked_against_each_other(
     with pytest.raises(SystemExit) as exc:
         _run(tmp_path, monkeypatch, [], *extra)
     assert exc.value.code == 2
+
+
+# --- a ping is one unit: a dropped half takes its mate with it ---------------
+
+def _frame_hole_pings(track):
+    """
+    Three pings; the middle two are each missing a transform for one channel.
+
+    Ping A (starboard frame has no sample 12) loses its starboard half; ping B
+    (port frame has no sample 13) loses its port half, and its starboard half
+    is fine. A and B are 0.14 s apart, well inside the pairing tolerance, so
+    a surviving half that stays pending would pair with the other ping's
+    opposite channel.
+    """
+    s = track.stamps
+    before = (s[5] + 30_000_000, s[5] + 30_000_000)
+    a = (s[11] + 80_000_000, s[11] + 80_000_000)
+    b = (s[13] + 20_000_000, s[13] + 20_000_000)
+    after = (s[20] + 30_000_000, s[20] + 30_000_000)
+    return [before, a, b, after]
+
+
+def test_a_ping_with_one_unresolvable_half_is_dropped_whole(
+        tmp_path, monkeypatch, capsys):
+    track = Track(40)
+    pings = _frame_hole_pings(track)
+    messages = two_frame_messages(
+        track, pings, drop_port_samples={13}, drop_stbd_samples={12})
+    rc, out = _run(tmp_path, monkeypatch, messages, '--no-split',
+                   '--max-tf-gap', '0.15')
+    report = capsys.readouterr().out
+    assert rc == 0, report
+    written = read_ping_headers(out)
+    # Only the two untouched pings are written; the surviving half of each
+    # broken ping must not pair with the other broken ping's other half.
+    assert len(written) == 2, report
+    assert _dropped(report)['tf_gap'] == 2     # one per ping, not per message
+    assert _dropped(report)['unpaired'] == 0
+    for ping, (port_ns, _) in zip(written, (pings[0], pings[3])):
+        _check_pose(ping, track.geo_at(port_ns))

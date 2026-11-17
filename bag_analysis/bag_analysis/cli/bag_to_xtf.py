@@ -78,7 +78,7 @@ import numpy as np
 
 from ..reader import iter_messages
 from ..tf_lookup import (
-    NO_TF, READY, stamp_ns as _stamp_ns, TF_GAP, TF_LATE, TfChain,
+    DEFINITE, NO_TF, READY, stamp_ns as _stamp_ns, TF_GAP, TF_LATE, TfChain,
     TfChainError, TfMismatch, WAITS)
 from ..xtf.geo import ecef_pose_to_geo
 from ..xtf.writer import (
@@ -457,7 +457,7 @@ def _seconds_per_ping(prev: _PendingPing | None, cur: _PendingPing) -> float:
 
 
 class _Held:
-    """A ping read from the bag, waiting for the transforms past its time."""
+    """One sonar message, read from the bag and not yet paired or looked up."""
 
     __slots__ = ('side', 'msg', 'raw_ns', 'record_ns', 'lookup_ns',
                  'altitude')
@@ -472,56 +472,106 @@ class _Held:
         self.altitude = altitude
 
 
+class _HeldPing:
+    """
+    A port and a starboard message paired on their stamps, awaiting a pose.
+
+    Which two messages form a ping is decided on the stamps as recorded and
+    nothing else, so a missing transform can never change it. The pair is
+    georeferenced, or dropped, as a whole. ``record_ns`` (bag time) is that
+    of the message that completed the pair, and ``altitude`` the nadir range
+    seen with it.
+    """
+
+    __slots__ = ('port', 'stbd', 'record_ns', 'altitude')
+
+    def __init__(self, port, stbd, completing):
+        """Pair ``port`` with ``stbd``; ``completing`` was read last."""
+        self.port = port
+        self.stbd = stbd
+        self.record_ns = completing.record_ns
+        self.altitude = completing.altitude
+
+
+def _ping_verdict(item, chain, final):
+    """
+    Return the verdict for a held ping, from the verdicts of both halves.
+
+    A definite refusal of either half (port first) is the ping's. Otherwise
+    a half that still waits makes the ping wait, and ``final`` turns that
+    wait into its answer. Only when both halves are ready is it ``ready``.
+    """
+    verdicts = [chain.check(h.msg.header.frame_id, h.lookup_ns)
+                for h in (item.port, item.stbd)]
+    for verdict in verdicts:
+        if verdict in DEFINITE:
+            return verdict
+    for verdict in verdicts:
+        if verdict in WAITS:
+            return chain.settle(verdict) if final else verdict
+    return READY
+
+
 def _resolve(held, chain, counts, now_ns, wait_ns, final):
     """
     Release pings from the front of ``held`` whose answer is known.
 
-    Yields ``(ping, pose)`` for each one that can be georeferenced and counts
-    the others by reason. Strictly first in, first out: a ping that still
-    waits blocks those behind it, so order and pairing are as read. A wait
-    ends when ``now_ns`` (bag record time) is more than ``wait_ns`` past the
-    ping's own record time, or when ``final`` says no more transforms will
-    come; the wait is then settled as ``no_tf`` or ``tf_late``.
+    Yields ``(ping, port_pose, stbd_pose)`` for each one that can be
+    georeferenced and counts the others, once per ping, by reason. Strictly
+    first in, first out: a ping that still waits blocks those behind it, so
+    order is as read. A wait ends when ``now_ns`` (bag record time) is more
+    than ``wait_ns`` past the ping's own record time, or when ``final`` says
+    no more transforms will come; the wait is then settled as ``no_tf`` or
+    ``tf_late``.
     """
     while held:
         head = held[0]
-        verdict = chain.check(head.msg.header.frame_id, head.lookup_ns)
+        verdict = _ping_verdict(head, chain, final=False)
         if verdict in WAITS:
             if not final and now_ns - head.record_ns <= wait_ns:
                 return
-            verdict = chain.settle(verdict)
+            verdict = _ping_verdict(head, chain, final=True)
         held.popleft()
         if verdict == READY:
             try:
-                pose = chain.lookup(head.msg.header.frame_id, head.lookup_ns)
+                poses = [chain.lookup(h.msg.header.frame_id, h.lookup_ns)
+                         for h in (head.port, head.stbd)]
             except TfMismatch:
                 counts['tf_mismatch'] += 1
                 continue
-            yield head, pose
+            yield head, poses[0], poses[1]
         else:
             counts[verdict] += 1
 
 
-def _pair_up(pending, held, pose, args, counts):
+def _pair_by_stamp(pending, half, args, counts):
     """
-    Pair a georeferenced ping with the waiting one of the other channel.
+    Pair a message with the waiting one of the other channel, by stamp.
 
-    Returns ``(port, starboard)`` when it completes a pair, else ``None``
-    after storing it (a ping it replaces is counted ``unpaired``). Pairing
-    compares the stamps as recorded.
+    Returns the :class:`_HeldPing` when it completes a pair, else ``None``
+    after storing the message; a message of the same channel it replaces was
+    never mated and is counted ``unpaired`` (per message). Pairing compares
+    the stamps as recorded and never looks at transforms.
     """
-    ping = _make_pending(held.msg, held.raw_ns, args.offset_ns, pose)
-    side = held.side
-    other = 'starboard' if side == 'port' else 'port'
-    mate = pending[other]
+    side = half.side
+    mate = pending['starboard' if side == 'port' else 'port']
     pair_tol_ns = args.pair_tolerance * _NS_PER_S
-    if mate is not None and abs(ping.raw_ns - mate.raw_ns) <= pair_tol_ns:
+    if mate is not None and abs(half.raw_ns - mate.raw_ns) <= pair_tol_ns:
         pending['port'] = pending['starboard'] = None
-        return (ping, mate) if side == 'port' else (mate, ping)
+        return _HeldPing(*((half, mate) if side == 'port' else (mate, half)),
+                         completing=half)
     if pending[side] is not None:
         counts['unpaired'] += 1  # discarded; mate never arrived
-    pending[side] = ping
+    pending[side] = half
     return None
+
+
+def _georeference(item, port_pose, stbd_pose, args):
+    """Return the ``(port, starboard)`` pending pings of a resolved pair."""
+    return (_make_pending(item.port.msg, item.port.raw_ns, args.offset_ns,
+                          port_pose),
+            _make_pending(item.stbd.msg, item.stbd.raw_ns, args.offset_ns,
+                          stbd_pose))
 
 
 def _iter_pings(args, counts):
@@ -529,13 +579,15 @@ def _iter_pings(args, counts):
     Read the bag and yield ``(port, starboard, altitude)`` per paired ping.
 
     Owns everything up to the write: the TF chain, nadir tracking, the
-    ``--start-time``/``--end-time`` window, georeferencing and port/
-    starboard pairing. A ping that passes the window waits in a queue until
-    the transforms past its lookup time (stamp - offset) have been read,
-    then gets a stamped tf2 lookup; see ``_resolve``. ``altitude`` is the
-    latest nadir range seen when the completing ping was read (``None``
-    before the first one). The pending pair is cleared before each ``yield``
-    so a consumer that stops early (``--max-pings``) does not see the
+    ``--start-time``/``--end-time`` window, port/starboard pairing and
+    georeferencing. Pairing comes first and uses the stamps alone; the pair
+    then waits in a queue until the transforms past its lookup time
+    (stamp - offset) have been read, and gets a stamped tf2 lookup for each
+    half; see ``_resolve``. A pair whose pose cannot be found is dropped as
+    a whole and counted once under its reason. ``altitude`` is the latest
+    nadir range seen when the completing message was read (``None`` before
+    the first one). The pending pair is cleared before each ``yield`` so a
+    consumer that stops early (``--max-pings``) does not see the
     just-yielded pair counted as ``unpaired``; pings still waiting are
     discarded without being counted.
     """
@@ -544,7 +596,9 @@ def _iter_pings(args, counts):
         '/tf', '/tf_static', args.port_topic, args.starboard_topic,
         args.nadir_topic,
     ]
-    wait_ns = round(args.tf_wait * _NS_PER_S)
+    # A negative offset looks the pose up after the stamp, so the wait is
+    # counted from the lookup time, not the record time.
+    wait_ns = round(args.tf_wait * _NS_PER_S) + max(0, -args.offset_ns)
     start_ns = _parse_time(args.start_time)
     end_ns = _parse_time(args.end_time)
 
@@ -561,7 +615,7 @@ def _iter_pings(args, counts):
                 chain.feed(msg.transforms, static=True,
                            authority='bag_to_xtf')
             elif not admitting:
-                continue    # past --end-time: only /tf, to settle the queue
+                pass    # past --end-time: nothing new, but time still runs
             elif topic == args.nadir_topic:
                 latest_altitude = float(msg.range)
                 counts['nadir'] += 1
@@ -579,24 +633,27 @@ def _iter_pings(args, counts):
                 elif float(msg.sample_rate) <= 0.0:
                     counts['malformed'] += 1
                 else:
-                    held.append(_Held(side, msg, raw_ns, t_ns,
-                                      args.offset_ns, latest_altitude))
+                    pair = _pair_by_stamp(
+                        pending,
+                        _Held(side, msg, raw_ns, t_ns, args.offset_ns,
+                              latest_altitude),
+                        args, counts)
+                    if pair is not None:
+                        held.append(pair)
             else:
                 continue
 
-            for item, pose in _resolve(
+            for item, port_pose, stbd_pose in _resolve(
                     held, chain, counts, t_ns, wait_ns, final=False):
-                pair = _pair_up(pending, item, pose, args, counts)
-                if pair is not None:
-                    yield pair[0], pair[1], item.altitude
+                port, stbd = _georeference(item, port_pose, stbd_pose, args)
+                yield port, stbd, item.altitude
             if not admitting and not held:
                 break
 
-        for item, pose in _resolve(held, chain, counts, 0, wait_ns,
-                                   final=True):
-            pair = _pair_up(pending, item, pose, args, counts)
-            if pair is not None:
-                yield pair[0], pair[1], item.altitude
+        for item, port_pose, stbd_pose in _resolve(
+                held, chain, counts, 0, wait_ns, final=True):
+            port, stbd = _georeference(item, port_pose, stbd_pose, args)
+            yield port, stbd, item.altitude
     finally:
         counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
         counts['tf_rejected'] = dict(chain.rejected)
@@ -1204,9 +1261,12 @@ def _report(sink, ping_count: int, counts: dict, args) -> None:
     _report_parts(parts, limit=args.split_bytes)
     _report_replaced(sink)
     print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
-          f' paired={counts["paired"]}')
-    print(f'  dropped: no_tf={counts[NO_TF]} tf_gap={counts[TF_GAP]} '
-          f'tf_late={counts[TF_LATE]} tf_mismatch={counts["tf_mismatch"]} '
+          f' paired={counts["paired"]} (pings)')
+    print('  dropped pings (a port and a starboard message paired on their '
+          f'stamps, counted once): no_tf={counts[NO_TF]} '
+          f'tf_gap={counts[TF_GAP]} tf_late={counts[TF_LATE]} '
+          f'tf_mismatch={counts["tf_mismatch"]}')
+    print('  dropped messages (no ping formed): '
           f'malformed={counts["malformed"]} unpaired={counts["unpaired"]}')
     print(f'  stamp-to-transmit offset: {args.stamp_to_transmit_offset:g} s '
           '(pose looked up at stamp - offset; that is the ping time '

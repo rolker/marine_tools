@@ -87,16 +87,31 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    inter-ping intervals are identical on either clock; only labels move. A
    part can therefore be named up to |offset| before the first raw stamp that
    `--start-time` admitted; documented.
-4. **Hold queue in `_iter_pings`.** A ping that passes the window and the
-   `sample_rate` check is appended to a FIFO queue with its raw message, its
-   bag record time and its altitude snapshot (the nadir value current when it
-   is read). After every message the head is resolved repeatedly: `ready` ->
-   stamped lookup (a `TfMismatch` is counted `tf_mismatch`, never a
-   fallback), then the existing pairing code and `yield`; `no_tf`/`tf_gap` ->
-   count and skip; a wait -> stop (head-of-line blocks, so emitted order,
-   pairing and `unpaired` are as today). The pair's altitude is the snapshot
-   of the completing, later-read ping, which is what today's code uses.
-   `_lookup_pose` and the `approx` status are deleted.
+4. **Pairing first, then the hold queue in `_iter_pings`.** (Revised after
+   local review round 1: pairing used to follow the lookup, so a ping dropped
+   for a transform reason left its mate pending, and the mate paired with the
+   next transmit's opposite channel, 0.1 s later and inside the tolerance.
+   Reproduced by `test_a_ping_with_one_unresolvable_half_is_dropped_whole`
+   before the fix.) A message that passes the window and the `sample_rate`
+   check is paired at once with the waiting message of the other channel on
+   the **stamps as recorded, and nothing else** (`_pair_by_stamp`); which two
+   messages form a ping no longer depends on any transform. A pair is
+   appended to a FIFO queue (`_HeldPing`: both messages, the record time and
+   altitude snapshot of the completing, later-read message). After every
+   message the head is resolved repeatedly: both halves `ready` -> a stamped
+   lookup for each (a `TfMismatch` on either is counted `tf_mismatch`, never a
+   fallback) and `yield`; a definite refusal of either half (`no_tf`,
+   `tf_gap`, `tf_evicted`) -> the whole ping is dropped and counted once; a
+   wait on either -> stop (head-of-line blocks, so emitted order is as read).
+   Nothing is left pending by a dropped ping, so it cannot pair with a
+   neighbour and is not also counted `unpaired`. A message replaced in
+   `pending` by a later one of the same channel, or left at the end, is
+   `unpaired`. `_lookup_pose` and the `approx` status are deleted.
+   **What the counters count:** `no_tf`, `tf_gap`, `tf_late`,
+   `tf_evicted` and `tf_mismatch` count **pings** (a port and a starboard
+   message paired on their stamps, once each); `paired` counts pings;
+   `port msgs`/`starboard msgs`, `malformed`, `unpaired` and `out_of_window`
+   count **messages**. The report prints them on two lines that say so.
 5. **Bounded hold, on bag record time.** The wait limit is `--tf-wait`
    (default 5 s), measured from the ping's own record time against the record
    time of the message just read (record time is monotone; stamps are not
@@ -117,8 +132,8 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    that errors, so `--max-tf-a` prefix matching cannot hit it either:
    `allow_abbrev=False`). New: `--tf-wait`, `--stamp-to-transmit-offset`.
    Report: first line unchanged (`wrote N XTF pings ...`), then the
-   counters line `dropped: no_tf= tf_gap= tf_late= tf_mismatch= malformed=
-   unpaired=`, then a line with the offset and the pose time (`pose looked up
+   two counter lines (`dropped pings ...: no_tf= tf_gap= tf_late=
+   tf_mismatch=` and `dropped messages ...: malformed= unpaired=`), then a line with the offset and the pose time (`pose looked up
    at stamp - offset; ping time written = that`) and any transforms the
    tracker rejected. `approx_tf` and its note are removed.
 7. **`--end-time`**: the first ping past the end time is still counted in

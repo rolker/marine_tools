@@ -263,3 +263,35 @@ def read_ping_headers(path):
         })
         offset += struct.unpack_from('<I', h, 10)[0]
     return out
+
+
+def two_frame_messages(track, pings, *, drop_port_samples=(),
+                       drop_stbd_samples=(), tf_delay_s=0.25,
+                       ping_lag_s=0.01):
+    """
+    Return /tf and ping messages for a port and a starboard sensor frame.
+
+    The sensors sit in frames ``sonar_port`` and ``sonar_stbd``, both with
+    the track's pose, so a transform sample can be missing for one channel
+    only. ``pings`` lists ``(port_stamp_ns, stbd_stamp_ns)`` per ping;
+    ``drop_port_samples`` and ``drop_stbd_samples`` are track sample
+    indices left out of that frame's /tf.
+    """
+    entries = []
+    for k in range(len(track.stamps)):
+        for child, dropped in (('sonar_port', drop_port_samples),
+                               ('sonar_stbd', drop_stbd_samples)):
+            if k not in dropped:
+                rec = track.stamps[k] + int(tf_delay_s * _NS)
+                entries.append((rec, 0, k, '/tf',
+                                track.tf_msg(k, child=child)))
+    for n, (port_ns, stbd_ns) in enumerate(pings):
+        port = _sonar_msg(port_ns, n, 40)
+        port.header.frame_id = 'sonar_port'
+        stbd = _sonar_msg(stbd_ns, n + 500, 40)
+        stbd.header.frame_id = 'sonar_stbd'
+        rec = max(port_ns, stbd_ns) + int(ping_lag_s * _NS)
+        entries.append((rec, 2, n, PORT_TOPIC, port))
+        entries.append((rec, 3, n, STBD_TOPIC, stbd))
+    entries.sort(key=lambda e: e[:3])
+    return [(e[3], e[4], e[0]) for e in entries]
