@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 from bag_analysis import tf_lookup
 from bag_analysis.tf_lookup import (
-    NO_TF, READY, TF_GAP, TF_LATE, TfChain, TfChainError, TfMismatch,
+    NO_TF, READY, TF_EVICTED, TF_GAP, TF_LATE, TfChain, TfChainError, TfMismatch,
     WAIT_CHAIN, WAIT_LATE)
 from builtin_interfaces.msg import Time as TimeMsg
 from geometry_msgs.msg import TransformStamped
@@ -280,3 +280,58 @@ def test_agrees_with_tf2_on_random_streams(seed):
         assert (verdict in (READY, TF_GAP)) == ok, (seed, ns, verdict)
         if ok:
             c.lookup('a', ns)
+
+
+def test_a_loop_is_an_error_whatever_the_links_before_it_say():
+    c = chain()
+    feed(c, tf('b', 'a', 100 * S), tf('a', 'b', 100 * S))
+    # Before the first sample a definite NO_TF used to be returned first.
+    with pytest.raises(TfChainError, match='loop'):
+        c.check('a', 50 * S)
+
+
+def test_a_link_with_no_sample_yet_makes_the_chain_wait():
+    c = chain()
+    feed(c, tf('earth', 'a', 100 * S), tf('a', 'b', 100 * S))
+    c._stamps['a'].items.clear()            # as if its stamps were gone
+    assert c.check('b', 100 * S) == WAIT_CHAIN
+
+
+def test_the_buffer_and_the_tracker_share_one_cache_length_in_ns():
+    # round() gives 10.000000001 s, truncation 10.000000000 s: a sample the
+    # tracker keeps must not be one tf2 has refused.
+    c = chain(cache=10.0000000006)
+    feed(c, tf('earth', 'a', 110 * S + 1))
+    feed(c, tf('earth', 'a', 100 * S))
+    assert c.rejected['older_than_cache'] == 0
+    assert c.check('a', 100 * S) == READY
+    assert bare_ok(c.buffer, 'earth', 'a', 100 * S)
+
+
+@pytest.mark.parametrize('cache, gap', [
+    (1e30, 1.0), (0.0, 1.0), (-1.0, 1.0), (600.0, 1e-10), (600.0, 0.0)])
+def test_option_values_the_buffer_cannot_take_are_refused(cache, gap):
+    with pytest.raises(ValueError):
+        TfChain('earth', cache, gap)
+
+
+def test_a_stamp_fed_twice_is_counted():
+    c = chain()
+    feed(c, tf('earth', 'a', 100 * S, x=1.0))
+    feed(c, tf('earth', 'a', 100 * S, x=2.0))
+    feed(c, tf('earth', 'a', 101 * S))
+    assert c.rejected['duplicate_stamp'] == 1
+    assert c.check('a', 100 * S) == READY      # tf2 kept one, tracker one
+
+
+def test_a_sample_the_cache_dropped_is_tf_evicted_not_no_tf():
+    c = chain(cache=10.0)
+    feed(c, tf('earth', 'a', 100 * S), tf('earth', 'a', 105 * S),
+         tf('earth', 'a', 112 * S), tf('earth', 'a', 125 * S))
+    assert c.check('a', 100 * S) == TF_EVICTED
+    assert c.check('a', 104 * S) == TF_EVICTED
+    assert c.check('a', 105 * S) == READY
+    assert c.settle(TF_EVICTED) == TF_EVICTED
+    other = chain(cache=10.0)
+    feed(other, tf('earth', 'b', 112 * S))
+    assert other.check('b', 100 * S) == NO_TF   # nothing was ever dropped

@@ -23,9 +23,11 @@ same map (QGIS, web, CAMP):
   dropped. ``geo_status`` is ``exact`` (located), ``no_tf`` (before the first
   transform, or the frame is not in the tree), ``tf_gap`` (the transforms
   around the time are further apart than ``--max-tf-gap``), ``tf_late``
-  (after the last transform) or ``tf_mismatch`` (tf2 refused a lookup the
-  tool had expected to work). Log entries carry minute precision at best;
-  that uncertainty is the entry's own and is not changed by any of this.
+  (after the last transform), ``tf_evicted`` (older than the transforms the
+  ``--tf-cache`` length still held at the end of the bag; raise it) or
+  ``tf_mismatch`` (tf2 refused a lookup the tool had expected to work). Log
+  entries carry minute precision at best; that uncertainty is the entry's own
+  and is not changed by any of this.
 
 GeoJSON has no native time type, so timestamps live in ``properties`` as
 ISO-8601 (``time``) plus epoch seconds (``t_epoch``). Coordinates are
@@ -54,8 +56,8 @@ import sys
 
 from ..reader import iter_messages
 from ..tf_lookup import (
-    NO_TF, READY, stamp_ns as _stamp_ns, TF_GAP, TF_LATE, TfChain,
-    TfChainError, TfMismatch)
+    MAX_CACHE_S, NO_TF, READY, stamp_ns as _stamp_ns, TF_EVICTED, TF_GAP,
+    TF_LATE, TfChain, TfChainError, TfMismatch)
 from ..xtf.geo import ecef_pose_to_geo
 
 _DEFAULT_CONTACTS = '/operator/sonar_waterfall/contacts'
@@ -119,6 +121,14 @@ def _parse_args(argv):
                         ('--tf-cache', args.tf_cache)):
         if not math.isfinite(value) or value <= 0.0:
             parser.error(f'{flag} must be a finite number above 0')
+    if round(args.max_tf_gap * 1e9) < 1:
+        parser.error(
+            f'--max-tf-gap {args.max_tf_gap:g} rounds to 0 ns; it must be at '
+            'least 1 ns')
+    if args.tf_cache > MAX_CACHE_S:
+        parser.error(
+            f'--tf-cache {args.tf_cache:g} is absurdly large (maximum '
+            f'{MAX_CACHE_S:g} s)')
     return args
 
 
@@ -249,14 +259,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     features = list(contacts)
-    log_stats = {'exact': 0, NO_TF: 0, TF_GAP: 0, TF_LATE: 0,
+    log_stats = {'exact': 0, NO_TF: 0, TF_GAP: 0, TF_LATE: 0, TF_EVICTED: 0,
                  'tf_mismatch': 0}
     if want_track:
         # The whole bag is in the chain, so nothing is left to wait for.
-        for t_ns, text in _read_log_entries(args.log):
-            feat = _log_feature(t_ns, text, chain, args)
-            log_stats[feat['properties']['geo_status']] += 1
-            features.append(feat)
+        try:
+            for t_ns, text in _read_log_entries(args.log):
+                feat = _log_feature(t_ns, text, chain, args)
+                log_stats[feat['properties']['geo_status']] += 1
+                features.append(feat)
+        except TfChainError as exc:
+            print(f'error: unsupported transform tree: {exc}',
+                  file=sys.stderr)
+            return 1
 
     features.sort(key=lambda f: f['properties']['t_epoch'])
     collection = {'type': 'FeatureCollection', 'features': features}
@@ -271,9 +286,19 @@ def main(argv: list[str] | None = None) -> int:
           + (f' + {n_log} log entries '
              f'({log_stats["exact"]} located, {log_stats[NO_TF]} no_tf, '
              f'{log_stats[TF_GAP]} tf_gap, {log_stats[TF_LATE]} tf_late, '
+             f'{log_stats[TF_EVICTED]} tf_evicted, '
              f'{log_stats["tf_mismatch"]} tf_mismatch)'
              if want_track else '')
           + f' -> {args.output}')
+    if log_stats[TF_EVICTED]:
+        print(f'warning: {log_stats[TF_EVICTED]} log entries are older than '
+              'the transforms the cache still held when the bag ended '
+              f'(--tf-cache {args.tf_cache:g} s); raise --tf-cache to '
+              'locate them', file=sys.stderr)
+    if want_track and chain.rejected:
+        reasons = ', '.join(
+            f'{k}={v}' for k, v in sorted(chain.rejected.items()))
+        print(f'note: transforms rejected or re-fed: {reasons}')
     return 0
 
 

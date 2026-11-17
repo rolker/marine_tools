@@ -78,8 +78,8 @@ import numpy as np
 
 from ..reader import iter_messages
 from ..tf_lookup import (
-    DEFINITE, NO_TF, READY, stamp_ns as _stamp_ns, TF_GAP, TF_LATE, TfChain,
-    TfChainError, TfMismatch, WAITS)
+    DEFINITE, MAX_CACHE_S, NO_TF, READY, stamp_ns as _stamp_ns, TF_EVICTED,
+    TF_GAP, TF_LATE, TfChain, TfChainError, TfMismatch, WAITS)
 from ..xtf.geo import ecef_pose_to_geo
 from ..xtf.writer import (
     ChannelPing,
@@ -172,7 +172,10 @@ def _build_parser() -> argparse.ArgumentParser:
         '--tf-wait', type=float, default=5.0, metavar='SECONDS',
         help=('How long (s of bag time) a ping waits for transforms past its '
               'time before it is dropped (counted tf_late). Must be larger '
-              'than --max-tf-gap. Default 5.'),
+              'than --max-tf-gap. With a negative '
+              '--stamp-to-transmit-offset the pose is looked up that much '
+              'after the stamp, and the wait is extended by the same amount. '
+              'Default 5.'),
     )
     p.add_argument(
         '--stamp-to-transmit-offset', type=float, default=0.0,
@@ -294,6 +297,22 @@ def _parse_args(argv):
             parser.error(f'{flag} must be a finite number')
     if args.max_tf_gap <= 0.0:
         parser.error('--max-tf-gap must be greater than 0')
+    if round(args.max_tf_gap * _NS_PER_S) < 1:
+        parser.error(
+            f'--max-tf-gap {args.max_tf_gap:g} rounds to 0 ns; it must be at '
+            'least 1 ns')
+    if args.tf_cache > MAX_CACHE_S:
+        parser.error(
+            f'--tf-cache {args.tf_cache:g} is absurdly large (maximum '
+            f'{MAX_CACHE_S:g} s)')
+    for flag, value in (('--start-time', args.start_time),
+                        ('--end-time', args.end_time)):
+        try:
+            _parse_time(value)
+        except (ValueError, OverflowError):
+            parser.error(
+                f'{flag} {value!r} is not epoch seconds or an ISO-8601 '
+                'timestamp')
     if abs(args.stamp_to_transmit_offset) > _MAX_OFFSET_S:
         parser.error(
             f'--stamp-to-transmit-offset {args.stamp_to_transmit_offset:g} '
@@ -1111,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
 
     counts = {
         'port': 0, 'starboard': 0, 'paired': 0, NO_TF: 0, TF_GAP: 0,
-        TF_LATE: 0, 'tf_mismatch': 0, 'malformed': 0, 'unpaired': 0,
+        TF_LATE: 0, TF_EVICTED: 0, 'tf_mismatch': 0, 'malformed': 0, 'unpaired': 0,
         'nadir': 0, 'no_altitude': 0, 'out_of_window': 0,
     }
     sink = _PartSink(args.output, args.sonar_name, args.layout, args.overwrite)
@@ -1265,6 +1284,7 @@ def _report(sink, ping_count: int, counts: dict, args) -> None:
     print('  dropped pings (a port and a starboard message paired on their '
           f'stamps, counted once): no_tf={counts[NO_TF]} '
           f'tf_gap={counts[TF_GAP]} tf_late={counts[TF_LATE]} '
+          f'tf_evicted={counts[TF_EVICTED]} '
           f'tf_mismatch={counts["tf_mismatch"]}')
     print('  dropped messages (no ping formed): '
           f'malformed={counts["malformed"]} unpaired={counts["unpaired"]}')
@@ -1277,7 +1297,7 @@ def _report(sink, ping_count: int, counts: dict, args) -> None:
     if counts.get('tf_rejected'):
         reasons = ', '.join(
             f'{k}={v}' for k, v in sorted(counts['tf_rejected'].items()))
-        print(f'  note: tf2 rules rejected transforms: {reasons}')
+        print(f'  note: transforms rejected or re-fed: {reasons}')
     if counts['nadir'] == 0:
         print('  warning: no nadir_depth messages; altitude written as 0 for '
               'all pings')

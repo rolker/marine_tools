@@ -227,7 +227,7 @@ def test_before_first_after_last_and_gap(tmp_path, monkeypatch, capsys):
         assert (f['geometry'] is None) == (
             f['properties']['geo_status'] != 'exact')
     out = capsys.readouterr().out
-    assert '1 located, 1 no_tf, 1 tf_gap, 1 tf_late, 0 tf_mismatch' in out
+    assert '1 located, 1 no_tf, 1 tf_gap, 1 tf_late, 0 tf_evicted, 0 tf_mismatch' in out
 
 
 def test_max_tf_gap_widens_the_bracket(tmp_path, monkeypatch):
@@ -260,6 +260,56 @@ def test_max_tf_gap_must_be_positive_and_finite(
         tmp_path, monkeypatch, value):
     with pytest.raises(SystemExit) as exc:
         _run(tmp_path, monkeypatch, [], None, '--max-tf-gap=' + value)
+    assert exc.value.code == 2
+
+
+def test_entry_older_than_the_cache_is_tf_evicted_not_no_tf(
+        tmp_path, monkeypatch, capsys):
+    track = _track()                 # 10 s of samples
+    lines = [_entry(T0_NS + 4 * _NS, 'old'), _entry(T0_NS + 8 * _NS, 'new')]
+    rc, feats = _run(tmp_path, monkeypatch, _tf_messages(track), lines,
+                     '--tf-cache', '3')
+    assert rc == 0
+    status = {f['properties']['text']: f['properties']['geo_status']
+              for f in feats}
+    assert status == {'old': 'tf_evicted', 'new': 'exact'}
+    captured = capsys.readouterr()
+    assert '1 tf_evicted' in captured.out
+    assert 'raise --tf-cache' in captured.err
+
+
+def test_rejected_transforms_are_reported(tmp_path, monkeypatch, capsys):
+    track = _track()
+    messages = _tf_messages(track)
+    bad = track.tf_msg(5, child=_FRAME)
+    bad.transforms[0].transform.translation.x = float('nan')
+    messages.insert(3, ('/tf', bad, track.stamps[3]))
+    messages.insert(4, ('/tf', track.tf_msg(2, child=_FRAME),
+                        track.stamps[4]))     # a stamp already held
+    rc, _ = _run(tmp_path, monkeypatch, messages,
+                 [_entry(T0_NS + 4 * _NS, 'x')])
+    assert rc == 0
+    assert ('note: transforms rejected or re-fed: duplicate_stamp=1, '
+            'not_finite=1') in capsys.readouterr().out
+
+
+def test_a_loop_in_the_tree_stops_the_run(tmp_path, monkeypatch, capsys):
+    track = _track()
+    messages = [
+        ('/tf', track.tf_msg(0, child=_FRAME, parent='loop_b'), 0),
+        ('/tf', track.tf_msg(0, child='loop_b', parent=_FRAME), 0)]
+    rc, feats = _run(tmp_path, monkeypatch, messages,
+                     [_entry(T0_NS, 'before everything')])
+    assert rc == 1
+    assert 'loop' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('extra', [
+    ['--tf-cache', '1e30'], ['--max-tf-gap', '1e-10']])
+def test_cache_and_gap_edge_values_are_usage_errors(
+        tmp_path, monkeypatch, extra):
+    with pytest.raises(SystemExit) as exc:
+        _run(tmp_path, monkeypatch, [], None, *extra)
     assert exc.value.code == 2
 
 

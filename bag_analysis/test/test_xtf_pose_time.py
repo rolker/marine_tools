@@ -270,7 +270,7 @@ def test_end_time_keeps_the_pings_still_waiting(
     # the first ping past the end is counted, as before; nothing after it
     assert 'port msgs=42 starboard msgs=41' in report
     assert _dropped(report) == {
-        'no_tf': 0, 'tf_gap': 0, 'tf_late': 0, 'tf_mismatch': 0,
+        'no_tf': 0, 'tf_gap': 0, 'tf_late': 0, 'tf_evicted': 0, 'tf_mismatch': 0,
         'malformed': 0, 'unpaired': 0}
 
 
@@ -361,7 +361,7 @@ def test_transforms_tf2_rejects_are_reported(tmp_path, monkeypatch, capsys):
     messages.insert(3, ('/tf', bad, messages[3][2]))
     rc, _ = _run(tmp_path, monkeypatch, messages, '--no-split')
     assert rc == 0
-    assert 'rejected transforms: not_finite=1' in capsys.readouterr().out
+    assert 'transforms rejected or re-fed: not_finite=1' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('bad_tree, message', [
@@ -484,6 +484,11 @@ def test_max_tf_age_cannot_be_reached_by_a_prefix(
     ['--tf-cache', '5'],                          # not above the wait
     ['--tf-cache', '6.5', '--stamp-to-transmit-offset', '-1'],
     ['--tf-cache', 'inf'],
+    ['--tf-cache', '1e30'],                       # beyond what Duration holds
+    ['--max-tf-gap', '1e-10'],                    # rounds to 0 ns
+    ['--start-time', 'nan'],
+    ['--end-time', 'inf'],
+    ['--start-time', 'yesterday'],
 ])
 def test_wait_gap_and_cache_are_checked_against_each_other(
         tmp_path, monkeypatch, extra):

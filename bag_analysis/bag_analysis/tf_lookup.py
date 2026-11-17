@@ -15,6 +15,9 @@ up only when the answer is sound:
   chain) have not been read yet; the caller holds the data and asks again
   after reading more;
 * ``no_tf``: the time is before a link's first sample;
+* ``tf_evicted``: the time is before the oldest sample the cache still
+  holds, and older samples were dropped from it, so the answer is lost to
+  the cache length, not to the bag (raise the cache length);
 * ``tf_gap``: the two samples around the time are further apart than the
   gap limit.
 
@@ -49,14 +52,19 @@ from tf2_ros import Buffer, TransformException
 READY = 'ready'
 NO_TF = 'no_tf'
 TF_GAP = 'tf_gap'
+TF_EVICTED = 'tf_evicted'
 TF_LATE = 'tf_late'
 WAIT_CHAIN = 'wait_chain'
 WAIT_LATE = 'wait_late'
 
 NS_PER_S = 1_000_000_000
 
+# Longest cache length accepted (s): Duration holds nanoseconds in an int64
+# (about 9.2e9 s), and a cache of more than a few months is a typo.
+MAX_CACHE_S = 1.0e7
+
 # Verdicts a caller must act on at once, whatever is still to come.
-DEFINITE = (NO_TF, TF_GAP)
+DEFINITE = (NO_TF, TF_GAP, TF_EVICTED)
 WAITS = (WAIT_CHAIN, WAIT_LATE)
 
 
@@ -81,11 +89,12 @@ def _strip(frame: str) -> str:
 class _Stamps:
     """Sorted stamps (ns) of one frame; the front is dropped by index."""
 
-    __slots__ = ('items', 'start')
+    __slots__ = ('items', 'start', 'evicted')
 
     def __init__(self) -> None:
         self.items: list[int] = []
         self.start = 0
+        self.evicted = False    # a stamp was dropped from the front
 
     def __len__(self) -> int:
         return len(self.items) - self.start
@@ -96,21 +105,29 @@ class _Stamps:
 
     def drop_before(self, cutoff: int) -> None:
         """Forget stamps below ``cutoff``."""
-        self.start = bisect.bisect_left(self.items, cutoff, self.start)
+        start = bisect.bisect_left(self.items, cutoff, self.start)
+        if start > self.start:
+            self.evicted = True
+        self.start = start
         if self.start > 4096 and self.start * 2 > len(self.items):
             del self.items[:self.start]
             self.start = 0
 
-    def add(self, value: int) -> None:
-        """Insert ``value``; a stamp already held is not added twice."""
+    def add(self, value: int) -> bool:
+        """
+        Insert ``value``; return False if that stamp was already held.
+
+        A stamp is not stored twice.
+        """
         items = self.items
         if not len(self) or value > items[-1]:
             items.append(value)
-            return
+            return True
         i = bisect.bisect_left(items, value, self.start)
         if i < len(items) and items[i] == value:
-            return
+            return False
         items.insert(i, value)
+        return True
 
 
 class TfChain:
@@ -127,7 +144,16 @@ class TfChain:
         self.earth = _strip(earth_frame)
         self.cache_ns = round(cache_s * NS_PER_S)
         self.max_gap_ns = round(max_gap_s * NS_PER_S)
-        self.buffer = Buffer(cache_time=Duration(seconds=cache_s))
+        if not 0 < cache_s <= MAX_CACHE_S:
+            raise ValueError(
+                f'cache length {cache_s:g} s is outside (0, {MAX_CACHE_S:g}]')
+        if self.max_gap_ns < 1:
+            raise ValueError(
+                f'gap limit {max_gap_s:g} s rounds to 0 ns; it must be at '
+                'least 1 ns')
+        # The tracker and the Buffer must prune against the same integer
+        # number of nanoseconds (Duration(seconds=) would truncate).
+        self.buffer = Buffer(cache_time=Duration(nanoseconds=self.cache_ns))
         self.rejected: Counter = Counter()
         self._parent: dict[str, str] = {}
         self._static: set[str] = set()
@@ -170,7 +196,10 @@ class TfChain:
                 return
             # tf2 prunes against the newest stamp from before this insert.
             stamps.drop_before(newest - self.cache_ns)
-        stamps.add(s_ns)
+        if not stamps.add(s_ns):
+            # tf2 replaces the value silently and the tracker cannot tell
+            # whether it differs; say that it happened.
+            self.rejected['duplicate_stamp'] += 1
         self._parent[child] = parent
         self.buffer.set_transform(tr, authority)
 
@@ -200,23 +229,34 @@ class TfChain:
             return NO_TF        # tf2 reads time 0 as "the latest"
         if frame == self.earth:
             return READY
-        late = False
+        # Walk the whole chain before any verdict is returned, so a loop is
+        # found whatever the links before it say.
+        definite = None
+        late = missing = False
         seen = {frame}
         cur = frame
         while cur != self.earth:
             parent = self._parent.get(cur)
             if parent is None:
-                return WAIT_CHAIN
-            if cur not in self._static:
+                missing = True
+                break
+            if cur not in self._static and definite is None:
                 verdict = self._check_link(cur, lookup_ns)
                 if verdict in DEFINITE:
-                    return verdict
-                late = late or verdict == WAIT_LATE
+                    definite = verdict
+                elif verdict == WAIT_CHAIN:
+                    missing = True
+                elif verdict == WAIT_LATE:
+                    late = True
             if parent in seen:
                 raise TfChainError(
                     f'the transform tree has a loop through "{parent}"')
             seen.add(parent)
             cur = parent
+        if definite is not None:
+            return definite
+        if missing:
+            return WAIT_CHAIN
         return WAIT_LATE if late else READY
 
     def _check_link(self, child: str, lookup_ns: int) -> str:
@@ -228,7 +268,8 @@ class TfChain:
         if i < len(items) and items[i] == lookup_ns:
             return READY                    # a sample at the time itself
         if i == start:
-            return NO_TF                    # before the first sample
+            # before the first sample held; was an older one evicted?
+            return TF_EVICTED if stamps.evicted else NO_TF
         if i == len(items):
             return WAIT_LATE                # past the newest sample
         if items[i] - items[i - 1] > self.max_gap_ns:
