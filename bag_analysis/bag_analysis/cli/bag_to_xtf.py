@@ -17,10 +17,21 @@ sensor frames (a self-contained ``bizzyboat_sonar`` bag does); a
 sidescan-only ``*_sidescan_raw`` bag has no nav and cannot be
 georeferenced.
 
-The output is written to a ``.partial`` sibling and atomically renamed
-into place only after a clean run, so a crash mid-stream never leaves a
-truncated-but-valid-looking XTF behind. A run that writes zero pings
-(wrong topics, no nav, all-malformed) exits non-zero.
+Output is split into parts so no file gets too big for the receiving
+tool: a new part starts when the next ping would push the file past
+``--split-size`` (default 500 MB), when the part has run longer than
+``--split-duration`` (default off), or when the sonar was silent for
+more than ``--split-gap`` seconds (default 60). ``--no-split`` writes one
+file. A run that ends with a single part keeps the plain ``--output``
+name; with several parts every part is named after the UTC time of its
+first ping (``survey_20260615T150345Z.xtf``).
+
+Each part is streamed to a ``.partial`` file and renamed into place once
+it is complete, so a crash never leaves a truncated-but-valid-looking
+XTF behind. After a failure the finished parts are kept and listed, and
+only the unfinished ``.partial`` is deleted. Files left by earlier runs
+are never deleted; they are listed in a warning at the end. A run that
+writes zero pings (wrong topics, no nav, all-malformed) exits non-zero.
 """
 
 from __future__ import annotations
@@ -28,6 +39,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 from pathlib import Path
+import re
 import sys
 
 import numpy as np
@@ -56,6 +68,11 @@ _DEFAULT_STBD = '/bizzy/sensors/sidescan/garmin_sidescan/sonar_image_starboard'
 _DEFAULT_NADIR = '/bizzy/sensors/sidescan/garmin_sidescan/nadir_depth'
 _DEFAULT_SOUND_SPEED = 1500.0
 _NS_PER_S = 1_000_000_000
+_DEFAULT_SPLIT_SIZE_MB = 500.0
+_DEFAULT_SPLIT_GAP_S = 60.0
+# File header (1024) + ping header (256) + two channel headers (2 x 64).
+_MIN_PING_FILE_BYTES = 1024 + 256 + 128
+_XTF_OFFSET_LIMIT = 2 ** 31
 
 
 class _PendingPing:
@@ -128,6 +145,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Stop after writing this many ping packets (for testing)',
     )
     p.add_argument(
+        '--split-size', type=float, default=None, metavar='MB',
+        help=('Start a new output file before it would exceed this many MB '
+              '(1 MB = 10^6 bytes). Default 500; 0 turns the size limit off. '
+              'Many XTF tools fail on files over 2 GB.'),
+    )
+    p.add_argument(
+        '--split-duration', type=float, default=None, metavar='MINUTES',
+        help=('Start a new output file when the current one spans this many '
+              'minutes of pings. Default: off.'),
+    )
+    p.add_argument(
+        '--split-gap', type=float, default=None, metavar='SECONDS',
+        help=('Start a new output file when more than this many seconds pass '
+              'between consecutive pings. Default 60; 0 turns it off.'),
+    )
+    p.add_argument(
+        '--no-split', action='store_true',
+        help=('Write a single output file, whatever its size. Cannot be '
+              'combined with --split-size, --split-duration or --split-gap.'),
+    )
+    p.add_argument(
         '--layout', choices=(LAYOUT_STANDARD, LAYOUT_PINGMAPPER),
         default=LAYOUT_STANDARD,
         help=(
@@ -139,6 +177,58 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     return p
+
+
+def _parse_args(argv):
+    """
+    Parse ``argv`` and resolve the split limits.
+
+    Adds ``split_bytes``, ``split_duration_ns`` and ``split_gap_ns`` to the
+    namespace (``None`` = that limit is off) and ``split_warnings`` (messages
+    to print before the run starts).
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    for name in ('split_size', 'split_duration', 'split_gap'):
+        value = getattr(args, name)
+        if value is not None and not value >= 0.0:
+            parser.error(f'--{name.replace("_", "-")} must not be negative')
+    if args.max_pings is not None and args.max_pings < 1:
+        parser.error('--max-pings must be at least 1')
+    explicit = [
+        f'--{n.replace("_", "-")}'
+        for n in ('split_size', 'split_duration', 'split_gap')
+        if getattr(args, n) is not None]
+    if args.no_split and explicit:
+        parser.error(
+            f'--no-split cannot be combined with {", ".join(explicit)}')
+
+    size_mb = _DEFAULT_SPLIT_SIZE_MB if args.split_size is None \
+        else args.split_size
+    gap_s = _DEFAULT_SPLIT_GAP_S if args.split_gap is None \
+        else args.split_gap
+    duration_min = args.split_duration
+    args.split_bytes = None
+    args.split_duration_ns = None
+    args.split_gap_ns = None
+    args.split_warnings = []
+    if args.no_split:
+        return args
+    if size_mb > 0:
+        args.split_bytes = int(size_mb * 1_000_000)
+        if args.split_bytes < _MIN_PING_FILE_BYTES:
+            args.split_warnings.append(
+                f'--split-size {size_mb} MB is smaller than a file header '
+                'plus one ping; every ping will get its own part')
+        if args.split_bytes > _XTF_OFFSET_LIMIT:
+            args.split_warnings.append(
+                f'--split-size {size_mb} MB is over 2 GB; many XTF tools '
+                'use 32-bit file offsets and cannot read parts that large')
+    if duration_min:
+        args.split_duration_ns = int(duration_min * 60 * _NS_PER_S)
+    if gap_s > 0:
+        args.split_gap_ns = int(gap_s * _NS_PER_S)
+    return args
 
 
 def _decode_samples(msg) -> np.ndarray:
@@ -362,10 +452,147 @@ def _iter_pings(args, counts):
         counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
 
 
-def _convert(args, stream, counts) -> int:
-    """Write every paired ping from the bag to ``stream``; return the count."""
-    writer = XtfWriter(
-        stream, sonar_name=args.sonar_name, layout=args.layout)
+def _utc_label(when: _dt.datetime) -> str:
+    """Return ``YYYYmmddTHHMMSSZ`` for a UTC datetime."""
+    return when.strftime('%Y%m%dT%H%M%SZ')
+
+
+def _utc_iso(when: _dt.datetime) -> str:
+    """Return ``YYYY-mm-ddTHH:MM:SSZ`` for a UTC datetime."""
+    return when.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class _PartInfo:
+    """A finished part: where it is and what it holds."""
+
+    def __init__(self, path, pings, first, last, size, reason) -> None:
+        """Record the part's path, ping count, time span, size and cause."""
+        self.path = path
+        self.pings = pings
+        self.first = first
+        self.last = last
+        self.size = size
+        self.reason = reason    # why this part started (None for part 1)
+
+
+class _PartSink:
+    """
+    Write pings into a series of part files.
+
+    A part is opened lazily, when its first ping is in hand, as a
+    ``.partial`` named after that ping's UTC time. ``end_part`` closes it
+    and renames it to its final time name. ``finish`` renames the only
+    part of a one-part run to the plain output name. ``abort`` removes the
+    unfinished ``.partial`` and leaves the finished parts alone.
+    """
+
+    def __init__(self, output: Path, sonar_name: str, layout: str) -> None:
+        """Remember where to write; nothing is created yet."""
+        self.output = output
+        self._sonar_name = sonar_name
+        self._layout = layout
+        self.parts: list[_PartInfo] = []
+        self._names: set[str] = set()
+        self._stream = None
+        self._partial: Path | None = None
+        self._final: Path | None = None
+        self._first = self._last = None
+        self._first_t_ns = 0
+        self._reason = None
+        self.writer: XtfWriter | None = None
+
+    @property
+    def is_open(self) -> bool:
+        """Return True while a part is being written."""
+        return self.writer is not None
+
+    @property
+    def first_t_ns(self) -> int:
+        """Return the stamp (ns) of the open part's first ping."""
+        return self._first_t_ns
+
+    def _final_path(self, when: _dt.datetime) -> Path:
+        stem, suffix = self.output.stem, self.output.suffix
+        base = f'{stem}_{_utc_label(when)}'
+        name = f'{base}{suffix}'
+        n = 2
+        while name in self._names:
+            name = f'{base}_{n}{suffix}'
+            n += 1
+        self._names.add(name)
+        return self.output.with_name(name)
+
+    def start_part(self, when, t_ns, reason) -> None:
+        """Open the next part, named after its first ping at ``when``."""
+        self._final = self._final_path(when)
+        self._partial = self._final.with_name(self._final.name + '.partial')
+        self._stream = open(self._partial, 'wb')
+        self.writer = XtfWriter(
+            self._stream, sonar_name=self._sonar_name, layout=self._layout)
+        self._first = self._last = when
+        self._first_t_ns = t_ns
+        self._reason = reason
+
+    def write_ping(self, **kwargs) -> None:
+        """Write one ping into the open part."""
+        self.writer.write_ping(**kwargs)
+        self._last = kwargs['time']
+
+    def end_part(self) -> None:
+        """Close the open part and move it to its final time name."""
+        writer, stream = self.writer, self._stream
+        self.writer = self._stream = None
+        stream.close()
+        self._partial.replace(self._final)
+        self.parts.append(_PartInfo(
+            self._final, writer.ping_count, self._first, self._last,
+            writer.bytes_written, self._reason))
+
+    def finish(self) -> None:
+        """End the open part; a one-part run takes the plain output name."""
+        if self.is_open:
+            self.end_part()
+        if len(self.parts) == 1:
+            only = self.parts[0]
+            only.path.replace(self.output)
+            only.path = self.output
+
+    def abort(self) -> None:
+        """Drop the unfinished part (if any); finished parts stay."""
+        stream, self.writer, self._stream = self._stream, None, None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        if self._partial is not None:
+            self._partial.unlink(missing_ok=True)
+            self._partial = None
+
+
+def _rollover_reason(args, sink, prev_t_ns, t_ns, ping_bytes):
+    """
+    Return why the next ping must start a new part, or ``None``.
+
+    Compared in integer nanoseconds against the previous *emitted* ping.
+    The first limit reached wins: gap, then duration, then size.
+    """
+    if (args.split_gap_ns is not None and prev_t_ns is not None
+            and t_ns - prev_t_ns > args.split_gap_ns):
+        return 'gap'
+    if (args.split_duration_ns is not None
+            and t_ns - sink.first_t_ns >= args.split_duration_ns):
+        return 'duration'
+    writer = sink.writer
+    if (args.split_bytes is not None and writer.ping_count > 0
+            and writer.bytes_written + ping_bytes > args.split_bytes):
+        return 'size'
+    return None
+
+
+def _convert(args, sink, counts) -> int:
+    """Write every paired ping from the bag into parts; return the count."""
+    total = 0
     prev_emitted = None
 
     pings = _iter_pings(args, counts)
@@ -375,72 +602,144 @@ def _convert(args, stream, counts) -> int:
             seconds_per_ping = _seconds_per_ping(prev_emitted, port)
             if altitude is None:
                 counts['no_altitude'] += 1
-            writer.write_ping(
-                time=port.time, ping_number=writer.ping_count,
+            port_chan = ChannelPing(
+                samples=port.samples, slant_range_m=port.slant_range,
+                frequency_hz=port.frequency, time_delay_s=port.time_delay,
+                time_duration_s=port.time_duration,
+                seconds_per_ping=seconds_per_ping)
+            stbd_chan = ChannelPing(
+                samples=stbd.samples, slant_range_m=stbd.slant_range,
+                frequency_hz=stbd.frequency, time_delay_s=stbd.time_delay,
+                time_duration_s=stbd.time_duration,
+                seconds_per_ping=seconds_per_ping)
+
+            reason = None
+            if sink.is_open:
+                reason = _rollover_reason(
+                    args, sink, prev_emitted.t_ns if prev_emitted else None,
+                    port.t_ns, XtfWriter.ping_size(port_chan, stbd_chan))
+                if reason:
+                    sink.end_part()
+            if not sink.is_open:
+                sink.start_part(port.time, port.t_ns, reason)
+
+            sink.write_ping(
+                time=port.time, ping_number=total,
                 latitude_deg=port.lat, longitude_deg=port.lon,
                 sensor_depth_m=0.0, altitude_m=altitude or 0.0,
                 heading_deg=port.heading, pitch_deg=port.pitch,
                 roll_deg=port.roll, speed_mps=speed,
                 sound_velocity_mps=port.sound_velocity,
-                port=ChannelPing(
-                    samples=port.samples, slant_range_m=port.slant_range,
-                    frequency_hz=port.frequency, time_delay_s=port.time_delay,
-                    time_duration_s=port.time_duration,
-                    seconds_per_ping=seconds_per_ping),
-                starboard=ChannelPing(
-                    samples=stbd.samples, slant_range_m=stbd.slant_range,
-                    frequency_hz=stbd.frequency, time_delay_s=stbd.time_delay,
-                    time_duration_s=stbd.time_duration,
-                    seconds_per_ping=seconds_per_ping),
-            )
+                port=port_chan, starboard=stbd_chan)
+            total += 1
             counts['paired'] += 1
             prev_emitted = port
-            if (args.max_pings is not None
-                    and writer.ping_count >= args.max_pings):
+            if args.max_pings is not None and total >= args.max_pings:
                 break
     finally:
         pings.close()
-    return writer.ping_count
+    return total
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``bag_to_xtf`` console script."""
-    args = _build_parser().parse_args(argv)
+    args = _parse_args(argv)
     if not args.bag.exists():
         print(f'error: bag not found: {args.bag}', file=sys.stderr)
         return 2
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    for message in args.split_warnings:
+        print(f'warning: {message}', file=sys.stderr)
 
     counts = {
         'port': 0, 'starboard': 0, 'paired': 0, 'no_tf': 0, 'stale_tf': 0,
         'approx_tf': 0, 'malformed': 0, 'unpaired': 0, 'nadir': 0,
         'no_altitude': 0, 'out_of_window': 0,
     }
-    # Write to a sibling .partial and rename on success, so a crash never
-    # leaves a truncated file at the destination path.
-    partial = args.output.with_name(args.output.name + '.partial')
+    sink = _PartSink(args.output, args.sonar_name, args.layout)
     try:
-        with open(partial, 'wb') as stream:
-            ping_count = _convert(args, stream, counts)
-    except BaseException:
-        partial.unlink(missing_ok=True)
+        ping_count = _convert(args, sink, counts)
+        sink.finish()
+    except BaseException as exc:
+        # Finished parts stay; only the unfinished .partial is removed.
+        sink.abort()
+        print(f'error: conversion failed: {exc!r}', file=sys.stderr)
+        _report_parts(sink.parts, header='finished parts kept')
+        _warn_old_files(args.output, sink.parts)
+        if isinstance(exc, OSError):
+            return 1
         raise
 
     if ping_count == 0:
-        partial.unlink(missing_ok=True)
         print('error: no pings written (check topics, nav/TF, sample_rate)',
               file=sys.stderr)
-        _report(args.output, ping_count, counts)
+        _report(sink, ping_count, counts, args)
         return 1
 
-    partial.replace(args.output)
-    _report(args.output, ping_count, counts)
+    _report(sink, ping_count, counts, args)
+    _warn_old_files(args.output, sink.parts)
     return 0
 
 
-def _report(output: Path, ping_count: int, counts: dict) -> None:
+def _mb(size: int) -> str:
+    return f'{size:,} bytes ({size / 1e6:.1f} MB)'
+
+
+def _report_parts(parts, *, header=None, limit=None) -> None:
+    """Print one line per part: file, pings, time span, size."""
+    if header:
+        print(f'{header}: {len(parts)}')
+    for n, part in enumerate(parts, 1):
+        note = ''
+        if part.reason:
+            note = f'  (new part: {part.reason})'
+        if limit is not None and part.size > limit:
+            note += '  (over the size limit: a single ping)'
+        print(f'  part {n}: {part.path.name}  pings={part.pings}  '
+              f'{_utc_iso(part.first)} to {_utc_iso(part.last)}  '
+              f'{_mb(part.size)}{note}')
+
+
+def _old_files(output: Path, written) -> list[Path]:
+    """Return files from earlier runs that this run did not write."""
+    stem, suffix = re.escape(output.stem), re.escape(output.suffix)
+    part_re = re.compile(
+        rf'{stem}_\d{{8}}T\d{{6}}Z(_\d+)?{suffix}(\.partial)?')
+    keep = {p.name for p in written}
+    found = []
+    for path in sorted(output.parent.iterdir()):
+        if path.name in keep:
+            continue
+        if (part_re.fullmatch(path.name)
+                or path.name in (output.name, output.name + '.partial')):
+            found.append(path)
+    return found
+
+
+def _warn_old_files(output: Path, parts) -> None:
+    """Warn about earlier runs' files next to the output; delete nothing."""
+    old = _old_files(output, [p.path for p in parts])
+    if not old:
+        return
+    print('WARNING: files from an earlier run are still in '
+          f'{output.parent}; nothing was deleted:', file=sys.stderr)
+    for path in old:
+        print(f'  {path.name}', file=sys.stderr)
+    print('  Remove them yourself if they are out of date, so they are not '
+          'mixed up with the parts just written.', file=sys.stderr)
+
+
+def _report(sink, ping_count: int, counts: dict, args) -> None:
     """Print a conversion summary, including any data loss."""
-    print(f'wrote {ping_count} XTF pings -> {output}')
+    parts = sink.parts
+    if len(parts) == 1:
+        print(f'wrote {ping_count} XTF pings -> {parts[0].path}')
+    elif parts:
+        print(f'wrote {ping_count} XTF pings in {len(parts)} parts '
+              f'-> {sink.output.parent}')
+    else:
+        print(f'wrote {ping_count} XTF pings -> {sink.output}')
+    _report_parts(parts, limit=args.split_bytes)
     print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
           f' paired={counts["paired"]}')
     print(f'  dropped: no_tf={counts["no_tf"]} stale_tf={counts["stale_tf"]} '
