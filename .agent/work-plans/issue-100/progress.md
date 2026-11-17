@@ -80,3 +80,33 @@ issue: 100
 ### Owner choices (view only)
 - XTF header time with non-zero offset: raw stamp (A).
 - Negative offsets: reject for now (a receive stamp cannot precede transmit); revisit if a trigger-stamped sensor needs it.
+
+## Implementation
+**Status**: complete
+**When**: 2026-11-17 13:33 -05:00
+**By**: Claude Sonnet
+
+**Plan**: `.agent/work-plans/issue-100/plan.md` (amended in place for the owner decisions and the Plan Review)
+**Branch**: feature/issue-100 (local only, not pushed, no PR)
+
+### Commits
+- `1c65b78` plan folded; `c2fe5d6` moving-track test first; `614efa5` shared `tf_lookup.TfChain`; `501f4a4` writer ComputerClock fields; `f25e42c` contacts_to_geojson; `22fa965` bag_to_xtf hold queue + options + offset + golden; `ce79cfe` tests; `6c49fd9` README; `dbe3ced` import order; `91f891a` plan note.
+
+### Failing on the old code (c2fe5d6, before any fix)
+The moving-track test failed: 59 of 60 pings written, every one through the latest-transform fallback, heading off by a median 4.05 deg (max 4.95 deg), position by up to 1.3 m from the pose interpolated at the ping stamp (truth from own slerp, track turning 15 deg/s at 4 m/s, quaternion sign flips, pings at 0.3/0.7 between samples, /tf after the pings in bag order).
+
+### Verified against installed Jazzy tf2 (scratchpad xtf_split/issue100/tf2_probe*.py, pinned in test_tf_lookup.py incl. a seeded differential test)
+Gap of any length is interpolated; lookups past newest/before oldest raise; leading slash stripped; set_transform reports rejections only in the log (NaN, zero quaternion, self, empty ids, data older than newest - cache, strictly); non-unit quaternions accepted; pruning uses the newest stamp from before the insert; re-parent and /tf + /tf_static duplicates behave as the review said (so they are fatal errors here). Not verified: tf2's per-frame 1,000,000 sample cap (not mirrored; a lookup disagreeing would show as tf_mismatch).
+
+### Result
+- 258 tests in bag_analysis pass via build.sh + test.sh (0 failures, 2 skipped, both pyxtf-not-installed skips that predate this).
+- Real bag 2026-08-25T13-59-09: 267561 pings written (as before), dropped no_tf=0 tf_gap=0 tf_late=1 tf_mismatch=0, unpaired=30. Against the pose interpolated at the ping time (independent code): heading max 0.010 deg, position max 3 mm (2 pings above 0.001 deg, both in 5 ms stamp bursts inside one 10 ms XTF time cell, matching ambiguity); old code on the same pings: heading median 0.10 deg, max 6.6 deg, position max 0.25 m. Split parts join byte for byte to the --no-split file. Time/peak RSS: old 2:54/83.9 MB, new 2:58/86.7 MB (split 2:52/87.2 MB). Offsets +0.05 and -0.05 on a 3 min slice: written time moves -50/+50 ms, poses match truth at stamp - offset, ComputerClock fields equal the raw stamp. Details: .agent/scratchpad/xtf_split/issue100/RESULT.txt.
+
+### Deviations and notes
+- Golden file regenerated: the ComputerClock bytes (236..239 of every ping header) are now written on every ping, offset 0 included, so the file means the same whatever the option. Checked against the old file: only those bytes differ, and they equal the ping time at offset 0. Poses unchanged (the fake sends /tf at the ping stamp).
+- One commit (22fa965) holds hold queue, option rename, offset and written time, because they share the same functions; the writer field is its own commit.
+- Counters: stale_tf became tf_gap; added tf_late (no transform past the time within --tf-wait, or bag ended) and tf_mismatch. Wait expiry is tf_late, not stale_tf.
+- Added --tf-wait (default 5 s, must exceed --max-tf-gap), cap of one hour on the offset, allow_abbrev=False on both CLIs (so --max-tf cannot reach the removed option; it also ends other prefix abbreviations).
+- contacts_to_geojson: --max-tf-gap default 1.0 s (same bar as bag_to_xtf), geo_status exact/no_tf/tf_gap/tf_late/tf_mismatch.
+- Known limit, documented in tf_lookup and README: a transform that arrives after a transform with a later stamp for the same frame is filed in order, but a ping already answered from the wider bracket is not revisited.
+- Real-data chain is all-dynamic for three links (map, base_link_north_up, base_link); the bag has no re-parent or /tf + /tf_static duplicates (the run would have stopped).
