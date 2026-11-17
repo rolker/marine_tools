@@ -335,3 +335,17 @@ def test_a_sample_the_cache_dropped_is_tf_evicted_not_no_tf():
     other = chain(cache=10.0)
     feed(other, tf('earth', 'b', 112 * S))
     assert other.check('b', 100 * S) == NO_TF   # nothing was ever dropped
+
+
+def test_a_time_before_the_first_sample_ever_fed_stays_no_tf_after_eviction():
+    c = chain(cache=10.0)
+    feed(c, tf('earth', 'a', 100 * S), tf('earth', 'a', 105 * S),
+         tf('earth', 'a', 112 * S), tf('earth', 'a', 125 * S))
+    assert c.check('a', 100 * S - 1) == NO_TF       # predates the recording
+    assert c.check('a', 50 * S) == NO_TF
+    assert c.check('a', 100 * S) == TF_EVICTED      # first sample, dropped
+    assert c.check('a', 100 * S + 1) == TF_EVICTED
+    # an older sample accepted later moves the first-ever stamp back
+    feed(c, tf('earth', 'a', 118 * S))
+    feed(c, tf('earth', 'a', 116 * S))
+    assert c.check('a', 100 * S - 1) == NO_TF

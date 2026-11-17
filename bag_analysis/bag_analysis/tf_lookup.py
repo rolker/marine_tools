@@ -16,8 +16,10 @@ up only when the answer is sound:
   after reading more;
 * ``no_tf``: the time is before a link's first sample;
 * ``tf_evicted``: the time is before the oldest sample the cache still
-  holds, and older samples were dropped from it, so the answer is lost to
-  the cache length, not to the bag (raise the cache length);
+  holds but at or after the first sample ever accepted for the link, and
+  older samples were dropped from it, so the answer is lost to the cache
+  length, not to the bag (raise the cache length). A time before the first
+  sample ever fed stays ``no_tf``;
 * ``tf_gap``: the two samples around the time are further apart than the
   gap limit.
 
@@ -89,12 +91,13 @@ def _strip(frame: str) -> str:
 class _Stamps:
     """Sorted stamps (ns) of one frame; the front is dropped by index."""
 
-    __slots__ = ('items', 'start', 'evicted')
+    __slots__ = ('items', 'start', 'evicted', 'first')
 
     def __init__(self) -> None:
         self.items: list[int] = []
         self.start = 0
         self.evicted = False    # a stamp was dropped from the front
+        self.first: int | None = None   # oldest stamp ever accepted
 
     def __len__(self) -> int:
         return len(self.items) - self.start
@@ -120,6 +123,8 @@ class _Stamps:
         A stamp is not stored twice.
         """
         items = self.items
+        if self.first is None or value < self.first:
+            self.first = value
         if not len(self) or value > items[-1]:
             items.append(value)
             return True
@@ -268,8 +273,12 @@ class TfChain:
         if i < len(items) and items[i] == lookup_ns:
             return READY                    # a sample at the time itself
         if i == start:
-            # before the first sample held; was an older one evicted?
-            return TF_EVICTED if stamps.evicted else NO_TF
+            # Before the first sample held. It is evicted only if the cache
+            # dropped samples and the time is not before the oldest one ever
+            # accepted; a time before the recording starts is no_tf.
+            if stamps.evicted and lookup_ns >= stamps.first:
+                return TF_EVICTED
+            return NO_TF
         if i == len(items):
             return WAIT_LATE                # past the newest sample
         if items[i] - items[i - 1] > self.max_gap_ns:

@@ -278,6 +278,20 @@ def test_entry_older_than_the_cache_is_tf_evicted_not_no_tf(
     assert 'raise --tf-cache' in captured.err
 
 
+def test_entry_before_the_recording_is_no_tf_even_if_the_cache_evicted(
+        tmp_path, monkeypatch, capsys):
+    track = _track()                 # first sample 0.35 s after T0_NS
+    lines = [_entry(T0_NS, 'before'), _entry(T0_NS + 4 * _NS, 'old'),
+             _entry(T0_NS + 8 * _NS, 'new')]
+    rc, feats = _run(tmp_path, monkeypatch, _tf_messages(track), lines,
+                     '--tf-cache', '3')
+    assert rc == 0
+    status = {f['properties']['text']: f['properties']['geo_status']
+              for f in feats}
+    assert status == {'before': 'no_tf', 'old': 'tf_evicted', 'new': 'exact'}
+    assert '1 tf_evicted' in capsys.readouterr().out
+
+
 def test_rejected_transforms_are_reported(tmp_path, monkeypatch, capsys):
     track = _track()
     messages = _tf_messages(track)

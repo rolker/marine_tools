@@ -178,7 +178,7 @@ A ping is dropped, and counted by reason in the summary, when:
 | `no_tf` | its time is before the first transform sample of a link in the chain, or a frame of the chain never appears |
 | `tf_gap` | the two samples around its time, on any dynamic link of the chain, are further apart than `--max-tf-gap` |
 | `tf_late` | no transform past its time arrived within `--tf-wait`, or the bag ended first |
-| `tf_evicted` | its time is older than the oldest sample the `--tf-cache` still held, so older samples had been dropped (raise `--tf-cache`; with the default and a ping waiting at most `--tf-wait` this should stay 0) |
+| `tf_evicted` | its time is older than the oldest sample the `--tf-cache` still held (but not older than the first sample ever fed for that link, which is `no_tf`), so older samples had been dropped (raise `--tf-cache`; with the default and a ping waiting at most `--tf-wait` this should stay 0) |
 | `tf_mismatch` | tf2 refused a lookup that the tool's own record of the samples said would work (should stay 0; if not, please report it) |
 
 Two more counters count messages, not pings; no ping is formed from them:
@@ -346,7 +346,9 @@ time, no fallback to the latest transform, and `earth` must be an ancestor
 of the track frame. The tool reads the whole bag's transforms first, so it
 never waits; an entry after the last transform is `tf_late`. Its
 `--tf-cache` (default 6 h) is the span of transforms kept: an entry older
-than what the cache still holds at the end of the bag is `tf_evicted`, and
+than what the cache still holds at the end of the bag, but not older than the
+first transform of the recording, is `tf_evicted` (older than the recording
+is `no_tf`), and
 the tool says so and names the option to raise. Rejected or re-fed
 transforms are listed after the summary line. Log timestamps have minute precision at best, so an entry is
 located only as well as its time is known.
