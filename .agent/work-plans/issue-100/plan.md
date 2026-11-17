@@ -153,8 +153,10 @@ Jazzy `tf2_ros` with `scratchpad/xtf_split/issue100/tf2_probe*.py`:
    the bag (review round 1; before, a bag whose /tf stopped was read to the
    end).
 8. **`--max-pings`**: unchanged consumer `break`/`close()`; the finally block
-   discards the queue without counting it as `unpaired` or dropped (only the
-   half-pair in `pending` counts, as today).
+   discards the queue without counting it as `unpaired` or dropped, and when
+   the consumer stops the run the halves in `pending` are not counted either
+   (they are waiting items; the old code had cleared `pending` before the
+   stop, so it counted none).
 9. **Failure**: `TfChainError` ends the conversion with a clear error and
    exit 1; finished parts are kept and the unfinished `.partial` removed, as
    for any other failure.

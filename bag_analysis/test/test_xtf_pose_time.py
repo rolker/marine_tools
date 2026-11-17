@@ -298,6 +298,23 @@ def test_max_pings_leaves_the_counts_clean(tmp_path, monkeypatch, capsys):
     assert dropped['tf_late'] == dropped['no_tf'] == 0
 
 
+def test_max_pings_does_not_count_the_halves_read_ahead(
+        tmp_path, monkeypatch, capsys):
+    track = Track(70)
+    messages, _ = track_messages(track, 60)
+    # Record every starboard half 0.05 s after its port half, so that while
+    # the last wanted ping waits for its transforms, later pings are read
+    # as lone port halves.
+    messages = sorted(
+        ((t, m, r + 50_000_000 if t == STBD_TOPIC else r)
+         for t, m, r in messages), key=lambda e: e[2])
+    rc, out = _run(tmp_path, monkeypatch, messages, '--max-pings', '5')
+    report = capsys.readouterr().out
+    assert rc == 0
+    assert len(read_ping_headers(out)) == 5
+    assert _dropped(report)['unpaired'] == 0
+
+
 def test_a_chain_that_never_comes_costs_one_wait_not_the_bag(
         tmp_path, monkeypatch, capsys):
     track = Track(70)

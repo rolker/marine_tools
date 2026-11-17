@@ -637,6 +637,7 @@ def _iter_pings(args, counts):
     held: deque = deque()
     latest_altitude = None
     admitting = True
+    stopped_early = False
     try:
         for topic, msg, t_ns in iter_messages(args.bag, topics=topics):
             if topic == '/tf':
@@ -685,8 +686,16 @@ def _iter_pings(args, counts):
                 held, chain, counts, 0, wait_ns, final=True):
             port, stbd = _georeference(item, port_pose, stbd_pose, args)
             yield port, stbd, item.altitude
+    except GeneratorExit:
+        stopped_early = True    # the consumer stopped (--max-pings)
+        raise
     finally:
-        counts['unpaired'] += sum(1 for v in pending.values() if v is not None)
+        # Halves read ahead while the last pair waited for its transforms
+        # are not counted when the consumer stops the run: they are waiting
+        # items, like the held pings.
+        if not stopped_early:
+            counts['unpaired'] += sum(
+                1 for v in pending.values() if v is not None)
         counts['tf_rejected'] = dict(chain.rejected)
 
 
