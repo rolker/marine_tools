@@ -240,3 +240,31 @@ Reported accurately (count, name, pings, time span, size, "rename them yourself"
 
 ### Notes (not findings)
 - Residual: a non-Linux or non-renameat2 filesystem without hard links still has the documented microsecond check-then-rename window.
+
+## Local Review (Pre-Push)
+**Status**: complete
+**When**: 2026-11-20 09:08 -05:00
+**By**: Claude Code Agent (Claude Fable 5.2)
+**Verdict**: approved
+
+**Branch**: feature/issue-98 at `4d06fca`
+**Mode**: pre-push
+**Depth**: Standard (reason: about 840 changed lines in 7 files, one package)
+**Must-fix**: 0 open (2 raised, both fixed before this entry) | **Suggestions**: 0 open (7 fixed, 3 not taken)
+**Round**: 1 | **Ship**: recommended — every must-fix was a precise fix, applied and covered by a test; the fixes had no separate review round
+
+Scope: the naming change of 2026-11-20 (`--output-dir` + `--name-prefix`, first-ping-time names, per-part exact-name clash rule). Reviewers: Claude Lens A and Lens B (Sonnet), Gemini, Codex (no findings). Static analysis ran through the package's ament flake8 and pep257 tests.
+
+### Findings
+- [x] (must-fix, Lens B, reproduced; present since PR 1) a finished, synced part whose move to its final name failed for a reason other than a taken name was deleted by `abort()` and reported as unfinished — now kept under its `.partial` name and listed — `bag_analysis/bag_analysis/cli/bag_to_xtf.py` `_PartSink.end_part`
+- [x] (must-fix, Gemini) an empty `--output-dir` became the current folder — refused at parse time — `bag_to_xtf.py` `_folder_arg`
+- [x] (suggestion, Lens A + Lens B + Gemini) `--name-prefix` accepted characters Windows and SMB refuse and had no length check, failing late — rejected before the bag is read — `bag_to_xtf.py` `_parse_args`
+- [x] (suggestion, Lens A) README did not say that `--overwrite` replaces another recording's file of the same prefix and second — `bag_analysis/README.md`
+- [x] (suggestion, Lens A) no test for a clash on a same-second counter name or an over-long prefix — `bag_analysis/test/test_xtf_split.py`
+- [x] (suggestion, Lens B) an interrupt was reported as "conversion failed" — `bag_to_xtf.py` `main`
+- [x] (suggestion, Gemini) pose-time `_run` sentinel could hide a run that wrote several files — `bag_analysis/test/test_xtf_pose_time.py`
+- [x] (suggestion, Gemini) later-part clash test read the reference run's report — `bag_analysis/test/test_xtf_split.py`
+- [x] (suggestion, Gemini) plan steps 4 and 6 did not point at the superseding section — `.agent/work-plans/issue-98/plan.md`
+- [ ] (suggestion, Lens B, not taken) a `.partial` created in the microseconds between the exclusive open and its bookkeeping is left behind on an interrupt; the next run refuses over it — `bag_to_xtf.py` `_PartSink.start_part`
+- [ ] (suggestion, Lens A, not taken: inherent) a rerun over a finished export is refused only once the first ping is in hand, since the name comes from it — `bag_to_xtf.py` `_preflight`
+- [ ] (suggestion, Gemini, not taken: no such caller) `_final_path` records a name before the clash check, stale only for a caller that reuses the sink after `_NameTaken` — `bag_to_xtf.py`

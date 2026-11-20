@@ -19,7 +19,7 @@ from pathlib import Path
 import struct
 
 from bag_analysis.cli import bag_to_xtf
-from xtf_fakes import base_args, fake_messages
+from xtf_fakes import base_args, fake_messages, only_xtf
 
 _GOLDEN = Path(__file__).parent / 'data' / 'xtf_golden_single.xtf'
 
@@ -30,8 +30,9 @@ def _run(tmp_path, monkeypatch, capsys, *extra):
         bag_to_xtf, 'iter_messages', lambda *a, **k: iter(messages))
     bag = tmp_path / 'bag'
     bag.mkdir()
-    out = tmp_path / 'out.xtf'
-    rc = bag_to_xtf.main(base_args(bag, out, *extra))
+    folder = tmp_path / 'out'
+    rc = bag_to_xtf.main(base_args(bag, folder, *extra))
+    out = only_xtf(folder)
     report = capsys.readouterr().out.replace(str(out), 'OUT')
     return rc, out, report
 

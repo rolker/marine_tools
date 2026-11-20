@@ -22,7 +22,7 @@ Usage::
 
     ros2 run bag_analysis bag_to_xtf \\
         --bag /path/to/bizzyboat_sonar/2026-06-15T15-03-45+00-00 \\
-        --output ~/data/sidescan/2026-06-15.xtf
+        --output-dir ~/data/sidescan/2026-06-15 --name-prefix sidescan_
 
 The bag must contain the TF chain from ``earth`` down to the sidescan
 sensor frames (a self-contained ``bizzyboat_sonar`` bag does); a
@@ -34,9 +34,13 @@ tool: a new part starts when the next ping would push the file past
 ``--split-size`` (default 500 MB), when the part has run longer than
 ``--split-duration`` (default off), or when the sonar was silent for
 more than ``--split-gap`` seconds (default 60). ``--no-split`` writes one
-file. A run that ends with a single part keeps the plain ``--output``
-name; with several parts every part is named after the UTC time of its
-first ping (``survey_20260615T150345Z.xtf``).
+file.
+
+Every file goes into ``--output-dir`` and is named ``--name-prefix``
+(default: none) followed by the UTC time of its first ping, for example
+``sidescan_2026-06-15T15.03.45+00.00.xtf``. A run that ends with a single
+part is named the same way. Two parts that start in the same second get
+``_2``, ``_3`` and so on before ``.xtf``.
 
 Each part is streamed to a ``.partial`` file, synced to disk and renamed
 into place once it is complete, so a crash never leaves a
@@ -44,17 +48,22 @@ truncated-but-valid-looking XTF behind. After a failure the finished
 parts are kept and listed, and only the unfinished ``.partial`` is
 deleted.
 
-The run refuses to start (exit 2, nothing written) if the output folder
-already holds the plain ``--output`` file or any file of this output's
-part-name pattern (parts and ``.partial`` leftovers), unless
-``--overwrite`` is given. With ``--overwrite`` the run replaces the files
-whose names it produces and lists them (an old ``.partial`` is unlinked,
-never written through); files of the pattern that it did not regenerate
-are never deleted, only warned about. Without ``--overwrite`` a file that
-appears mid-run is not replaced: parts move into place by hard link, else
-by an atomic no-replace rename (Linux), and only where neither exists by a
-check followed by a rename. A finished part that cannot take its name is
-kept under its ``.partial`` name and reported.
+A file's name is known only when its first ping is in hand, so existing
+files are checked one part at a time: a part whose name (or ``.partial``
+name) already exists is not started and the run stops, unless
+``--overwrite`` is given. If that was the first part nothing has been
+written and the exit status is 2; if earlier parts were written they are
+kept and listed and the exit status is 1. Other files in the folder,
+whatever their names, are not looked at: a file named by a time alone
+cannot be told from another recording's. With ``--overwrite`` the run
+replaces the files whose names it produces and lists them (an old
+``.partial`` is unlinked, never written through); it deletes nothing else,
+so parts of an earlier run with other start times stay where they are.
+Without ``--overwrite`` a file that appears mid-run is not replaced: parts
+move into place by hard link, else by an atomic no-replace rename (Linux),
+and only where neither exists by a check followed by a rename. A finished
+part that cannot take its name is kept under its ``.partial`` name and
+reported.
 A run that writes zero pings (wrong topics, no nav, all-malformed) exits
 non-zero.
 """
@@ -70,7 +79,6 @@ import errno
 import math
 import os
 from pathlib import Path
-import re
 import sys
 import tempfile
 
@@ -100,6 +108,7 @@ _DEFAULT_STBD = '/bizzy/sensors/sidescan/garmin_sidescan/sonar_image_starboard'
 _DEFAULT_NADIR = '/bizzy/sensors/sidescan/garmin_sidescan/nadir_depth'
 _DEFAULT_SOUND_SPEED = 1500.0
 _NS_PER_S = 1_000_000_000
+_SUFFIX = '.xtf'
 _DEFAULT_SPLIT_SIZE_MB = 500.0
 _DEFAULT_SPLIT_GAP_S = 60.0
 # File header (1024) + ping header (256) + two channel headers (2 x 64).
@@ -112,6 +121,13 @@ _MAX_SPLIT_DURATION_MIN = 1e7
 _MAX_SPLIT_GAP_S = 1e9
 # How many file names an error message lists before saying "and N more".
 _MAX_LISTED = 10
+# Characters a file-name prefix cannot hold: path separators, controls, and
+# the ones Windows and SMB shares refuse in a name (the files go to both).
+_PREFIX_FORBIDDEN = frozenset(
+    '/\\:*?"<>|' + ''.join(map(chr, range(32)))
+    + ''.join(map(chr, range(0x7f, 0xa0))))
+# Longest file name most filesystems take, in bytes.
+_MAX_NAME_BYTES = 255
 # Largest stamp-to-transmit offset (s) accepted; anything bigger is a typo.
 _MAX_OFFSET_S = 3600.0
 
@@ -131,6 +147,19 @@ class _PendingPing:
             setattr(self, k, v)
 
 
+def _folder_arg(text: str) -> Path:
+    """
+    Parse ``--output-dir``; an empty value is an error.
+
+    ``Path('')`` is the current folder: an unset shell variable must not
+    send the files (or ``--overwrite``) there.
+    """
+    if not text.strip():
+        raise argparse.ArgumentTypeError(
+            'the value is empty; name the folder to write into')
+    return Path(text)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='bag_to_xtf',
@@ -142,9 +171,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Path to the rosbag2 directory (the one with metadata.yaml)',
     )
     p.add_argument(
-        '--output', required=True, type=Path,
-        help='Output XTF file path (e.g. .../survey.xtf)',
+        '--output-dir', type=_folder_arg, default=None, metavar='FOLDER',
+        help=('Folder the XTF files are written into (created if missing). '
+              'Required.'),
     )
+    p.add_argument(
+        '--name-prefix', default='', metavar='TEXT',
+        help=("Start of every file name. The UTC time of the file's first "
+              'ping and ".xtf" follow it, as in '
+              'sidescan_2026-06-15T15.03.45+00.00.xtf for the prefix '
+              '"sidescan_". Default: no prefix.'),
+    )
+    p.add_argument('--output', default=None, help=argparse.SUPPRESS)
     p.add_argument('--port-topic', default=_DEFAULT_PORT)
     p.add_argument('--starboard-topic', default=_DEFAULT_STBD)
     p.add_argument(
@@ -231,12 +269,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         '--overwrite', action='store_true',
-        help=('Allow replacing files in the output folder. Without it the '
-              'run refuses to start if the plain --output file or any file '
-              "of this output's part-name pattern (parts, .partial "
-              'leftovers) already exists. With it, the files this run '
-              'produces replace same-named ones and are listed; other old '
-              'files of the pattern are only warned about, never deleted.'),
+        help=('Allow replacing files in the output folder. Without it a '
+              'part whose name (or .partial name) already exists is not '
+              'started and the run stops. With it, the files this run '
+              'produces replace same-named ones and are listed; no other '
+              'file is touched.'),
     )
     p.add_argument(
         '--layout', choices=(LAYOUT_STANDARD, LAYOUT_PINGMAPPER),
@@ -282,6 +319,30 @@ def _parse_args(argv):
                 '0 or --no-split to remove a limit')
     if args.max_pings is not None and args.max_pings < 1:
         parser.error('--max-pings must be at least 1')
+    if args.output is not None:
+        parser.error(
+            '--output is gone: files are now named by the time of their '
+            'first ping. Give the folder with --output-dir and, if wanted, '
+            'the start of the file names with --name-prefix')
+    if args.output_dir is None:
+        parser.error('the following arguments are required: --output-dir')
+    bad = sorted({c for c in args.name_prefix if c in _PREFIX_FORBIDDEN})
+    if bad:
+        parser.error(
+            '--name-prefix is the start of a file name and cannot contain '
+            + ' '.join(repr(c) for c in bad))
+    if args.name_prefix.startswith('.'):
+        parser.error('--name-prefix cannot start with "." (a hidden file)')
+    # The longest name a run can need: the time, a same-second counter and
+    # the .partial ending.
+    longest = (f'{args.name_prefix}{_utc_label(_dt.datetime(2000, 1, 1))}'
+               f'_999{_SUFFIX}.partial')
+    spare = _MAX_NAME_BYTES - len(os.fsencode(longest))
+    if spare < 0:
+        parser.error(
+            f'--name-prefix is {-spare} byte(s) too long: with the time and '
+            f'"{_SUFFIX}.partial" after it the file name would pass '
+            f'{_MAX_NAME_BYTES} bytes')
     if args.max_tf_age is not None:
         parser.error(
             '--max-tf-age is gone: it bounded the age of a fallback to the '
@@ -702,8 +763,17 @@ def _iter_pings(args, counts):
 
 
 def _utc_label(when: _dt.datetime) -> str:
-    """Return ``YYYYmmddTHHMMSSZ`` for a UTC datetime."""
-    return when.strftime('%Y%m%dT%H%M%SZ')
+    """
+    Return ``YYYY-mm-ddTHH.MM.SS+00.00`` for a UTC datetime.
+
+    The form used in file names: the bag folders' time format with dots,
+    not dashes, between the parts of the time, so date and time stand apart.
+    """
+    return when.strftime('%Y-%m-%dT%H.%M.%S+00.00')
+
+
+class _NameTaken(FileExistsError):
+    """A part was not started because its name is already in the folder."""
 
 
 def _utc_iso(when: _dt.datetime) -> str:
@@ -822,12 +892,12 @@ class _PartSink:
 
     A part is opened lazily, when its first ping is in hand, as a
     ``.partial`` named after that ping's UTC time. ``end_part`` syncs and
-    closes it and moves it to its final time name. ``finish`` moves the
-    only part of a one-part run to the plain output name. ``abort``
-    removes the unfinished ``.partial`` and leaves the finished parts
-    alone.
+    closes it and moves it to its final name. ``finish`` ends the last
+    part. ``abort`` removes the unfinished ``.partial`` and leaves the
+    finished parts alone.
 
-    Without ``overwrite`` ``.partial`` files are opened exclusively and a
+    Without ``overwrite`` a part whose name or ``.partial`` name exists is
+    not started (``_NameTaken``); ``.partial`` files are opened exclusively and a
     part is moved into place without replacing: by hard link (atomic),
     else by an atomic no-replace rename (Linux ``renameat2``), else, only
     if neither exists on this filesystem, by a check followed by a
@@ -837,15 +907,17 @@ class _PartSink:
     move replaces by rename, which swaps the name and never writes
     through it.
 
-    A finished part whose final name was taken meanwhile stays under its
-    ``.partial`` name and is listed in ``kept``.
+    A finished part that cannot be moved to its final name (the name was
+    taken meanwhile, or the move failed) stays under its ``.partial`` name
+    and is listed in ``kept``; it is never deleted.
     """
 
     def __init__(
-            self, output: Path, sonar_name: str, layout: str,
+            self, out_dir: Path, prefix: str, sonar_name: str, layout: str,
             overwrite: bool = False) -> None:
         """Remember where to write; nothing is created yet."""
-        self.output = output
+        self.out_dir = out_dir
+        self._prefix = prefix
         self._sonar_name = sonar_name
         self._layout = layout
         self._overwrite = overwrite
@@ -875,20 +947,23 @@ class _PartSink:
         return self._first_t_ns
 
     def _final_path(self, when: _dt.datetime) -> Path:
-        stem, suffix = self.output.stem, self.output.suffix
-        base = f'{stem}_{_utc_label(when)}'
-        name = f'{base}{suffix}'
+        base = f'{self._prefix}{_utc_label(when)}'
+        name = f'{base}{_SUFFIX}'
         n = 2
         while name in self._names:
-            name = f'{base}_{n}{suffix}'
+            name = f'{base}_{n}{_SUFFIX}'
             n += 1
         self._names.add(name)
-        return self.output.with_name(name)
+        return self.out_dir / name
 
     def start_part(self, when, t_ns, reason) -> None:
         """Open the next part, named after its first ping at ``when``."""
         final = self._final_path(when)
         partial = final.with_name(final.name + '.partial')
+        if not self._overwrite:
+            for taken in (final, partial):
+                if os.path.lexists(taken):
+                    raise _NameTaken(errno.EEXIST, 'File exists', str(taken))
         if self._overwrite and os.path.lexists(partial):
             # Never open an existing name for writing: that would follow
             # a symlink or truncate a hard-linked inode. Remove the name
@@ -937,7 +1012,7 @@ class _PartSink:
         os.unlink(src)
 
     def end_part(self) -> None:
-        """Sync and close the open part and move it to its final time name."""
+        """Sync and close the open part and move it to its final name."""
         writer, stream = self.writer, self._stream
         self.writer = self._stream = None
         try:
@@ -952,7 +1027,7 @@ class _PartSink:
         try:
             self.parts.append(info)
             self._place(partial, final)
-        except BaseException as exc:
+        except BaseException:
             # An interrupt can land on either side of the move: let the
             # disk decide whether this part is finished.
             done = _settled(partial, final)
@@ -962,9 +1037,11 @@ class _PartSink:
                 self.parts.remove(info)
             if done:
                 self._partial = None
-            elif isinstance(exc, FileExistsError):
-                # The part is complete and synced; only its name was
-                # taken. Keep the data under its .partial name.
+            elif os.path.lexists(partial):
+                # The part is complete and synced; it only could not take
+                # its name (taken, or the move failed, or an interrupt).
+                # Keep the data under its .partial name: abort() must not
+                # delete it.
                 self.kept.append((partial, info))
                 self._partial = None
             raise
@@ -972,20 +1049,9 @@ class _PartSink:
         _fsync_dir(final.parent)
 
     def finish(self) -> None:
-        """End the open part; a one-part run takes the plain output name."""
+        """End the open part, if there is one."""
         if self.is_open:
             self.end_part()
-        if len(self.parts) == 1:
-            only = self.parts[0]
-            src = only.path
-            try:
-                self._place(src, self.output)
-            except BaseException:
-                if _settled(src, self.output):
-                    only.path = self.output
-                raise
-            only.path = self.output
-            _fsync_dir(self.output.parent)
 
     def abort(self) -> None:
         """
@@ -1100,26 +1166,11 @@ def _preflight(args) -> int | None:
     Nothing is written, apart from the output folder being created and a
     temporary probe file that is removed again.
     """
-    output = args.output
-    if output.is_dir():
-        print(f'error: --output is a directory: {output}', file=sys.stderr)
+    folder = args.output_dir
+    if os.path.lexists(folder) and not folder.is_dir():
+        print(f'error: --output-dir is not a folder: {folder}',
+              file=sys.stderr)
         return 2
-    folder = output.parent
-    if folder.is_dir():
-        try:
-            existing = _old_files(output, [])
-        except OSError as exc:
-            print(f'error: cannot read output folder {folder}: {exc}',
-                  file=sys.stderr)
-            return 2
-        if existing and not args.overwrite:
-            print(
-                f'error: {len(existing)} file(s) for this output already '
-                f'exist in {folder}:\n{_list_names(existing)}\n'
-                'Nothing was written. Move them away, choose another '
-                '--output, or pass --overwrite to let this run replace the '
-                'files it produces.', file=sys.stderr)
-            return 2
     try:
         folder.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=folder):
@@ -1156,7 +1207,9 @@ def main(argv: list[str] | None = None) -> int:
         TF_LATE: 0, TF_EVICTED: 0, 'tf_mismatch': 0, 'malformed': 0, 'unpaired': 0,
         'nadir': 0, 'no_altitude': 0, 'out_of_window': 0,
     }
-    sink = _PartSink(args.output, args.sonar_name, args.layout, args.overwrite)
+    sink = _PartSink(
+        args.output_dir, args.name_prefix, args.sonar_name, args.layout,
+        args.overwrite)
     try:
         ping_count = _convert(args, sink, counts)
         sink.finish()
@@ -1165,9 +1218,21 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(exc, TfChainError):
             print(f'error: unsupported transform tree: {exc}',
                   file=sys.stderr)
+        elif isinstance(exc, _NameTaken):
+            taken = Path(exc.filename)
+            print(f'error: {taken.name} already exists in {taken.parent} '
+                  'and was not replaced, so the part that would take that '
+                  'name was not started. Move it away, choose another '
+                  '--output-dir or --name-prefix, or pass --overwrite to let '
+                  'this run replace the files it produces.', file=sys.stderr)
+            if not sink.parts and not sink.kept:
+                print('Nothing was written.', file=sys.stderr)
+        elif isinstance(exc, KeyboardInterrupt):
+            print('error: interrupted', file=sys.stderr)
         else:
             print(f'error: conversion failed: {exc!r}', file=sys.stderr)
-        if isinstance(exc, FileExistsError):
+        if isinstance(exc, FileExistsError) and not isinstance(
+                exc, _NameTaken):
             print('error: a file appeared in the output folder during the '
                   'run and was NOT replaced (pass --overwrite to allow '
                   'that)', file=sys.stderr)
@@ -1182,7 +1247,8 @@ def main(argv: list[str] | None = None) -> int:
         _best_effort(_report_parts, sink.parts, header='finished parts kept')
         _best_effort(_report_kept, sink)
         _best_effort(_report_replaced, sink)
-        _check_old_files(args.output, sink)
+        if isinstance(exc, _NameTaken) and not sink.parts and not sink.kept:
+            return 2
         if isinstance(exc, (OSError, TfChainError)):
             return 1
         raise
@@ -1191,11 +1257,9 @@ def main(argv: list[str] | None = None) -> int:
         print('error: no pings written (check topics, nav/TF, sample_rate)',
               file=sys.stderr)
         _summarize(sink, ping_count, counts, args)
-        _check_old_files(args.output, sink)
         return 1
 
     _summarize(sink, ping_count, counts, args)
-    _check_old_files(args.output, sink)
     return 0
 
 
@@ -1207,16 +1271,6 @@ def _summarize(sink, ping_count, counts, args) -> None:
         print(f'warning: the summary could not be printed ({exc!r}); the '
               f'{len(sink.parts)} part(s) were written:', file=sys.stderr)
         _best_effort(_report_parts, sink.parts)
-
-
-def _check_old_files(output: Path, sink) -> None:
-    """Warn about old files; a listing error is reported, never raised."""
-    try:
-        _warn_old_files(output, sink.parts, [p for p, _ in sink.kept])
-    except Exception as exc:    # noqa: BLE001 - must not undo a finished run
-        print(f'warning: the check for files of earlier runs could not be '
-              f'done ({exc!r}); the output folder may hold old files that '
-              'mix with the parts just written', file=sys.stderr)
 
 
 def _mb(size: int) -> str:
@@ -1238,44 +1292,14 @@ def _report_parts(parts, *, header=None, limit=None) -> None:
               f'{_mb(part.size)}{note}')
 
 
-def _old_files(output: Path, written) -> list[Path]:
-    """Return files from earlier runs that this run did not write."""
-    stem, suffix = re.escape(output.stem), re.escape(output.suffix)
-    part_re = re.compile(
-        rf'{stem}_\d{{8}}T\d{{6}}Z(_\d+)?{suffix}(\.partial)?')
-    keep = {p.name for p in written}
-    found = []
-    for path in sorted(output.parent.iterdir()):
-        if path.name in keep:
-            continue
-        if (part_re.fullmatch(path.name)
-                or path.name in (output.name, output.name + '.partial')):
-            found.append(path)
-    return found
-
-
-def _warn_old_files(output: Path, parts, kept=()) -> None:
-    """Warn about earlier runs' files next to the output; delete nothing."""
-    old = _old_files(output, [p.path for p in parts] + list(kept))
-    if not old:
-        return
-    print(f'WARNING: {output.parent} now mixes files from two runs. These '
-          "files match this output's name pattern but were not written by "
-          f'this run ({len(old)} in all; not regenerated, nothing was '
-          'deleted):', file=sys.stderr)
-    print(_list_names(old), file=sys.stderr)
-    print('  Remove them yourself if they are out of date, so they are not '
-          'mixed up with the parts just written.', file=sys.stderr)
-
-
 def _report_kept(sink) -> None:
     """List complete parts left under their .partial name."""
     if not sink.kept:
         return
     print(f'{len(sink.kept)} finished part(s) could not take their final '
-          'name (another file appeared there during the run, and was not '
-          'replaced). They are complete data and were left under their '
-          '.partial name; rename them yourself:')
+          'name (another file appeared there during the run and was not '
+          'replaced, or the move failed). They are complete data and were '
+          'left under their .partial name; rename them yourself:')
     for path, info in sink.kept:
         print(f'  {path.name}  pings={info.pings}  '
               f'{_utc_iso(info.first)} to {_utc_iso(info.last)}  '
@@ -1297,9 +1321,9 @@ def _report(sink, ping_count: int, counts: dict, args) -> None:
         print(f'wrote {ping_count} XTF pings -> {parts[0].path}')
     elif parts:
         print(f'wrote {ping_count} XTF pings in {len(parts)} parts '
-              f'-> {sink.output.parent}')
+              f'-> {sink.out_dir}')
     else:
-        print(f'wrote {ping_count} XTF pings -> {sink.output}')
+        print(f'wrote {ping_count} XTF pings -> {sink.out_dir}')
     _report_parts(parts, limit=args.split_bytes)
     _report_replaced(sink)
     print(f'  port msgs={counts["port"]} starboard msgs={counts["starboard"]}'
