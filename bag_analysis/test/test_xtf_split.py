@@ -236,7 +236,12 @@ def test_prefix_is_used_as_given(tmp_path, monkeypatch):
         _expected_name(messages, prefix='a.b+c (1) ')]
 
 
-@pytest.mark.parametrize('prefix', ['a/b', 'a\\b', '../x', '.hidden', 'a\nb'])
+@pytest.mark.parametrize('prefix', [
+    'a/b', 'a\\b', '../x', '.hidden', 'a\nb', 'a:b', 'a*b', 'a?b', 'a"b',
+    'a<b', 'a>b', 'a|b',
+    'p' * 215,          # 215 + 25 (time) + 4 (_999) + 12 (.xtf.partial) = 256
+    'é' * 108,          # 216 bytes: counted in bytes, not characters
+])
 def test_prefix_that_is_not_a_plain_name_start_is_rejected(
         tmp_path, prefix, capsys):
     with pytest.raises(SystemExit) as exc:
@@ -245,6 +250,20 @@ def test_prefix_that_is_not_a_plain_name_start_is_rejected(
     assert exc.value.code == 2
     assert '--name-prefix' in capsys.readouterr().err
     assert not (tmp_path / 'o').exists()
+
+
+def test_longest_allowed_prefix_runs(tmp_path, monkeypatch):
+    prefix = 'p' * 214
+    messages = fake_messages(3)
+    monkeypatch.setattr(
+        bag_to_xtf, 'iter_messages', lambda *a, **k: iter(messages))
+    (tmp_path / 'bag').mkdir()
+    folder = tmp_path / 'o'
+    rc = bag_to_xtf.main(base_args(
+        tmp_path / 'bag', folder, '--name-prefix', prefix))
+    assert rc == 0
+    assert [p.name for p in folder.iterdir()] == [
+        _expected_name(messages, prefix=prefix)]
 
 
 def test_old_output_option_is_refused_with_the_new_names(tmp_path, capsys):
@@ -606,6 +625,64 @@ def test_file_appearing_as_final_name_mid_run_is_not_replaced(
     assert kept[0].stat().st_size > _HEADER
     assert 'left under their .partial name' in captured.out
     assert kept[0].name in captured.out
+
+
+@pytest.mark.parametrize('overwrite', [(), ('--overwrite',)])
+def test_finished_part_that_cannot_be_moved_is_kept_not_deleted(
+        tmp_path, monkeypatch, capsys, overwrite):
+    # The move to the final name fails for a reason other than "name
+    # taken" (a share that refuses the rename): the part is complete and
+    # synced, so it must stay under its .partial name.
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    folder = tmp_path / 'run'
+    folder.mkdir()
+
+    def place(self, src, dst):
+        raise PermissionError(13, 'Permission denied', str(dst))
+    monkeypatch.setattr(bag_to_xtf._PartSink, '_place', place)
+    rc, _ = _run(folder, monkeypatch, messages, *_SMALL, *overwrite)
+    assert rc == 1
+    kept = folder / (name + '.partial')
+    assert [p.name for p in folder.iterdir() if p.is_file()] == [kept.name]
+    assert kept.stat().st_size > _HEADER
+    captured = capsys.readouterr()
+    assert 'Permission denied' in captured.err
+    assert 'left under their .partial name' in captured.out
+    assert kept.name in captured.out
+    assert 'discarded unfinished part' not in captured.out
+
+
+def test_clash_on_a_same_second_counter_name(tmp_path, monkeypatch, capsys):
+    # Every ping its own part, all in one second: the second part is
+    # named ..._2.xtf, and a file of that name stops the run there.
+    messages = fake_messages(5, dt_s=0.1)
+    ref = tmp_path / 'ref'
+    ref.mkdir()
+    rc, _ = _run(ref, monkeypatch, messages, '--split-size', '0.001')
+    assert rc == 0
+    counter = next(p.name for p in _parts(ref) if p.name.endswith('_2.xtf'))
+    folder = tmp_path / 'run'
+    folder.mkdir()
+    (folder / counter).write_bytes(b'foreign')
+    rc, _ = _run(folder, monkeypatch, messages, '--split-size', '0.001')
+    assert rc == 1
+    assert (folder / counter).read_bytes() == b'foreign'
+    assert len(_parts(folder)) == 2          # part 1 and the foreign file
+    assert f'{counter} already exists' in capsys.readouterr().err
+
+
+def test_interrupt_is_reported_as_an_interrupt(tmp_path, monkeypatch, capsys):
+    def gen(*a, **k):
+        yield from fake_messages(3)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(bag_to_xtf, 'iter_messages', gen)
+    (tmp_path / 'bag').mkdir()
+    with pytest.raises(KeyboardInterrupt):
+        bag_to_xtf.main(_args(tmp_path / 'bag', tmp_path))
+    err = capsys.readouterr().err
+    assert 'error: interrupted' in err
+    assert 'conversion failed' not in err
 
 
 # --- up-front checks ------------------------------------------------------

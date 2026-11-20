@@ -121,8 +121,12 @@ _MAX_SPLIT_DURATION_MIN = 1e7
 _MAX_SPLIT_GAP_S = 1e9
 # How many file names an error message lists before saying "and N more".
 _MAX_LISTED = 10
-# Characters a file-name prefix cannot hold: path separators and controls.
-_PREFIX_FORBIDDEN = frozenset('/\\' + ''.join(map(chr, range(32))) + '\x7f')
+# Characters a file-name prefix cannot hold: path separators, controls, and
+# the ones Windows and SMB shares refuse in a name (the files go to both).
+_PREFIX_FORBIDDEN = frozenset(
+    '/\\:*?"<>|' + ''.join(map(chr, range(32))) + '\x7f')
+# Longest file name most filesystems take, in bytes.
+_MAX_NAME_BYTES = 255
 # Largest stamp-to-transmit offset (s) accepted; anything bigger is a typo.
 _MAX_OFFSET_S = 3600.0
 
@@ -315,6 +319,16 @@ def _parse_args(argv):
             + ' '.join(repr(c) for c in bad))
     if args.name_prefix.startswith('.'):
         parser.error('--name-prefix cannot start with "." (a hidden file)')
+    # The longest name a run can need: the time, a same-second counter and
+    # the .partial ending.
+    longest = (f'{args.name_prefix}{_utc_label(_dt.datetime(2000, 1, 1))}'
+               f'_999{_SUFFIX}.partial')
+    spare = _MAX_NAME_BYTES - len(os.fsencode(longest))
+    if spare < 0:
+        parser.error(
+            f'--name-prefix is {-spare} byte(s) too long: with the time and '
+            f'"{_SUFFIX}.partial" after it the file name would pass '
+            f'{_MAX_NAME_BYTES} bytes')
     if args.max_tf_age is not None:
         parser.error(
             '--max-tf-age is gone: it bounded the age of a fallback to the '
@@ -879,8 +893,9 @@ class _PartSink:
     move replaces by rename, which swaps the name and never writes
     through it.
 
-    A finished part whose final name was taken meanwhile stays under its
-    ``.partial`` name and is listed in ``kept``.
+    A finished part that cannot be moved to its final name (the name was
+    taken meanwhile, or the move failed) stays under its ``.partial`` name
+    and is listed in ``kept``; it is never deleted.
     """
 
     def __init__(
@@ -998,7 +1013,7 @@ class _PartSink:
         try:
             self.parts.append(info)
             self._place(partial, final)
-        except BaseException as exc:
+        except BaseException:
             # An interrupt can land on either side of the move: let the
             # disk decide whether this part is finished.
             done = _settled(partial, final)
@@ -1008,9 +1023,11 @@ class _PartSink:
                 self.parts.remove(info)
             if done:
                 self._partial = None
-            elif isinstance(exc, FileExistsError):
-                # The part is complete and synced; only its name was
-                # taken. Keep the data under its .partial name.
+            elif os.path.lexists(partial):
+                # The part is complete and synced; it only could not take
+                # its name (taken, or the move failed, or an interrupt).
+                # Keep the data under its .partial name: abort() must not
+                # delete it.
                 self.kept.append((partial, info))
                 self._partial = None
             raise
@@ -1196,6 +1213,8 @@ def main(argv: list[str] | None = None) -> int:
                   'this run replace the files it produces.', file=sys.stderr)
             if not sink.parts and not sink.kept:
                 print('Nothing was written.', file=sys.stderr)
+        elif isinstance(exc, KeyboardInterrupt):
+            print('error: interrupted', file=sys.stderr)
         else:
             print(f'error: conversion failed: {exc!r}', file=sys.stderr)
         if isinstance(exc, FileExistsError) and not isinstance(
@@ -1264,9 +1283,9 @@ def _report_kept(sink) -> None:
     if not sink.kept:
         return
     print(f'{len(sink.kept)} finished part(s) could not take their final '
-          'name (another file appeared there during the run, and was not '
-          'replaced). They are complete data and were left under their '
-          '.partial name; rename them yourself:')
+          'name (another file appeared there during the run and was not '
+          'replaced, or the move failed). They are complete data and were '
+          'left under their .partial name; rename them yourself:')
     for path, info in sink.kept:
         print(f'  {path.name}  pings={info.pings}  '
               f'{_utc_iso(info.first)} to {_utc_iso(info.last)}  '
