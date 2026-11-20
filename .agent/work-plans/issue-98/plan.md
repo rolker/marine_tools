@@ -114,3 +114,15 @@ Resolved by the owner: stale files are warned about, never deleted; option names
 ## Estimated Scope
 
 Single PR (PR 1). PR 2 is a separate plan: measured turn thresholds on real bags (including 0.5 m/s tracks), a nav-only first pass, drop-turn option.
+
+## Naming change after PR 1 (owner decision, 2026-11-20)
+
+Supersedes the naming and existing-file rules of steps 4, 6 and 8 above and the matching test lines; the rest of PR 1 stands.
+
+- `--output <file>` is replaced by `--output-dir <folder>` (required) and `--name-prefix <text>` (default none). `--output` is a usage error that names the two new options.
+- Every file is named `<prefix><first-ping UTC>.xtf`, the time written as `YYYY-mm-ddTHH.MM.SS+00.00` (the bag folders' form, with dots between the parts of the time so date and time stand apart). Example: `sidescan_2026-08-25T14.01.42+00.00.xtf`. Same-second parts still get `_2`, `_3` before `.xtf`.
+- A one-part run is named the same way; there is no plain-name file any more, and `finish` no longer renames.
+- Existing files: the name is not known before the bag is read, so the up-front folder scan, the "mixes files from two runs" warning and the pattern match are removed. A part whose name or `.partial` name exists is not started and the run stops (`_NameTaken`): exit 2 with "Nothing was written" if it was the first part, exit 1 with the earlier parts kept and listed otherwise. `--overwrite` replaces same-named files as before. Files with other names are not looked at, because a time-only name cannot be told from another recording's export in the same folder. Accepted consequence: a rerun with other split settings into a used folder leaves the earlier parts with other start times in place, unwarned.
+- The prefix cannot hold a path separator or control character, or start with a dot.
+- Tests: `test_xtf_split.py` rewritten for the names and the clash rule (first-part clash, later-part clash, leftover `.partial`, other files untouched and unmentioned, prefix validation, old option refused); golden and pose-time tests read the one file from the output folder.
+- Real-data check: bag 2026-08-28T19-11-01 with `--split-size 30` gave three files; their ping bytes joined equal the single-file export of the same bag; pyxtf reads them; a rerun exits 2 and writes nothing.
