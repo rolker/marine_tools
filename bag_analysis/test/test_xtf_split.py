@@ -7,6 +7,7 @@ bytes of the unsplit file, which also proves that ping numbers and the
 speed / seconds-per-ping carry-over run across part boundaries.
 """
 
+import datetime as dt
 import os
 from pathlib import Path
 import re
@@ -15,25 +16,38 @@ import struct
 from bag_analysis.cli import bag_to_xtf
 import pytest
 from xtf_fakes import (
-    base_args, fake_messages, Track, track_messages)
+    base_args, fake_messages, only_xtf, PART_NAME_RE, PORT_TOPIC, Track,
+    track_messages, xtf_files)
 
 _HEADER = 1024
 _PING_RECORD = 1024 + 256 + 128  # file header + ping with empty channels
 
 
-def _run(tmp_path, monkeypatch, messages, *extra, name='out.xtf'):
+_PREFIX = 'out_'
+
+
+def _args(bag, folder, *extra):
+    return base_args(bag, folder, '--name-prefix', _PREFIX, *extra)
+
+
+def _run(tmp_path, monkeypatch, messages, *extra):
+    """Convert into ``tmp_path``; return the exit code and that folder."""
     monkeypatch.setattr(
         bag_to_xtf, 'iter_messages', lambda *a, **k: iter(messages))
     bag = tmp_path / 'bag'
     bag.mkdir(exist_ok=True)
-    out = tmp_path / name
-    return bag_to_xtf.main(base_args(bag, out, *extra)), out
+    return bag_to_xtf.main(_args(bag, tmp_path, *extra)), tmp_path
 
 
-def _parts(tmp_path, stem='out', suffix='.xtf'):
-    pat = re.compile(rf'{re.escape(stem)}_\d{{8}}T\d{{6}}Z(_\d+)?'
-                     rf'{re.escape(suffix)}')
-    return sorted(p for p in tmp_path.iterdir() if pat.fullmatch(p.name))
+def _parts(tmp_path, prefix=_PREFIX):
+    return xtf_files(tmp_path, prefix)
+
+
+def _expected_name(messages, prefix=_PREFIX):
+    """Return the name of a file whose first ping is the first port ping."""
+    stamp = next(m for t, m, _ in messages if t == PORT_TOPIC).header.stamp
+    when = dt.datetime.fromtimestamp(stamp.sec, dt.timezone.utc)
+    return f"{prefix}{when.strftime('%Y-%m-%dT%H.%M.%S')}+00.00.xtf"
 
 
 def _ping_bytes(paths):
@@ -52,22 +66,21 @@ def _ping_numbers(path):
 def _unsplit(tmp_path, monkeypatch, messages, *extra):
     sub = tmp_path / 'unsplit'
     sub.mkdir(exist_ok=True)
-    rc, out = _run(sub, monkeypatch, messages, '--no-split', *extra)
+    rc, _ = _run(sub, monkeypatch, messages, '--no-split', *extra)
     assert rc == 0
-    return out
+    return only_xtf(sub, _PREFIX)
 
 
 @pytest.mark.parametrize('layout', ['standard', 'pingmapper'])
 def test_size_split_equals_unsplit_pings(tmp_path, monkeypatch, layout):
     messages = fake_messages(30, dt_s=0.3)
     single = _unsplit(tmp_path, monkeypatch, messages, '--layout', layout)
-    rc, out = _run(
+    rc, _ = _run(
         tmp_path, monkeypatch, messages, '--split-size', '0.008',
         '--layout', layout)
     assert rc == 0
     parts = _parts(tmp_path)
     assert len(parts) > 2
-    assert not out.exists()
     assert not list(tmp_path.glob('*.partial'))
     for part in parts:
         assert part.stat().st_size <= 8000
@@ -152,7 +165,7 @@ def test_gap_just_under_and_over_in_integer_ns(tmp_path, monkeypatch):
     exact = fake_messages(6, dt_s=0.3, extra_gaps={3: 59.7})
     rc, _ = _run(tmp_path, monkeypatch, exact)
     assert rc == 0
-    assert _parts(tmp_path) == []
+    assert len(_parts(tmp_path)) == 1
     over = fake_messages(6, dt_s=0.3, extra_gaps={3: 59.7000001})
     sub = tmp_path / 'over'
     sub.mkdir()
@@ -171,21 +184,84 @@ def test_gap_carry_over_matches_unsplit_file(tmp_path, monkeypatch):
 
 def test_gap_off_and_no_split_give_one_file(tmp_path, monkeypatch):
     messages = fake_messages(10, dt_s=0.3, extra_gaps={4: 90.0})
-    rc, out = _run(tmp_path, monkeypatch, messages, '--split-gap', '0')
-    assert rc == 0 and out.exists() and _parts(tmp_path) == []
+    rc, _ = _run(tmp_path, monkeypatch, messages, '--split-gap', '0')
+    assert rc == 0 and len(_parts(tmp_path)) == 1
     sub = tmp_path / 'ns'
     sub.mkdir()
-    rc, out = _run(sub, monkeypatch, messages, '--no-split')
-    assert rc == 0 and out.exists() and _parts(sub) == []
+    rc, _ = _run(sub, monkeypatch, messages, '--no-split')
+    assert rc == 0 and len(_parts(sub)) == 1
 
 
-def test_one_part_keeps_plain_name_and_leaves_no_partial(
+def test_one_part_is_named_by_its_first_ping_and_leaves_no_partial(
         tmp_path, monkeypatch):
-    rc, out = _run(tmp_path, monkeypatch, fake_messages(5))
+    messages = fake_messages(5)
+    rc, _ = _run(tmp_path, monkeypatch, messages)
     assert rc == 0
-    assert out.exists()
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == [
-        'out.xtf']
+        _expected_name(messages)]
+
+
+def test_name_is_date_dashes_time_dots_and_utc_offset(tmp_path, monkeypatch):
+    # 2026-06-15T15:03:45.2 UTC: the name carries the whole second.
+    start = int(dt.datetime(
+        2026, 6, 15, 15, 3, 45, tzinfo=dt.timezone.utc).timestamp()) * 10**9
+    messages = fake_messages(3, dt_s=0.2, start_ns=start)
+    rc, _ = _run(tmp_path, monkeypatch, messages)
+    assert rc == 0
+    assert [p.name for p in tmp_path.iterdir() if p.is_file()] == [
+        'out_2026-06-15T15.03.45+00.00.xtf']
+
+
+def test_without_a_prefix_the_name_is_the_time_alone(tmp_path, monkeypatch):
+    messages = fake_messages(3)
+    monkeypatch.setattr(
+        bag_to_xtf, 'iter_messages', lambda *a, **k: iter(messages))
+    (tmp_path / 'bag').mkdir()
+    folder = tmp_path / 'new' / 'folder'      # created by the run
+    assert bag_to_xtf.main(base_args(tmp_path / 'bag', folder)) == 0
+    assert [p.name for p in folder.iterdir()] == [
+        _expected_name(messages, prefix='')]
+
+
+def test_prefix_is_used_as_given(tmp_path, monkeypatch):
+    messages = fake_messages(3)
+    monkeypatch.setattr(
+        bag_to_xtf, 'iter_messages', lambda *a, **k: iter(messages))
+    (tmp_path / 'bag').mkdir()
+    folder = tmp_path / 'o'
+    rc = bag_to_xtf.main(base_args(
+        tmp_path / 'bag', folder, '--name-prefix', 'a.b+c (1) '))
+    assert rc == 0
+    assert [p.name for p in folder.iterdir()] == [
+        _expected_name(messages, prefix='a.b+c (1) ')]
+
+
+@pytest.mark.parametrize('prefix', ['a/b', 'a\\b', '../x', '.hidden', 'a\nb'])
+def test_prefix_that_is_not_a_plain_name_start_is_rejected(
+        tmp_path, prefix, capsys):
+    with pytest.raises(SystemExit) as exc:
+        bag_to_xtf.main(base_args(
+            tmp_path, tmp_path / 'o', f'--name-prefix={prefix}'))
+    assert exc.value.code == 2
+    assert '--name-prefix' in capsys.readouterr().err
+    assert not (tmp_path / 'o').exists()
+
+
+def test_old_output_option_is_refused_with_the_new_names(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        bag_to_xtf.main([
+            '--bag', str(tmp_path), '--output', str(tmp_path / 'o.xtf')])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert '--output is gone' in err
+    assert '--output-dir' in err and '--name-prefix' in err
+
+
+def test_output_dir_is_required(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        bag_to_xtf.main(['--bag', str(tmp_path)])
+    assert exc.value.code == 2
+    assert '--output-dir' in capsys.readouterr().err
 
 
 def test_same_second_parts_get_a_counter(tmp_path, monkeypatch):
@@ -196,7 +272,7 @@ def test_same_second_parts_get_a_counter(tmp_path, monkeypatch):
     names = [p.name for p in _parts(tmp_path)]
     assert len(names) == 5
     assert len(set(names)) == 5
-    assert any(re.search(r'Z_2\.xtf$', n) for n in names)
+    assert any(re.search(r'\+00\.00_2\.xtf$', n) for n in names)
 
 
 def test_part_report_lists_time_span(tmp_path, monkeypatch, capsys):
@@ -205,7 +281,7 @@ def test_part_report_lists_time_span(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert 'in 2 parts' in out
     assert out.count('  part ') == 2
-    assert re.search(r'part 1: out_\d{8}T\d{6}Z\.xtf  pings=4  '
+    assert re.search(rf'part 1: out_{PART_NAME_RE}  pings=4  '
                      r'\d{4}-\d\d-\d\dT[\d:]+Z to \d{4}-\d\d-\d\dT[\d:]+Z',
                      out)
 
@@ -270,11 +346,8 @@ def test_failure_in_part_two_keeps_finished_parts(
         bag_to_xtf, 'iter_messages', _failing(messages, 70))
     bag = tmp_path / 'bag'
     bag.mkdir()
-    out = tmp_path / 'out.xtf'
-    rc = bag_to_xtf.main(
-        base_args(bag, out, '--split-size', '0.008'))
+    rc = bag_to_xtf.main(_args(bag, tmp_path, '--split-size', '0.008'))
     assert rc == 1
-    assert not out.exists()
     assert not list(tmp_path.glob('*.partial'))
     parts = _parts(tmp_path)
     assert len(parts) >= 1
@@ -288,7 +361,7 @@ def test_failure_in_part_one_leaves_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(bag_to_xtf, 'iter_messages', _failing(messages, 20))
     bag = tmp_path / 'bag'
     bag.mkdir()
-    rc = bag_to_xtf.main(base_args(bag, tmp_path / 'out.xtf'))
+    rc = bag_to_xtf.main(_args(bag, tmp_path))
     assert rc == 1
     assert [p for p in tmp_path.iterdir() if p.is_file()] == []
 
@@ -301,7 +374,7 @@ def test_non_os_error_is_reraised_after_cleanup(tmp_path, monkeypatch):
     bag = tmp_path / 'bag'
     bag.mkdir()
     with pytest.raises(RuntimeError):
-        bag_to_xtf.main(base_args(bag, tmp_path / 'out.xtf'))
+        bag_to_xtf.main(_args(bag, tmp_path))
     assert [p for p in tmp_path.iterdir() if p.is_file()] == []
 
 
@@ -321,7 +394,7 @@ def test_non_os_error_is_reraised_after_cleanup(tmp_path, monkeypatch):
 ])
 def test_option_validation(tmp_path, extra):
     with pytest.raises(SystemExit) as exc:
-        bag_to_xtf.main(base_args(tmp_path, tmp_path / 'o.xtf', *extra))
+        bag_to_xtf.main(base_args(tmp_path, tmp_path / 'o', *extra))
     assert exc.value.code == 2
 
 
@@ -330,66 +403,6 @@ def test_size_over_2gb_warns(tmp_path, monkeypatch, capsys):
         tmp_path, monkeypatch, fake_messages(3), '--split-size', '3000')
     assert rc == 0
     assert 'over 2 GB' in capsys.readouterr().err
-
-
-def test_old_files_are_listed_and_never_deleted(
-        tmp_path, monkeypatch, capsys):
-    old = [
-        tmp_path / 'out_20200101T000000Z.xtf',
-        tmp_path / 'out_20200101T000000Z_2.xtf',
-        tmp_path / 'out_20200101T000000Z.xtf.partial',
-        tmp_path / 'out.xtf.partial',
-    ]
-    unrelated = [
-        tmp_path / 'other_20200101T000000Z.xtf', tmp_path / 'out_notes.xtf',
-        tmp_path / 'out_20200101T000000Z.xtf.bak']
-    for path in old + unrelated:
-        path.write_bytes(b'x')
-    # A multi-part run does not replace the plain-name file of an earlier
-    # run, so it is listed as well.
-    plain = tmp_path / 'out.xtf'
-    plain.write_bytes(b'x')
-    messages = fake_messages(10, dt_s=0.3, extra_gaps={4: 90.0})
-    rc, _ = _run(tmp_path, monkeypatch, messages, '--overwrite')
-    assert rc == 0
-    err = capsys.readouterr().err
-    assert 'WARNING' in err
-    assert 'mixes files from two runs' in err
-    for path in old + [plain]:
-        assert f'  {path.name}\n' in err
-        assert path.exists()
-    for path in unrelated:
-        assert f'  {path.name}\n' not in err
-        assert path.exists()
-
-
-def test_old_file_scan_escapes_the_stem(tmp_path, monkeypatch, capsys):
-    odd = tmp_path / 'a.b+c'
-    odd.mkdir()
-    lookalike = odd / 'aXb+c_20200101T000000Z.xtf'
-    real = odd / 'a.b+c_20200101T000000Z.xtf'
-    lookalike.write_bytes(b'x')
-    real.write_bytes(b'x')
-    rc, _ = _run(
-        odd, monkeypatch, fake_messages(3), '--overwrite', name='a.b+c.xtf')
-    assert rc == 0
-    err = capsys.readouterr().err
-    assert f'  {real.name}\n' in err
-    assert f'  {lookalike.name}\n' not in err
-
-
-def test_old_files_warned_and_kept_on_failure(tmp_path, monkeypatch, capsys):
-    old = tmp_path / 'out_20200101T000000Z.xtf'
-    old.write_bytes(b'x')
-    monkeypatch.setattr(
-        bag_to_xtf, 'iter_messages', _failing(fake_messages(10), 20))
-    bag = tmp_path / 'bag'
-    bag.mkdir()
-    rc = bag_to_xtf.main(
-        base_args(bag, tmp_path / 'out.xtf', '--overwrite'))
-    assert rc == 1
-    assert old.exists()
-    assert old.name in capsys.readouterr().err
 
 
 # --- refuse unless --overwrite -------------------------------------------
@@ -407,12 +420,16 @@ def _forbid_reading(monkeypatch):
     monkeypatch.setattr(bag_to_xtf, 'iter_messages', boom)
 
 
-def _first_part_name(tmp_path, monkeypatch, messages):
+def _part_names(tmp_path, monkeypatch, messages):
     ref = tmp_path / 'ref'
     ref.mkdir()
     rc, _ = _run(ref, monkeypatch, messages, *_SMALL)
     assert rc == 0
-    return _parts(ref)[0].name
+    return [p.name for p in _parts(ref)]
+
+
+def _first_part_name(tmp_path, monkeypatch, messages):
+    return _part_names(tmp_path, monkeypatch, messages)[0]
 
 
 def test_rerun_without_overwrite_refuses_and_changes_nothing(
@@ -421,31 +438,187 @@ def test_rerun_without_overwrite_refuses_and_changes_nothing(
     rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL)
     assert rc == 0
     before = _snapshot(tmp_path)
+    first = _parts(tmp_path)[0].name
     capsys.readouterr()
-    _forbid_reading(monkeypatch)
-    rc = bag_to_xtf.main(
-        base_args(tmp_path / 'bag', tmp_path / 'out.xtf', *_SMALL))
+    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL)
     assert rc == 2
     assert _snapshot(tmp_path) == before
-    err = capsys.readouterr().err
-    assert 'already exist' in err and '--overwrite' in err
-    assert 'Nothing was written' in err
-    for name in before:
-        assert name in err
+    captured = capsys.readouterr()
+    assert f'{first} already exists' in captured.err
+    assert '--overwrite' in captured.err
+    assert 'Nothing was written' in captured.err
+    assert 'conversion failed' not in captured.err
+    assert 'appeared in the output folder' not in captured.err
 
 
-def test_refusal_caps_a_long_list(tmp_path, monkeypatch, capsys):
-    for i in range(25):
-        (tmp_path / f'out_20200101T0000{i:02d}Z.xtf').write_bytes(b'x')
+def test_one_file_rerun_refuses_then_overwrites(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(5)
+    rc, _ = _run(tmp_path, monkeypatch, messages)
+    assert rc == 0
+    out = only_xtf(tmp_path, _PREFIX)
+    before = out.read_bytes()
+    out.write_bytes(b'precious')
+    rc, _ = _run(tmp_path, monkeypatch, messages)
+    assert rc == 2
+    assert out.read_bytes() == b'precious'
+    capsys.readouterr()
+    rc, _ = _run(tmp_path, monkeypatch, messages, '--overwrite')
+    assert rc == 0
+    assert out.read_bytes() == before
+    assert 'replaced 1 file(s)' in capsys.readouterr().out
+
+
+def test_clash_on_a_later_part_keeps_the_earlier_parts(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(30, dt_s=0.3)
+    names = _part_names(tmp_path, monkeypatch, messages)
+    assert len(names) > 2
+    folder = tmp_path / 'run'
+    folder.mkdir()
+    foreign = folder / names[1]
+    foreign.write_bytes(b'foreign')
+    rc, _ = _run(folder, monkeypatch, messages, *_SMALL)
+    assert rc == 1
+    assert foreign.read_bytes() == b'foreign'
+    assert [p.name for p in _parts(folder)] == names[:2]
+    assert not list(folder.glob('*.partial'))
+    captured = capsys.readouterr()
+    assert f'{names[1]} already exists' in captured.err
+    assert 'Nothing was written' not in captured.err
+    assert 'finished parts kept: 1' in captured.out
+    assert names[0] in captured.out
+
+
+def test_other_files_in_the_folder_are_left_alone_and_not_mentioned(
+        tmp_path, monkeypatch, capsys):
+    # Files named by a time alone cannot be told from another recording's,
+    # so nothing but an exact name clash is looked at.
+    others = [
+        tmp_path / 'out_2020-01-01T00.00.00+00.00.xtf',
+        tmp_path / 'out_2020-01-01T00.00.00+00.00_2.xtf',
+        tmp_path / 'out_2020-01-01T00.00.00+00.00.xtf.partial',
+        tmp_path / '2020-01-01T00.00.00+00.00.xtf',
+        tmp_path / 'out_notes.xtf',
+    ]
+    for path in others:
+        path.write_bytes(b'x')
+    messages = fake_messages(10, dt_s=0.3, extra_gaps={4: 90.0})
+    for extra in ((), ('--overwrite',)):
+        rc, _ = _run(tmp_path, monkeypatch, messages, *extra)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert 'WARNING' not in captured.err
+        for path in others:
+            assert path.read_bytes() == b'x'
+            assert path.name not in captured.err + captured.out
+
+
+def test_overwrite_leaves_parts_with_other_start_times(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(30, dt_s=0.3)
+    _run(tmp_path, monkeypatch, messages, '--split-size', '0.004')
+    old_parts = _parts(tmp_path)
+    assert len(old_parts) > 3
+    rc, _ = _run(tmp_path, monkeypatch, messages, '--split-size', '0.008',
+                 '--overwrite')
+    assert rc == 0
+    assert all(p.exists() for p in old_parts)
+
+
+def test_existing_partial_leftover_refuses_then_is_replaced(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    same = tmp_path / (name + '.partial')
+    other = tmp_path / 'out_2020-01-01T00.00.00+00.00.xtf.partial'
+    same.write_bytes(b'precious')
+    other.write_bytes(b'other')
+    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL)
+    assert rc == 2
+    assert same.read_bytes() == b'precious'
+    assert not _parts(tmp_path)
+    assert f'{same.name} already exists' in capsys.readouterr().err
+    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL, '--overwrite')
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert not same.exists()
+    assert same.name in captured.out         # listed as replaced
+    assert other.read_bytes() == b'other'    # another start time: untouched
+
+
+def _after_first_part_opens(monkeypatch, action):
+    """Run ``action`` once, right after the first part has been opened."""
+    real = bag_to_xtf._PartSink.start_part
+    calls = []
+
+    def start_part(self, *a, **k):
+        real(self, *a, **k)
+        if not calls:
+            calls.append(1)
+            action()
+    monkeypatch.setattr(bag_to_xtf._PartSink, 'start_part', start_part)
+
+
+def test_partial_appearing_between_check_and_open_is_not_truncated(
+        tmp_path, monkeypatch, capsys):
+    # The check in start_part passes, then the name is taken before the
+    # exclusive open: the open must fail, not truncate.
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    folder = tmp_path / 'run'
+    folder.mkdir()
+    foreign = folder / (name + '.partial')
+    real_lexists = os.path.lexists
+
+    def lexists(path):
+        found = real_lexists(path)
+        if Path(path) == foreign and not found:
+            foreign.write_bytes(b'foreign')
+        return found
+    monkeypatch.setattr(bag_to_xtf.os.path, 'lexists', lexists)
+    rc, _ = _run(folder, monkeypatch, messages, *_SMALL)
+    monkeypatch.undo()
+    assert rc == 1
+    assert foreign.read_bytes() == b'foreign'
+    assert [p.name for p in folder.iterdir() if p.is_file()] == [foreign.name]
+
+
+def test_file_appearing_as_final_name_mid_run_is_not_replaced(
+        tmp_path, monkeypatch, capsys):
+    messages = fake_messages(30, dt_s=0.3)
+    name = _first_part_name(tmp_path, monkeypatch, messages)
+    folder = tmp_path / 'run'
+    folder.mkdir()
+    foreign = folder / name
+    _after_first_part_opens(
+        monkeypatch, lambda: foreign.write_bytes(b'foreign'))
+    rc, _ = _run(folder, monkeypatch, messages, *_SMALL)
+    assert rc == 1
+    assert foreign.read_bytes() == b'foreign'
+    captured = capsys.readouterr()
+    assert 'was NOT replaced' in captured.err
+    # The finished part is complete data: kept under its .partial name,
+    # named in the report, not deleted.
+    kept = list(folder.glob('*.partial'))
+    assert len(kept) == 1
+    assert kept[0].name == name + '.partial'
+    assert kept[0].stat().st_size > _HEADER
+    assert 'left under their .partial name' in captured.out
+    assert kept[0].name in captured.out
+
+
+# --- up-front checks ------------------------------------------------------
+
+def test_output_dir_that_is_a_file_is_rejected_up_front(
+        tmp_path, monkeypatch, capsys):
     _forbid_reading(monkeypatch)
     (tmp_path / 'bag').mkdir()
-    rc = bag_to_xtf.main(
-        base_args(tmp_path / 'bag', tmp_path / 'out.xtf'))
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert '25 file(s)' in err
-    assert '... and 15 more (25 files in all)' in err
-    assert err.count('out_2020') == 10
+    target = tmp_path / 'not_a_folder'
+    target.write_bytes(b'x')
+    assert bag_to_xtf.main(_args(tmp_path / 'bag', target)) == 2
+    assert 'is not a folder' in capsys.readouterr().err
+    assert target.read_bytes() == b'x'
 
 
 def test_rerun_with_overwrite_replaces_and_reports(
@@ -466,23 +639,6 @@ def test_rerun_with_overwrite_replaces_and_reports(
     assert 'WARNING' not in captured.err
 
 
-def test_plain_single_file_rerun_refuses_then_overwrites(
-        tmp_path, monkeypatch, capsys):
-    messages = fake_messages(5)
-    rc, out = _run(tmp_path, monkeypatch, messages)
-    assert rc == 0
-    before = out.read_bytes()
-    out.write_bytes(b'precious')
-    rc, _ = _run(tmp_path, monkeypatch, messages)
-    assert rc == 2
-    assert out.read_bytes() == b'precious'
-    capsys.readouterr()
-    rc, _ = _run(tmp_path, monkeypatch, messages, '--overwrite')
-    assert rc == 0
-    assert out.read_bytes() == before
-    assert 'replaced 1 file(s)' in capsys.readouterr().out
-
-
 def test_max_pings_test_run_over_full_export_refuses(
         tmp_path, monkeypatch):
     messages = fake_messages(30, dt_s=0.3)
@@ -491,126 +647,6 @@ def test_max_pings_test_run_over_full_export_refuses(
     rc, _ = _run(tmp_path, monkeypatch, messages, '--max-pings', '3')
     assert rc == 2
     assert _snapshot(tmp_path) == before
-
-
-def test_mixed_case_old_run_had_more_parts_warns(tmp_path, monkeypatch, capsys):
-    messages = fake_messages(30, dt_s=0.3)
-    _run(tmp_path, monkeypatch, messages, '--split-size', '0.004')
-    old_parts = _parts(tmp_path)
-    assert len(old_parts) > 3
-    capsys.readouterr()
-    _run(tmp_path, monkeypatch, messages, '--split-size', '0.008',
-         '--overwrite')
-    err = capsys.readouterr().err
-    assert 'mixes files from two runs' in err
-    assert 'nothing was deleted' in err
-    leftovers = [p for p in old_parts if f'  {p.name}\n' in err]
-    assert leftovers
-    assert all(p.exists() for p in old_parts)
-
-
-def test_existing_partial_leftover_refuses_then_is_replaced(
-        tmp_path, monkeypatch, capsys):
-    messages = fake_messages(30, dt_s=0.3)
-    name = _first_part_name(tmp_path, monkeypatch, messages)
-    same = tmp_path / (name + '.partial')
-    other = tmp_path / 'out_20200101T000000Z.xtf.partial'
-    same.write_bytes(b'precious')
-    other.write_bytes(b'other')
-    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL)
-    assert rc == 2
-    assert same.read_bytes() == b'precious'
-    assert not _parts(tmp_path)
-    capsys.readouterr()
-    rc, _ = _run(tmp_path, monkeypatch, messages, *_SMALL, '--overwrite')
-    assert rc == 0
-    captured = capsys.readouterr()
-    assert not same.exists()
-    assert same.name in captured.out         # listed as replaced
-    assert other.read_bytes() == b'other'    # not regenerated: kept
-    assert other.name in captured.err
-
-
-def test_file_appearing_as_partial_mid_run_is_not_truncated(
-        tmp_path, monkeypatch, capsys):
-    messages = fake_messages(30, dt_s=0.3)
-    name = _first_part_name(tmp_path, monkeypatch, messages)
-    folder = tmp_path / 'run'
-    folder.mkdir()
-    foreign = folder / (name + '.partial')
-
-    def gen(*a, **k):
-        foreign.write_bytes(b'foreign')
-        yield from messages
-    monkeypatch.setattr(bag_to_xtf, 'iter_messages', gen)
-    bag = tmp_path / 'bag'
-    bag.mkdir()
-    rc = bag_to_xtf.main(base_args(bag, folder / 'out.xtf', *_SMALL))
-    assert rc == 1
-    assert foreign.read_bytes() == b'foreign'
-    assert [p.name for p in folder.iterdir()] == [foreign.name]
-
-
-def test_file_appearing_as_final_name_mid_run_is_not_replaced(
-        tmp_path, monkeypatch, capsys):
-    messages = fake_messages(30, dt_s=0.3)
-    name = _first_part_name(tmp_path, monkeypatch, messages)
-    folder = tmp_path / 'run'
-    folder.mkdir()
-    foreign = folder / name
-
-    def gen(*a, **k):
-        for i, item in enumerate(messages):
-            if i == 5:
-                foreign.write_bytes(b'foreign')
-            yield item
-    monkeypatch.setattr(bag_to_xtf, 'iter_messages', gen)
-    (tmp_path / 'bag').mkdir(exist_ok=True)
-    rc = bag_to_xtf.main(
-        base_args(tmp_path / 'bag', folder / 'out.xtf', *_SMALL))
-    assert rc == 1
-    assert foreign.read_bytes() == b'foreign'
-    captured = capsys.readouterr()
-    assert 'was NOT replaced' in captured.err
-    # The finished part is complete data: kept under its .partial name,
-    # named in the report, not deleted.
-    kept = list(folder.glob('*.partial'))
-    assert len(kept) == 1
-    assert kept[0].name == name + '.partial'
-    assert kept[0].stat().st_size > _HEADER
-    assert 'left under their .partial name' in captured.out
-    assert kept[0].name in captured.out
-
-
-def test_plain_name_appearing_before_the_final_rename_is_not_replaced(
-        tmp_path, monkeypatch, capsys):
-    messages = fake_messages(5)
-    plain = tmp_path / 'out.xtf'
-
-    def gen(*a, **k):
-        yield from messages
-        plain.write_bytes(b'foreign')
-    monkeypatch.setattr(bag_to_xtf, 'iter_messages', gen)
-    (tmp_path / 'bag').mkdir()
-    rc = bag_to_xtf.main(base_args(tmp_path / 'bag', plain))
-    assert rc == 1
-    assert plain.read_bytes() == b'foreign'
-    # The finished part keeps its time name and is reported.
-    kept = _parts(tmp_path)
-    assert len(kept) == 1
-    assert kept[0].name in capsys.readouterr().out
-
-
-# --- up-front checks ------------------------------------------------------
-
-def test_output_that_is_a_directory_is_rejected_up_front(
-        tmp_path, monkeypatch, capsys):
-    _forbid_reading(monkeypatch)
-    (tmp_path / 'bag').mkdir()
-    target = tmp_path / 'out.xtf'
-    target.mkdir()
-    assert bag_to_xtf.main(base_args(tmp_path / 'bag', target)) == 2
-    assert 'is a directory' in capsys.readouterr().err
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permissions')
@@ -622,8 +658,7 @@ def test_unwritable_folder_is_rejected_up_front(
     folder.mkdir()
     folder.chmod(0o500)
     try:
-        rc = bag_to_xtf.main(
-            base_args(tmp_path / 'bag', folder / 'out.xtf'))
+        rc = bag_to_xtf.main(_args(tmp_path / 'bag', folder))
     finally:
         folder.chmod(0o700)
     assert rc == 2
@@ -631,18 +666,6 @@ def test_unwritable_folder_is_rejected_up_front(
 
 
 # --- failure handling -----------------------------------------------------
-
-def test_zero_pings_still_warns_about_old_files(
-        tmp_path, monkeypatch, capsys):
-    old = tmp_path / 'out.xtf'
-    old.write_bytes(b'x')
-    rc, _ = _run(tmp_path, monkeypatch, [], '--overwrite')
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert 'no pings written' in err
-    assert 'WARNING' in err and old.name in err
-    assert old.read_bytes() == b'x'
-
 
 def test_cleanup_failures_do_not_hide_the_original_error(
         tmp_path, monkeypatch, capsys):
@@ -656,19 +679,15 @@ def test_cleanup_failures_do_not_hide_the_original_error(
             raise PermissionError('cannot remove')
         return real_unlink(self, *a, **k)
 
-    def warn(*a, **k):
-        raise OSError('listing failed')
     monkeypatch.setattr(Path, 'unlink', unlink)
-    monkeypatch.setattr(bag_to_xtf, '_warn_old_files', warn)
     bag = tmp_path / 'bag'
     bag.mkdir()
-    rc = bag_to_xtf.main(base_args(bag, tmp_path / 'out.xtf', *_SMALL))
+    rc = bag_to_xtf.main(_args(bag, tmp_path, *_SMALL))
     monkeypatch.undo()
     assert rc == 1
     captured = capsys.readouterr()
     assert 'disk full' in captured.err
     assert 'could not remove' in captured.err
-    assert 'listing failed' in captured.err
     assert 'finished parts kept' in captured.out
 
 
@@ -677,8 +696,7 @@ def test_failure_report_counts_pings_in_the_discarded_part(
     messages = fake_messages(30, dt_s=0.3)
     monkeypatch.setattr(bag_to_xtf, 'iter_messages', _failing(messages, 70))
     (tmp_path / 'bag').mkdir()
-    bag_to_xtf.main(
-        base_args(tmp_path / 'bag', tmp_path / 'out.xtf', *_SMALL))
+    bag_to_xtf.main(_args(tmp_path / 'bag', tmp_path, *_SMALL))
     out = capsys.readouterr().out
     kept = sum(int(n) for n in re.findall(r'pings=(\d+)', out))
     discarded = int(re.search(r': (\d+) pings were in it', out).group(1))
@@ -703,12 +721,10 @@ def test_interrupt_after_the_move_still_reports_the_part(
         lambda *a, **k: iter(fake_messages(30, dt_s=0.3)))
     (tmp_path / 'bag').mkdir()
     with pytest.raises(KeyboardInterrupt):
-        bag_to_xtf.main(
-            base_args(tmp_path / 'bag', tmp_path / 'out.xtf', *_SMALL))
+        bag_to_xtf.main(_args(tmp_path / 'bag', tmp_path, *_SMALL))
     captured = capsys.readouterr()
     first = _parts(tmp_path)[0]
     assert f'part 1: {first.name}' in captured.out
-    assert 'WARNING' not in captured.err      # not called an old file
 
 
 def test_parts_are_synced_before_they_are_renamed(
@@ -771,7 +787,7 @@ def test_overwrite_final_move_replaces_a_symlink_not_its_target(
 # --- no-replace move and its fallbacks --------------------------------------
 
 def _sink(tmp_path):
-    return bag_to_xtf._PartSink(tmp_path / 'out.xtf', 'x', 'standard')
+    return bag_to_xtf._PartSink(tmp_path, _PREFIX, 'x', 'standard')
 
 
 def _no_links(monkeypatch):
@@ -904,19 +920,6 @@ def test_eio_on_file_fsync_stays_fatal(tmp_path, monkeypatch, capsys):
 
 
 # --- success path reporting is guarded -------------------------------------
-
-def test_old_file_check_failure_after_success_is_not_a_traceback(
-        tmp_path, monkeypatch, capsys):
-    def warn(*a, **k):
-        raise OSError('listing failed')
-    monkeypatch.setattr(bag_to_xtf, '_warn_old_files', warn)
-    rc, _ = _run(tmp_path, monkeypatch, fake_messages(30, dt_s=0.3), *_SMALL)
-    assert rc == 0
-    assert _parts(tmp_path)
-    err = capsys.readouterr().err
-    assert 'listing failed' in err
-    assert 'check for files of earlier runs could not be done' in err
-
 
 def test_summary_failure_after_success_still_names_the_parts(
         tmp_path, monkeypatch, capsys):

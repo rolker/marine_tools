@@ -24,18 +24,25 @@ import numpy as np
 import pytest
 from xtf_fakes import (
     base_args, FRAME, PORT_TOPIC, read_ping_headers, single_ping_messages,
-    STBD_TOPIC, Track, track_messages, two_frame_messages)
+    STBD_TOPIC, Track, track_messages, two_frame_messages, xtf_files)
 
 _NS = 1_000_000_000
 
 
-def _run(tmp_path, monkeypatch, messages, *extra, name='out.xtf'):
+def _run(tmp_path, monkeypatch, messages, *extra):
+    """
+    Convert into ``tmp_path / 'out'``; return the exit code and the file.
+
+    With no file or several, the path returned does not exist.
+    """
     monkeypatch.setattr(
         bag_to_xtf, 'iter_messages', lambda *a, **k: iter(messages))
     bag = tmp_path / 'bag'
     bag.mkdir(exist_ok=True)
-    out = tmp_path / name
-    return bag_to_xtf.main(base_args(bag, out, *extra)), out
+    folder = tmp_path / 'out'
+    rc = bag_to_xtf.main(base_args(bag, folder, *extra))
+    files = xtf_files(folder) if folder.is_dir() else []
+    return rc, files[0] if len(files) == 1 else folder / 'not_one_file'
 
 
 def _wrap(d):
@@ -398,7 +405,7 @@ def test_unsupported_tree_ends_the_run_with_exit_1(
     assert rc == 1
     assert message in captured.err
     assert not out.exists()
-    assert not list(tmp_path.glob('*.partial'))
+    assert not list((tmp_path / 'out').glob('*.partial'))
 
 
 # --- the stamp-to-transmit offset -------------------------------------------
@@ -458,13 +465,13 @@ def test_part_names_follow_the_written_time(tmp_path, monkeypatch, capsys):
     rc, _ = _run(tmp_path, monkeypatch, messages,
                  '--stamp-to-transmit-offset', '-2', '--split-size', '0.02')
     assert rc == 0
-    parts = sorted(p.name for p in tmp_path.glob('out_*.xtf'))
+    parts = [p.name for p in xtf_files(tmp_path / 'out')]
     assert len(parts) >= 2
     first_written = _dt.datetime.fromtimestamp(
         (stamps[0] + 2 * _NS) / 1e9, tz=_dt.timezone.utc)
-    assert parts[0] == f'out_{first_written:%Y%m%dT%H%M%SZ}.xtf'
+    assert parts[0] == f'{first_written:%Y-%m-%dT%H.%M.%S}+00.00.xtf'
     raw_label = _dt.datetime.fromtimestamp(
-        stamps[0] / 1e9, tz=_dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        stamps[0] / 1e9, tz=_dt.timezone.utc).strftime('%Y-%m-%dT%H.%M.%S')
     assert raw_label not in parts[0]
 
 
@@ -605,7 +612,7 @@ def test_pings_held_at_end_time_settle_without_reading_to_the_bag_end(
     bag.mkdir()
     end = stamps[40] + 10_000_000
     rc = bag_to_xtf.main(base_args(
-        bag, tmp_path / 'out.xtf', '--no-split', '--tf-wait', '1.2',
+        bag, tmp_path / 'out', '--no-split', '--tf-wait', '1.2',
         '--end-time', f'{end / _NS:.6f}'))
     report = capsys.readouterr().out
     assert rc == 0

@@ -10,6 +10,7 @@ non-trivial and a split that resets the carry-over changes the bytes.
 """
 
 import math
+import re
 import struct
 from types import SimpleNamespace
 
@@ -81,10 +82,32 @@ def fake_messages(
     return out
 
 
-def base_args(bag, output, *extra):
+PART_NAME_RE = (r'\d{4}-\d\d-\d\dT\d\d\.\d\d\.\d\d\+00\.00(_\d+)?'
+                r'\.xtf')
+
+
+def xtf_files(folder, prefix=''):
+    """Return the finished XTF files of ``prefix`` in ``folder``, sorted."""
+    pat = re.compile(re.escape(prefix) + PART_NAME_RE)
+    return sorted(p for p in folder.iterdir() if pat.fullmatch(p.name))
+
+
+def only_xtf(folder, prefix=''):
+    """
+    Return the one XTF file in ``folder``.
+
+    With none, return a path that does not exist, so a test can assert on
+    that; more than one fails.
+    """
+    found = xtf_files(folder, prefix) if folder.is_dir() else []
+    assert len(found) <= 1, [p.name for p in found]
+    return found[0] if found else folder / 'no_file_was_written.xtf'
+
+
+def base_args(bag, out_dir, *extra):
     """Return the CLI argument list for a synthetic run."""
     return [
-        '--bag', str(bag), '--output', str(output),
+        '--bag', str(bag), '--output-dir', str(out_dir),
         '--port-topic', PORT_TOPIC, '--starboard-topic', STBD_TOPIC,
         '--nadir-topic', NADIR_TOPIC, *extra,
     ]
