@@ -264,7 +264,10 @@ the time so that date and time stand apart, for example
 The prefix is optional; without it the name is the time alone. A run that
 ends with one part is named the same way. Two parts that start in the
 same second get `_2`, `_3` and so on before `.xtf`. The prefix cannot
-contain a path separator or a control character, or start with a dot.
+contain a path separator, a control character or one of `: * ? " < > |`
+(Windows and SMB shares refuse those), cannot start with a dot, and must
+leave the whole name within 255 bytes; a prefix that breaks this is a
+usage error before the bag is read.
 
 `--output` (a file path) is gone and is a usage error that names the two
 options above.
@@ -316,7 +319,9 @@ unlinked and created afresh, never opened for writing, so a symlink or a
 hard link under that name is removed as a name and its target (or the
 other link) is left alone; a finished part replaces an existing name by
 rename, which also swaps the name without writing through it. Nothing
-else is deleted.
+else is deleted. The name is the only identity a file has: with
+`--overwrite`, a file from another recording that has the same prefix
+and starts in the same second is replaced like any other.
 
 Without `--overwrite` a file that appears while the run is going is not
 replaced, with one caveat that depends on the filesystem. `.partial`
@@ -335,9 +340,10 @@ its name by the first of these that the filesystem supports:
    that existed then.
 
 If the name is taken, the run fails with a non-zero status and the file
-that appeared is untouched. The finished part is complete data: it stays
-under its `.partial` name, and the report names it so you can rename it
-yourself. Parts already finished are listed as before. Syncing a part to
+that appeared is untouched. The same holds when the move fails for
+another reason (a share that refuses the rename, for example). The
+finished part is complete data: it stays under its `.partial` name, and
+the report names it so you can rename it yourself. Parts already finished are listed as before. Syncing a part to
 disk is skipped on filesystems that cannot do it (`EINVAL`, `ENOSYS`,
 `ENOTSUP`); an I/O error while syncing still fails the run.
 
