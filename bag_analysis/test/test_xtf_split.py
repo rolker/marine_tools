@@ -238,7 +238,7 @@ def test_prefix_is_used_as_given(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('prefix', [
     'a/b', 'a\\b', '../x', '.hidden', 'a\nb', 'a:b', 'a*b', 'a?b', 'a"b',
-    'a<b', 'a>b', 'a|b',
+    'a<b', 'a>b', 'a|b', 'a\x85b',
     'p' * 215,          # 215 + 25 (time) + 4 (_999) + 12 (.xtf.partial) = 256
     'é' * 108,          # 216 bytes: counted in bytes, not characters
 ])
@@ -274,6 +274,18 @@ def test_old_output_option_is_refused_with_the_new_names(tmp_path, capsys):
     err = capsys.readouterr().err
     assert '--output is gone' in err
     assert '--output-dir' in err and '--name-prefix' in err
+
+
+@pytest.mark.parametrize('value', ['', '   '])
+def test_empty_output_dir_is_refused_not_read_as_the_current_folder(
+        tmp_path, monkeypatch, capsys, value):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        bag_to_xtf.main(['--bag', str(tmp_path), '--output-dir', value])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert '--output-dir' in err and 'the value is empty' in err
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_output_dir_is_required(tmp_path, capsys):
@@ -497,6 +509,7 @@ def test_clash_on_a_later_part_keeps_the_earlier_parts(
     folder.mkdir()
     foreign = folder / names[1]
     foreign.write_bytes(b'foreign')
+    capsys.readouterr()          # drop the reference run's report
     rc, _ = _run(folder, monkeypatch, messages, *_SMALL)
     assert rc == 1
     assert foreign.read_bytes() == b'foreign'

@@ -124,7 +124,8 @@ _MAX_LISTED = 10
 # Characters a file-name prefix cannot hold: path separators, controls, and
 # the ones Windows and SMB shares refuse in a name (the files go to both).
 _PREFIX_FORBIDDEN = frozenset(
-    '/\\:*?"<>|' + ''.join(map(chr, range(32))) + '\x7f')
+    '/\\:*?"<>|' + ''.join(map(chr, range(32)))
+    + ''.join(map(chr, range(0x7f, 0xa0))))
 # Longest file name most filesystems take, in bytes.
 _MAX_NAME_BYTES = 255
 # Largest stamp-to-transmit offset (s) accepted; anything bigger is a typo.
@@ -146,6 +147,19 @@ class _PendingPing:
             setattr(self, k, v)
 
 
+def _folder_arg(text: str) -> Path:
+    """
+    Parse ``--output-dir``; an empty value is an error.
+
+    ``Path('')`` is the current folder: an unset shell variable must not
+    send the files (or ``--overwrite``) there.
+    """
+    if not text.strip():
+        raise argparse.ArgumentTypeError(
+            'the value is empty; name the folder to write into')
+    return Path(text)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='bag_to_xtf',
@@ -157,7 +171,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Path to the rosbag2 directory (the one with metadata.yaml)',
     )
     p.add_argument(
-        '--output-dir', type=Path, default=None, metavar='FOLDER',
+        '--output-dir', type=_folder_arg, default=None, metavar='FOLDER',
         help=('Folder the XTF files are written into (created if missing). '
               'Required.'),
     )

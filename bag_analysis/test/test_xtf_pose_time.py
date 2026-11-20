@@ -332,7 +332,7 @@ def test_a_chain_that_never_comes_costs_one_wait_not_the_bag(
     report = capsys.readouterr().out
     assert rc == 1                       # nothing could be written
     assert _dropped(report)['no_tf'] == 60
-    assert not out.exists()
+    assert xtf_files(tmp_path / 'out') == []
     # 2 s of bag time at 20 messages/s, plus the one being read
     assert max(depths) <= 45
 
@@ -404,7 +404,7 @@ def test_unsupported_tree_ends_the_run_with_exit_1(
     captured = capsys.readouterr()
     assert rc == 1
     assert message in captured.err
-    assert not out.exists()
+    assert xtf_files(tmp_path / 'out') == []
     assert not list((tmp_path / 'out').glob('*.partial'))
 
 
