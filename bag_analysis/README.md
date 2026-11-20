@@ -107,7 +107,7 @@ SonarWiz/Triton on Windows).
 ```bash
 ros2 run bag_analysis bag_to_xtf \
     --bag /path/to/bizzyboat_sonar/2026-06-15T15-03-45+00-00 \
-    --output ~/data/sidescan/2026-06-15.xtf
+    --output-dir ~/data/sidescan/2026-06-15 --name-prefix sidescan_
 ```
 
 It reads the port and starboard `marine_acoustic_msgs/RawSonarImage`
@@ -139,7 +139,7 @@ A quick way to find the dock-out/dock-in times is the boat speed from
 `/bizzy/odom`. Example:
 
 ```bash
-ros2 run bag_analysis bag_to_xtf --bag <bag> --output survey.xtf \
+ros2 run bag_analysis bag_to_xtf --bag <bag> --output-dir survey \
     --start-time 2026-06-15T16:26:49 --end-time 2026-06-15T20:56:17
 ```
 
@@ -249,18 +249,25 @@ output into parts by default:
 | `--split-duration <minutes>` | off | Start a new part when the current one covers this many minutes of pings. |
 | `--split-gap <seconds>` | 60 | Start a new part when more than this many seconds pass between two pings, for example when the sonar was switched off. `0` turns it off. |
 | `--no-split` | | One file, whatever its size, as before. Cannot be combined with the three options above. |
-| `--overwrite` | off | Let the run replace existing files of its output (see "Existing files" below). Without it the run refuses to start if any exist. |
+| `--overwrite` | off | Let the run replace existing files that have the names it produces (see "Existing files" below). Without it a part whose name exists is not started and the run stops. |
 
 Negative, non-finite (`inf`, `nan`) and absurdly large values are
 rejected, as is a duration or gap that rounds to 0 ns. A size limit over 2 GB or smaller than one
 ping prints a warning. Whichever limit is reached first starts the next
 part, and the report says which one it was.
 
-Naming: a run that ends with one part writes the plain `--output` name,
-so existing scripts keep working. A run with several parts writes
-`<stem>_<UTC time of the part's first ping><suffix>`, for example
-`survey_20260615T150345Z.xtf`, and no plain-name file. Two parts that
-start in the same second get `_2`, `_3` and so on.
+Naming: every file goes into `--output-dir` (created if missing) and is
+named `<--name-prefix><UTC time of the file's first ping>.xtf`. The time
+is written like the bag folders' names, with dots between the parts of
+the time so that date and time stand apart, for example
+`sidescan_2026-06-15T15.03.45+00.00.xtf` with `--name-prefix sidescan_`.
+The prefix is optional; without it the name is the time alone. A run that
+ends with one part is named the same way. Two parts that start in the
+same second get `_2`, `_3` and so on before `.xtf`. The prefix cannot
+contain a path separator or a control character, or start with a dot.
+
+`--output` (a file path) is gone and is a usage error that names the two
+options above.
 
 Ping numbers, speed and the seconds-per-ping field run on across parts,
 so the pings of all parts joined together (everything after each file's
@@ -280,29 +287,36 @@ non-zero.
 
 #### Existing files: refused unless `--overwrite`
 
-Before the bag is read, `bag_to_xtf` looks in the output folder for the
-plain `--output` file and for any file of this output's part-name
-pattern (the time-stamped parts, their `_2` variants and `.partial`
-leftovers). If there is any and `--overwrite` was not given, it prints
-the files (a long list is cut, with the count), writes nothing and exits
-with status 2. This also covers a `--max-pings` test run over a full
-export, and it is a change from the single-file behaviour before
-splitting: a rerun used to replace the plain output silently, now it
-refuses. `--output` that is a directory, or a folder that cannot be
-written, is refused up front the same way (status 2).
+A file's name comes from its first ping, so it is not known before the
+bag is read, and existing files are checked one part at a time. When a
+part is about to start and a file of its name (or its `.partial` name)
+is already in the folder, the part is not started and the run stops,
+unless `--overwrite` was given:
+
+- if it was the first part, nothing has been written and the exit status
+  is 2. This is what a rerun over a finished export gives, and a
+  `--max-pings` test run over a full export;
+- if earlier parts were written, they are kept and listed and the exit
+  status is 1.
+
+No other file in the folder is looked at. A file named by a time alone
+cannot be told from the export of another recording in the same folder,
+so the run does not warn about, or refuse over, files with other names.
+The consequence: rerunning with other split settings into a folder that
+holds an earlier export leaves the earlier parts whose start times
+differ next to the new ones. Use an empty folder for a rerun with
+different settings.
+
+An `--output-dir` that exists and is not a folder, or a folder that
+cannot be written, is refused before the bag is read (status 2).
 
 With `--overwrite` the run replaces the files whose names it produces
 and the report lists every file it replaced. An old `.partial` is
 unlinked and created afresh, never opened for writing, so a symlink or a
 hard link under that name is removed as a name and its target (or the
 other link) is left alone; a finished part replaces an existing name by
-rename, which also swaps the name without writing through it. A
-one-part run goes through its time name before it takes the plain name,
-so an old file of that time name is replaced (and listed) too. Old files of the pattern that
-the run did not regenerate (for example the extra parts of an earlier,
-larger split) are never deleted; the run ends with a warning that the
-folder now mixes two runs and lists them. Remove them yourself when they
-are out of date.
+rename, which also swaps the name without writing through it. Nothing
+else is deleted.
 
 Without `--overwrite` a file that appears while the run is going is not
 replaced, with one caveat that depends on the filesystem. `.partial`
@@ -317,8 +331,8 @@ its name by the first of these that the filesystem supports:
 3. where neither exists, a check that the name is free followed by a
    rename. This is the only path with a gap: a file created in the
    microseconds between the check and the rename would be replaced. The
-   up-front refusal has already ruled out every name that existed when
-   the run started.
+   check made when the part was started has already ruled out a name
+   that existed then.
 
 If the name is taken, the run fails with a non-zero status and the file
 that appeared is untouched. The finished part is complete data: it stays
@@ -327,9 +341,8 @@ yourself. Parts already finished are listed as before. Syncing a part to
 disk is skipped on filesystems that cannot do it (`EINVAL`, `ENOSYS`,
 `ENOTSUP`); an I/O error while syncing still fails the run.
 
-If listing the folder or printing the summary fails after a complete
-conversion, the run still exits 0: the parts are written. It says so and
-says that the check for files of earlier runs could not be done.
+If printing the summary fails after a complete conversion, the run still
+exits 0: the parts are written, and it says so and names them.
 
 ## Contacts and log entries → GeoJSON (`contacts_to_geojson`)
 
